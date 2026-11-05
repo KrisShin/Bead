@@ -27,6 +27,12 @@ pub struct AppSettings {
     pub selection_enabled: bool,
     #[serde(default = "default_hotkey")]
     pub selection_hotkey: String,
+    /// 开机自启（用户显式开启；便携包移动后启动时自动重写路径并提示）。
+    #[serde(default)]
+    pub autostart_enabled: bool,
+    /// 窗口位置（逻辑坐标，退出时记忆；越界回落主屏右上）。
+    #[serde(default)]
+    pub window_position: Option<(i32, i32)>,
 }
 
 fn default_hotkey() -> String {
@@ -59,6 +65,8 @@ impl Default for AppSettings {
             languages: default_languages(),
             selection_enabled: false,
             selection_hotkey: default_hotkey(),
+            autostart_enabled: false,
+            window_position: None,
         }
     }
 }
@@ -110,6 +118,8 @@ mod tests {
             leave_grace_ms: 900,
             selection_enabled: true,
             selection_hotkey: "Ctrl+Alt+B".into(),
+            autostart_enabled: false,
+            window_position: Some((100, 100)),
             provider: ProviderConfig {
                 engine: bead_providers::Engine::Zhipu,
                 api_key: "key-1".into(),

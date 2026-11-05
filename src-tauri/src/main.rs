@@ -22,6 +22,7 @@ use bead_core::{
 use bead_providers::{build_translator, list_models, Engine, ProviderConfig, UreqTransport};
 use serde::Serialize;
 use tauri::{LogicalPosition, LogicalSize, Manager};
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 struct SystemClock;
@@ -238,6 +239,7 @@ struct SettingsView {
     hover_delay_ms: u64,
     selection_enabled: bool,
     selection_hotkey: String,
+    autostart_enabled: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -303,6 +305,7 @@ fn snapshot(state: &AppState) -> StateView {
             hover_delay_ms: settings.hover_delay_ms,
             selection_enabled: settings.selection_enabled,
             selection_hotkey: settings.selection_hotkey.clone(),
+            autostart_enabled: settings.autostart_enabled,
         },
         speak: None,
     }
@@ -667,6 +670,32 @@ fn set_settings(
     snapshot(state.inner())
 }
 
+/// 开机自启开关（tauri-plugin-autostart：Win 注册表 Run / macOS LaunchAgent / XDG autostart）。
+#[tauri::command]
+fn set_autostart(
+    enabled: bool,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> StateView {
+    let autostart = app.autolaunch();
+    let result = if enabled {
+        autostart.enable()
+    } else {
+        autostart.disable()
+    };
+    match result {
+        Ok(()) => {
+            state.settings.lock().expect("settings poisoned").autostart_enabled = enabled;
+            persist(state.inner());
+        }
+        Err(error) => {
+            *state.notice.lock().expect("notice poisoned") =
+                Some(format!("开机自启设置失败：{error}"));
+        }
+    }
+    snapshot(state.inner())
+}
+
 /// 设置落盘。目录在 setup 里由 Tauri app_config_dir 提供。
 fn persist(state: &AppState) {
     let dir = state.settings_dir.lock().expect("settings dir poisoned").clone();
@@ -799,6 +828,17 @@ fn main() {
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // 第二次启动：唤起已有实例（显示窗口），不起新进程。
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .manage(AppState {
             coordinator: Mutex::new(SyncCoordinator::new(
                 pool,
@@ -839,6 +879,7 @@ fn main() {
             set_languages,
             set_provider,
             set_settings,
+            set_autostart,
             test_provider,
             list_provider_models,
             speak_card
@@ -864,6 +905,7 @@ fn main() {
             let dir = app.path().app_config_dir().ok();
             if let Some(dir) = &dir {
                 let loaded = settings::load(dir);
+                let saved_position = loaded.window_position;
                 if let Ok(pool) = LanguagePool::new(
                     loaded
                         .languages
@@ -893,11 +935,141 @@ fn main() {
                 rebuild_chain(&loaded.provider, state.inner());
                 *state.settings.lock().expect("settings poisoned") = loaded;
                 *state.settings_dir.lock().expect("settings dir poisoned") = Some(dir.clone());
+                // 位置记忆：恢复上次位置，越界（窗口左上角不在任何显示器内）回落主屏右上。
+                if let Some((x, y)) = saved_position {
+                    let _ = window.set_position(LogicalPosition::new(x, y));
+                    let outer = window.outer_position().ok();
+                    let on_screen = outer.is_some_and(|outer| {
+                        window
+                            .available_monitors()
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|monitor| {
+                                let origin = monitor.position();
+                                let size = monitor.size();
+                                outer.x >= origin.x
+                                    && outer.y >= origin.y
+                                    && outer.x < origin.x + size.width as i32
+                                    && outer.y < origin.y + size.height as i32
+                            })
+                    });
+                    if !on_screen {
+                        let width = board_width(
+                            state
+                                .coordinator
+                                .lock()
+                                .expect("coordinator poisoned")
+                                .document()
+                                .slots()
+                                .count(),
+                        );
+                        if let Ok(Some(monitor)) = window.current_monitor() {
+                            let screen_width =
+                                monitor.size().width as f64 / monitor.scale_factor();
+                            let _ = window
+                                .set_position(LogicalPosition::new(screen_width - width, 0.0));
+                        }
+                    }
+                }
+                // 自启动：已启用则重写当前路径（便携包移动后自愈），并提示一次。
+                if state.settings.lock().expect("settings poisoned").autostart_enabled {
+                    let autostart = app.autolaunch();
+                    let _ = autostart.disable();
+                    match autostart.enable() {
+                        Ok(()) => {
+                            *state.notice.lock().expect("notice poisoned") =
+                                Some("已更新开机自启动路径（检测到程序位置变化或例行校正）".to_string());
+                        }
+                        Err(error) => {
+                            *state.notice.lock().expect("notice poisoned") =
+                                Some(format!("开机自启动更新失败：{error}"));
+                        }
+                    }
+                }
             }
             // 划词热键线程：注册失败写 notice；开关关闭时热键仍在但不动作（默认关闭，规范要求）。
             spawn_hotkey_thread(app.handle().clone());
+            // 托盘：设置 / 显隐胶囊 / 退出（工单 08）。
+            build_tray(app.handle())?;
+            // Wayland 能力提示：定位/置顶受限是协议限制（立项调研已记录），明确告知不静默。
+            #[cfg(target_os = "linux")]
+            {
+                if std::env::var("WAYLAND_DISPLAY").is_ok() {
+                    *app.state::<AppState>()
+                        .notice
+                        .lock()
+                        .expect("notice poisoned") = Some(
+                        "Wayland 环境：窗口定位与置顶受协议限制，可能无法贴边吸附".to_string(),
+                    );
+                }
+            }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("failed to run Bead");
+        .build(tauri::generate_context!())
+        .expect("failed to build Bead")
+        .run(|app_handle, event| {
+            // 位置记忆：退出时把窗口左上角（逻辑坐标）写进设置。
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    if let Ok(outer) = window.outer_position() {
+                        let scale = window
+                            .current_monitor()
+                            .ok()
+                            .flatten()
+                            .map(|monitor| monitor.scale_factor())
+                            .unwrap_or(1.0);
+                        let logical_x = (outer.x as f64 / scale).round() as i32;
+                        let logical_y = (outer.y as f64 / scale).round() as i32;
+                        let state = app_handle.state::<AppState>();
+                        state.settings.lock().expect("settings poisoned").window_position =
+                            Some((logical_x, logical_y));
+                        persist(state.inner());
+                    }
+                }
+            }
+        });
+}
+
+/// 托盘菜单：设置（显示并展开面板开关）、显隐胶囊、退出。
+fn build_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::TrayIconBuilder;
+
+    let toggle = MenuItem::with_id(app, "toggle", "显示 / 隐藏胶囊", true, None::<&str>)?;
+    let settings_item = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&toggle, &settings_item, &quit])?;
+
+    let mut tray = TrayIconBuilder::with_id("bead-tray")
+        .menu(&menu)
+        .show_menu_on_left_click(true)
+        .tooltip("Bead · 悬停即译");
+    if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.ico")) {
+        tray = tray.icon(icon);
+    }
+    tray.on_menu_event(|app, event| {
+        let window = app.get_webview_window("main");
+        match event.id().as_ref() {
+            "toggle" => {
+                if let Some(window) = window {
+                    if window.is_visible().unwrap_or(false) {
+                        let _ = window.hide();
+                    } else {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+            "settings" => {
+                if let Some(window) = &window {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        }
+    })
+    .build(app)?;
+    Ok(())
 }

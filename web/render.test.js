@@ -150,4 +150,20 @@ describe('board rendering', () => {
     expect(html.match(/data-action="speak"/g)).toHaveLength(2);
     expect(html).toContain('朗读');
   });
+
+  it('shows the autostart switch in the settings section', () => {
+    const html = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      settings: {
+        auto_read_clipboard: true,
+        hover_delay_ms: 200,
+        selection_enabled: false,
+        selection_hotkey: 'Ctrl+Alt+B',
+        autostart_enabled: true,
+      },
+    });
+    expect(html).toContain('data-setting="autostart" checked');
+    expect(html).toContain('开机自启');
+  });
 });

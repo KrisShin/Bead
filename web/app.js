@@ -191,9 +191,13 @@ function draw(view) {
     }
   });
 
-  // 设置即时生效：任一控件变化都带全量设置。
+  // 设置即时生效：任一控件变化都带全量设置（自启走独立命令）。
   root.querySelectorAll('[data-setting]').forEach((input) => {
     input.addEventListener('change', () => {
+      if (input.dataset.setting === 'autostart') {
+        send('set_autostart', { enabled: input.checked });
+        return;
+      }
       const read =
         root.querySelector('[data-setting="auto_read_clipboard"]')?.checked ?? true;
       const delay =
