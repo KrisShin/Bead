@@ -50,6 +50,7 @@
 - **D18** 项目定名 **Bead**（中文可作「齐译」，不作为交付标识）。用户拍板。标识统一：仓库 `KrisShin/Bead`、本地 `C:/Users/HP/WorkSpace/Bead`、会话工作区 `C:/Users/HP/WorkSpace/WorkBuddy/Bead`、`.scratch/bead/`、二进制 `bead`、PKGBUILD `bead`、crate `bead-core`。原名 FloatTrans 与 `krisir/floattrans`（40★ 同品类 macOS 工具）撞车故弃用。因 Windows 目录句柄占用导致 rename 被拒，改用 `cp -a` 完整拷贝迁移，7 条 git 提交与证据链原样保留。
 - **D19** 仓库沿用 Stage 0 的 `git init`，**不重复初始化**，避免抹掉 ship 证据链；用户本次要求的「git init」按「确认仓库可用 + 补齐远端」理解执行。
 - **D20** 远端仓库 `KrisShin/Bead` 已创建为 **PUBLIC**，默认分支 `main`，本地全部提交已推送，本地与远端 HEAD 一致（以 `git rev-parse HEAD` 与 `git ls-remote origin` 实时核对，不在此写死 SHA）。描述为「悬停即译、五语同步的轻量桌面多向翻译工具 (Tauri v2 + Rust)」。HTTPS 代理 `127.0.0.1:2154` 对 git 的 CONNECT 隧道返回 502，改用 SSH 远端 `git@github.com:KrisShin/Bead.git` 推送成功（`Hi KrisShin!` 认证通过）。本次推送由用户单次授权（改名 + Agents.md + 建仓推送为同一条指令）。
+- **D21** 立项期全部调研结论已归档到 `docs/`（索引 `docs/README.md`）：竞品定位、命名排查、翻译源实测与免费额度、平台约束（Wayland / 签名 / 判毒 / 安装器对比 / CI）。定位为**调研留档、非执行依据**；执行依据仍是 `SPEC.md` 与 `TICKETS.md`，代码存在后以代码与测试为准。所有数据标注 2026-11-05 时间性。
 
 ## Facts (Stage 1 实测 / 查证)
 
@@ -71,13 +72,23 @@
 
 ## Next action
 
-仍停在 Stage 3 门：`TICKETS.md` 已拆好，等待用户确认切片粒度与阻塞边。确认后才进 Stage 4 从工单 01 开始 TDD 实现。本轮完成的改名、`Agents.md`、远端创建与推送属于仓库基础设施，不视为 Stage 4 已启动。
+仍停在 **Stage 3 门**：`TICKETS.md` 已拆好（10 张 tracer bullet、初始前沿仅 01），等待用户确认切片粒度与阻塞边。确认后才进 Stage 4 从工单 01 开始 TDD 实现。本轮完成的改名、`Agents.md`、`docs/` 归档、远端创建与推送属于**仓库基础设施**，不视为 Stage 4 已启动；当前仓库无任何实现代码、无 `Cargo.toml`、0 tests（与 Stage 0 基线一致）。
+
+## 文档地图
+
+- `Agents.md` — 绝对规范、改动分级、不可动清单（每次动手前读）
+- `docs/README.md` — 调研文档索引与「非执行依据」声明
+- `docs/competitive-landscape.md` / `naming.md` / `translation-providers.md` / `platform-constraints.md` — 立项期查证
+- `.scratch/bead/SPEC.md` — 已批准规格（78 条用户故事）
+- `.scratch/bead/TICKETS.md` — 工单与 Frontier
+- `.scratch/bead/STATE.md` — 本文件，只记决策/假设/基线
 
 ## Later
 
 - ~~GitHub 远端仓库创建与推送~~ → 已完成，见 D20（`KrisShin/Bead`，public，main）
 - 后续可考虑：翻译历史、术语表、OCR 截图翻译、离线模型
-- 旧目录 `C:/Users/HP/WorkSpace/FloatTrans` 与 `C:/Users/HP/WorkSpace/WorkBuddy/FloatTrans` 因 Windows 句柄占用未能删除，待占用释放后清理（内容已完整拷贝到 Bead）
+- 旧目录 `C:/Users/HP/WorkSpace/FloatTrans` 与 `C:/Users/HP/WorkSpace/WorkBuddy/FloatTrans` 因 Windows 句柄占用未能删除，待关闭 WorkBuddy 与预览面板后手动清理（内容已完整拷贝到 Bead）
+- README.md 尚未创建：按 SPEC 要求，首句须围绕「一次输入多语言并排、改任一语言其余自动同步」写，并说明未签名与各平台首次运行放行方式（属工单 10 范围）
 
 ## Close
 
