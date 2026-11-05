@@ -1,0 +1,25 @@
+# Maintainer: KrisShin <KrisShin@users.noreply.github.com>
+# Bead — 悬停即译、多语言并排联动的桌面翻译工具（Tauri v2）
+pkgname=bead
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="悬停即译、五语同步的轻量桌面多向翻译工具 (Tauri v2 + Rust)"
+arch=('x86_64')
+url="https://github.com/KrisShin/Bead"
+license=('MIT')
+depends=('webkit2gtk-4.1' 'gtk3' 'hicolor-icon-theme')
+makedepends=('rust' 'npm' 'base-devel')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/KrisShin/Bead/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP') # 正式发版由 Release 的 SHA256SUMS 覆盖，此处占位
+
+build() {
+  cd "$pkgname-$pkgver"
+  npm install --no-audit --no-fund
+  cargo build --release -p bead
+}
+
+package() {
+  install -Dm755 "target/release/bead" "$pkgdir/usr/bin/bead"
+  install -Dm644 "packaging/arch/bead.desktop" "$pkgdir/usr/share/applications/bead.desktop"
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

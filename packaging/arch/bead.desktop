@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Bead
+Comment=悬停即译、多语言并排联动的桌面翻译工具
+Exec=/usr/bin/bead
+Icon=bead
+Terminal=false
+Categories=Utility;Translator;
