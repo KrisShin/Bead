@@ -16,8 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bead_core::{
     ChainConfig, Clock, HeuristicDetector, HoverAction, HoverEvent, HoverState, HoverStateMachine,
-    Lang, LanguagePool, ProviderChain, SensitiveFilter, SensitiveVerdict, SlotStatus,
-    SyncCoordinator, SyncPlan,
+    Lang, LanguagePool, OfflineSpeaker, OnlineTts, ProviderChain, SensitiveFilter, SensitiveVerdict,
+    SlotStatus, SpeechError, SpeechManager, SpeechOutcome, SyncCoordinator, SyncPlan,
 };
 use bead_providers::{build_translator, list_models, Engine, ProviderConfig, UreqTransport};
 use serde::Serialize;
@@ -35,6 +35,35 @@ impl Clock for SystemClock {
     }
 }
 
+/// 离线语音：Windows SAPI（System.Speech），零第三方依赖。子进程自己发声，不阻塞壳层。
+/// 初版不按语言挑音色（Windows 已装语音有限），按文本内容走默认语音；诚实标注为粗粒度。
+struct SapiSpeaker;
+
+impl OfflineSpeaker for SapiSpeaker {
+    fn speak(&self, _language: &Lang, text: &str) -> Result<(), SpeechError> {
+        let script = format!(
+            "(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{}')",
+            text.replace('\'', "''")
+        );
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| SpeechError::OfflineFailed(format!("SAPI 启动失败：{error}")))
+    }
+}
+
+/// 在线 TTS：Google translate_tts（无 key；本网络不可达时即走离线降级路径）。
+struct GoogleTtsOnline {
+    transport: bead_providers::UreqByteTransport,
+}
+
+impl OnlineTts for GoogleTtsOnline {
+    fn fetch(&self, language: &Lang, text: &str) -> Result<Vec<u8>, SpeechError> {
+        bead_providers::GoogleTts::fetch(&self.transport, language, text)
+    }
+}
+
 struct AppState {
     coordinator: Mutex<SyncCoordinator<SystemClock>>,
     hover: Mutex<HoverStateMachine>,
@@ -43,6 +72,7 @@ struct AppState {
     provider_config: Mutex<ProviderConfig>,
     settings: Mutex<settings::AppSettings>,
     settings_dir: Mutex<Option<PathBuf>>,
+    speech: Mutex<SpeechManager<GoogleTtsOnline, SapiSpeaker>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -64,6 +94,13 @@ struct ProviderView {
     base_url: String,
 }
 
+/// 朗读结果视图：file = 前端用 convertFileSrc 播放；played = SAPI 已自播。
+#[derive(Serialize, Clone)]
+struct SpeakView {
+    kind: String,
+    url: String,
+}
+
 /// 设置视图（全量回显——没有机密）。
 #[derive(Serialize, Clone)]
 struct SettingsView {
@@ -79,6 +116,7 @@ struct StateView {
     notice: Option<String>,
     provider: ProviderView,
     settings: SettingsView,
+    speak: Option<SpeakView>,
 }
 
 fn status_name(status: SlotStatus) -> &'static str {
@@ -132,7 +170,46 @@ fn snapshot(state: &AppState) -> StateView {
             auto_read_clipboard: settings.auto_read_clipboard,
             hover_delay_ms: settings.hover_delay_ms,
         },
+        speak: None,
     }
+}
+
+/// 朗读一张卡：在线抓取→缓存→前端播放，失败自动降级 SAPI 自播，再失败出轻提示。
+#[tauri::command]
+fn speak_card(lang: String, state: tauri::State<'_, AppState>) -> StateView {
+    let text = {
+        let coordinator = state.coordinator.lock().expect("coordinator poisoned");
+        coordinator
+            .document()
+            .slot(&Lang::new(&lang))
+            .map(|slot| slot.text.clone())
+            .unwrap_or_default()
+    };
+    let mut view = snapshot(state.inner());
+    if text.trim().is_empty() {
+        *state.notice.lock().expect("notice poisoned") = Some("这张卡没有内容可朗读".to_string());
+        view = snapshot(state.inner());
+        return view;
+    }
+    match state.speech.lock().expect("speech poisoned").request(&Lang::new(&lang), &text) {
+        Ok(SpeechOutcome::PlayFile(path)) => {
+            view.speak = Some(SpeakView {
+                kind: "file".into(),
+                url: path.to_string_lossy().to_string(),
+            });
+        }
+        Ok(SpeechOutcome::Played) => {
+            view.speak = Some(SpeakView {
+                kind: "played".into(),
+                url: String::new(),
+            });
+        }
+        Err(_) => {
+            *state.notice.lock().expect("notice poisoned") =
+                Some("朗读失败：在线与离线语音都不可用".to_string());
+        }
+    }
+    view
 }
 
 /// 翻译统一走链：回退/重试/熔断都在这里，调用方只看成功或「全部引擎失败」。
@@ -601,6 +678,13 @@ fn main() {
             provider_config: Mutex::new(default_config),
             settings: Mutex::new(settings::AppSettings::default()),
             settings_dir: Mutex::new(None),
+            speech: Mutex::new(SpeechManager::new(
+                GoogleTtsOnline {
+                    transport: bead_providers::UreqByteTransport,
+                },
+                SapiSpeaker,
+                std::env::temp_dir().join("bead-tts"),
+            )),
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
@@ -620,7 +704,8 @@ fn main() {
             set_provider,
             set_settings,
             test_provider,
-            list_provider_models
+            list_provider_models,
+            speak_card
         ])
         .setup(move |app| {
             // 贴屏幕顶缘、右缘，尺寸就位后才显示，避免窗口在默认位置闪现。
