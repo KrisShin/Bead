@@ -11,6 +11,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use crate::detector::LanguageDetector;
 use crate::document::{Document, DocumentError, Lang, LanguagePool, SlotStatus};
 
 /// 只用于「和上次是否同一段内容」的判断，不是安全哈希，也不写入日志。
@@ -70,10 +71,11 @@ pub struct SyncCoordinator<C: Clock> {
     generation: u64,
     last_clipboard_hash: Option<u64>,
     clock: C,
+    detector: Box<dyn LanguageDetector>,
 }
 
 impl<C: Clock> SyncCoordinator<C> {
-    pub fn new(pool: LanguagePool, clock: C) -> Self {
+    pub fn new(pool: LanguagePool, clock: C, detector: Box<dyn LanguageDetector>) -> Self {
         let document = Document::for_pool(&pool);
         Self {
             pool,
@@ -81,6 +83,7 @@ impl<C: Clock> SyncCoordinator<C> {
             generation: 0,
             last_clipboard_hash: None,
             clock,
+            detector,
         }
     }
 
@@ -159,7 +162,8 @@ impl<C: Clock> SyncCoordinator<C> {
     }
 
     /// hover 读到的剪贴板文本入口。`force` 对应界面上的「刷新」，忽略哈希去重。
-    /// 空文本按空态处理，不发起请求；初始落卡先落主语言，语言检测属于工单 03。
+    /// 空文本按空态处理，不发起请求；初始落卡走语言检测：命中池内语言落到对应卡
+    /// （该卡即权威源），检测不出或语言不在池内回落主语言卡。
     pub fn accept_clipboard(&mut self, text: &str, force: bool) -> Option<SyncPlan> {
         let hash = content_hash(text);
         if !force && self.last_clipboard_hash == Some(hash) {
@@ -169,8 +173,38 @@ impl<C: Clock> SyncCoordinator<C> {
         if text.trim().is_empty() {
             return None;
         }
-        let primary = self.pool.primary().clone();
-        self.commit(&primary, text).ok()
+        let source = self
+            .detector
+            .detect(text)
+            .filter(|lang| self.pool.contains(lang))
+            .unwrap_or_else(|| self.pool.primary().clone());
+        self.commit(&source, text).ok()
+    }
+
+    /// 变更语言池（工单 03 的设置动作）：保留语言的 slot 文本原样带过去，被移除的丢弃；
+    /// 原权威源被移除时回落主语言卡，还在则保持。槽位状态一律回 Idle——换池是显式
+    /// 设置动作，旧池的同步目标已不存在。
+    pub fn replace_pool(&mut self, pool: LanguagePool) {
+        let old_authoritative = self.document.authoritative().cloned();
+        let mut document = Document::for_pool(&pool);
+        for language in pool.languages() {
+            if let Some(slot) = self.document.slot(language) {
+                if !slot.text.is_empty() {
+                    let _ = document.set_text(language, slot.text.clone());
+                }
+            }
+        }
+        self.pool = pool;
+        self.document = document;
+        match old_authoritative {
+            Some(language) if self.pool.contains(&language) => {
+                let _ = self.document.set_authoritative(&language);
+            }
+            Some(_) => {
+                let _ = self.document.set_authoritative(self.pool.primary());
+            }
+            None => {}
+        }
     }
 
     /// 对 apply 标错的卡单独重试：源仍是权威源卡的现文本，一次请求只携带失败语言
@@ -236,10 +270,33 @@ mod tests {
         }
     }
 
+    struct NullDetector;
+
+    impl LanguageDetector for NullDetector {
+        fn detect(&self, _text: &str) -> Option<Lang> {
+            None
+        }
+    }
+
+    struct FixedDetector(Option<Lang>);
+
+    impl LanguageDetector for FixedDetector {
+        fn detect(&self, _text: &str) -> Option<Lang> {
+            self.0.clone()
+        }
+    }
+
     fn coordinator(codes: &[&str]) -> SyncCoordinator<FakeClock> {
+        coordinator_with(Box::new(NullDetector), codes)
+    }
+
+    fn coordinator_with(
+        detector: Box<dyn LanguageDetector>,
+        codes: &[&str],
+    ) -> SyncCoordinator<FakeClock> {
         let pool = LanguagePool::new(codes.iter().map(|code| Lang::new(*code)).collect())
             .expect("test pool is valid");
-        SyncCoordinator::new(pool, FakeClock(1_000))
+        SyncCoordinator::new(pool, FakeClock(1_000), detector)
     }
 
     #[test]
@@ -386,5 +443,82 @@ mod tests {
 
         assert!(coordinator.retry_failed().is_none());
         assert_eq!(coordinator.generation(), before);
+    }
+
+    #[test]
+    fn detected_language_lands_in_its_own_card_and_translates_the_rest() {
+        let mut coordinator = coordinator_with(
+            Box::new(FixedDetector(Some(Lang::new("ja")))),
+            &["zh", "en", "ja"],
+        );
+        let plan = coordinator.accept_clipboard("テストです", false).unwrap();
+        assert_eq!(plan.source_lang, Lang::new("ja"));
+        coordinator.apply(EchoTranslator.translate(&plan).unwrap());
+
+        assert_eq!(
+            coordinator.document().slot(&Lang::new("ja")).unwrap().text,
+            "テストです"
+        );
+        assert_eq!(
+            coordinator.document().slot(&Lang::new("en")).unwrap().text,
+            "[en] テストです"
+        );
+        assert_eq!(coordinator.document().authoritative(), Some(&Lang::new("ja")));
+    }
+
+    #[test]
+    fn undetected_content_falls_back_to_the_primary_card() {
+        let mut coordinator = coordinator(&["zh", "en"]);
+        let plan = coordinator.accept_clipboard("Hello world", false).unwrap();
+        assert_eq!(plan.source_lang, Lang::new("zh"));
+        assert_eq!(
+            coordinator.document().slot(&Lang::new("zh")).unwrap().text,
+            "Hello world"
+        );
+    }
+
+    #[test]
+    fn a_detected_language_outside_the_pool_falls_back_to_the_primary_card() {
+        let mut coordinator = coordinator_with(
+            Box::new(FixedDetector(Some(Lang::new("ko")))),
+            &["zh", "en"],
+        );
+        let plan = coordinator.accept_clipboard("안녕하세요", false).unwrap();
+        assert_eq!(plan.source_lang, Lang::new("zh"));
+    }
+
+    #[test]
+    fn changing_the_pool_keeps_overlapping_cards_and_drops_removed_ones() {
+        let mut coordinator = coordinator(&["zh", "en", "ja"]);
+        let plan = coordinator.commit(&Lang::new("zh"), "你好").unwrap();
+        coordinator.apply(EchoTranslator.translate(&plan).unwrap());
+
+        coordinator.replace_pool(
+            LanguagePool::new(vec![Lang::new("zh"), Lang::new("en")]).expect("two languages"),
+        );
+        assert_eq!(
+            coordinator.document().slot(&Lang::new("zh")).unwrap().text,
+            "你好"
+        );
+        assert_eq!(
+            coordinator.document().slot(&Lang::new("en")).unwrap().text,
+            "[en] 你好"
+        );
+        assert_eq!(coordinator.document().slot(&Lang::new("ja")), None);
+        assert_eq!(coordinator.document().authoritative(), Some(&Lang::new("zh")));
+    }
+
+    #[test]
+    fn removing_the_authoritative_card_falls_back_to_the_primary() {
+        let mut coordinator = coordinator(&["zh", "en", "ja"]);
+        let plan = coordinator.commit(&Lang::new("ja"), "テスト").unwrap();
+        coordinator.apply(EchoTranslator.translate(&plan).unwrap());
+        assert_eq!(coordinator.document().authoritative(), Some(&Lang::new("ja")));
+
+        coordinator.replace_pool(
+            LanguagePool::new(vec![Lang::new("zh"), Lang::new("en")]).expect("two languages"),
+        );
+        assert_eq!(coordinator.document().authoritative(), Some(&Lang::new("zh")));
+        assert_eq!(coordinator.document().slot(&Lang::new("ja")), None);
     }
 }
