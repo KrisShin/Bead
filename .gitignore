@@ -36,3 +36,6 @@ Thumbs.db
 !.env.example
 *.log
 config.local.json
+
+# --- Tauri 生成物（tauri-build 每次构建重新生成）---
+src-tauri/gen/schemas/

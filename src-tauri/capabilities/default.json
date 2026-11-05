@@ -1,0 +1,10 @@
+{
+  "identifier": "bead-main",
+  "description": "Allow the floating window to read the clipboard once and copy a card.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text"
+  ]
+}
