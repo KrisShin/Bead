@@ -8,11 +8,13 @@
 //! DefaultHasher 足够（它只判断「和上次是否一样」，不承担安全用途）；HTTP 客户端属于工单 04，
 //! 现在引入只会把测试拖进网络。时钟、翻译器、剪贴板都是 trait，测试注入 fake。
 
+pub mod chain;
 pub mod detector;
 pub mod document;
 pub mod hover;
 pub mod sync;
 
+pub use chain::{ChainConfig, ProviderChain};
 pub use detector::{HeuristicDetector, LanguageDetector};
 pub use document::{Document, DocumentError, Lang, LanguagePool, PoolError, Slot, SlotStatus, MAX_LANGUAGES, MIN_LANGUAGES};
 pub use hover::{
