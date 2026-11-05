@@ -12,6 +12,7 @@
 pub mod aliyun;
 pub mod baidu;
 pub mod deepl;
+pub mod google_tts;
 pub mod mymemory;
 pub mod openai;
 pub mod settings;
@@ -22,4 +23,5 @@ pub mod volc;
 pub mod youdao;
 
 pub use settings::{build_translator, list_models, openai_preset, Engine, ProviderConfig};
+pub use google_tts::{ByteTransport, GoogleTts, UreqByteTransport};
 pub use transport::{HttpMethod, HttpRequest, HttpResponse, Transport, UreqTransport};
