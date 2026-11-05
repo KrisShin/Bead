@@ -1,11 +1,11 @@
-# FloatTrans — 全平台悬浮窗多向翻译桌面应用
+# Bead — 全平台悬浮窗多向翻译桌面应用
 
-- **Slug**: `float-trans`
+- **Slug**: `bead`
 - **Tier**: `L` — 跨平台桌面应用，涉及 GUI 悬浮窗、剪贴板/划词系统钩子、翻译后端、TTS、多平台打包与自启动，跨多个模块且单个会话做不完
 - **Stage**: `tickets`
 - **Started**: 2026-11-05
 - **Base**: `6da4428850436f9a617e2e603d265e0637edde9c` — diff range `6da4428..HEAD`
-- **Repo**: `C:/Users/HP/WorkSpace/FloatTrans`
+- **Repo**: `C:/Users/HP/WorkSpace/Bead`
 
 ## Goal
 
@@ -24,7 +24,9 @@
 
 ## Decisions
 
-- 仓库落在 `C:/Users/HP/WorkSpace/FloatTrans` 而非 WorkBuddy 会话工作区 — 用户选择「换目录再做」，代码与状态文件都进新仓库
+<!-- Settled decisions only, one line each, newest last. A decision that changes later gets struck through, not deleted. This is intent, and intent is not in the code. -->
+
+- 仓库落在 `C:/Users/HP/WorkSpace/Bead`（原 `FloatTrans`，2026-11-05 改名）而非 WorkBuddy 会话工作区 — 用户选择「换目录再做」，代码与状态文件都进新仓库
 - 采用 `git init` 新建空仓库并做基线提交 — 用户明确授权；`gh auth` 已登录 KrisShin，SSH key 可用，后续如需远端由用户决定
 - 规模定为 L — 用户确认按完整流程（盘问 → spec → 工单 → TDD → 三轴评审 → 收尾）
 - **D1** 不做安装器，交付点开即用的独立 app，定位轻量小工具、体积尽量小巧精致；**明确排除 Qt/PySide6 与 Electron**（原 Q1 推荐作废，需重选型）
@@ -39,12 +41,14 @@
 - **D10** Q12 划词/hover 按推荐定案：未开划词完全被动（仅 hover 读一次）；开启划词后划词完成自动展开并送入文本；锁定或编辑状态下 hover 不覆盖当前内容，仅显式点「读取剪贴板」或解锁后刷新；剪贴板内容哈希去重
 - **D11** Q10 修正：GLM-4.7-Flash 不能免 key 直调，用户提出可走硅基流动 key。定案为 `OpenAICompatible` provider（base_url + model + key 全部可配），预设智谱 / 硅基流动 / 自定义；运行时探测 `/v1/models`，默认零 key 源仍为 MyMemory
 - **OPEN — 待用户决定**：Q9 技术栈（Tauri v2 vs 纯 Rust 自绘）、Q13 是否做安装器。已给出对比与推荐，等用户拍板。→ **已定，见 D12/D13**
-- **D12** Q9 定案：**Tauri v2（Rust + 前端 WebView）**。决定性理由是 Q3 的「中文可编辑多语言卡」需要完善 IME，WebView 与 egui/Slint 自绘是代差；且官方插件生态覆盖托盘/全局快捷键/剪贴板/自启/单实例。Wayland 窗口定位限制两方案都存在，不构成改选 b 的理由。
+- **D12** Q9 定案：**Tauri v2（Rust + 前端 WebView）**。决定性理由是 Q3 的「中文可编辑多语言卡」需要完善 IME，WebView 与 egui/Slint 自绘是代差；且官方插件生态覆盖托盘/全局快捷键/剪贴板/单实例。Wayland 窗口定位限制两方案都存在，不构成改选 b 的理由。
 - **D13** Q13 定案：**方案 C 双轨**，且用户补充「**不做单文件启动（易被判毒）**，改为安装器 + zip 便携目录」。
 - **D14** 授权选 MIT/Apache 系，避免 Slint 的 GPLv3/商业双授权。
 - **D15** 签名策略（**用户拍板，产品决定**）：**任何平台都不做代码签名**，不申请/购买证书、不接 macOS 公证、CI 不留签名钩子。理由：开源软件，觉得不安全自己看源码。信任来自源码可审计 + SHA256SUMS + 可复现 CI；README 如实写明首次运行放行方式。
 - **D16** 自动更新从 Out of Scope 移入范围，但**只做版本比较提示**：启动时请求 GitHub Releases latest tag 与当前版本比较，不匹配显示可关闭轻提示 + 跳转 Release 页；一致/离线/超时静默；设置页有手动检查入口与开关。**绝不自动下载或安装、绝不替换自身文件**。
 - **D17** SPEC.md 已获用户批准（附带 D15/D16 两处修改，已应用）。Stage 2 门通过。
+- **D18** 项目定名 **Bead**（中文可作「齐译」，不作为交付标识）。用户拍板。标识统一：仓库 `KrisShin/Bead`、本地 `C:/Users/HP/WorkSpace/Bead`、会话工作区 `C:/Users/HP/WorkSpace/WorkBuddy/Bead`、`.scratch/bead/`、二进制 `bead`、PKGBUILD `bead`、crate `bead-core`。原名 FloatTrans 与 `krisir/floattrans`（40★ 同品类 macOS 工具）撞车故弃用。因 Windows 目录句柄占用导致 rename 被拒，改用 `cp -a` 完整拷贝迁移，7 条 git 提交与证据链原样保留。
+- **D19** 仓库沿用 Stage 0 的 `git init`，**不重复初始化**，避免抹掉 ship 证据链；用户本次要求的「git init」按「确认仓库可用 + 补齐远端」理解执行。
 
 ## Facts (Stage 1 实测 / 查证)
 
@@ -54,12 +58,10 @@
 - **Tauri v2 Wayland 硬限制（tauri-apps/tauri#14913，2026-02 提出、仍未关闭）**：`Window::set_position` 与 `always_on_top` 在 Wayland 下**静默 no-op**，连窗口初始位置都不生效。这是 xdg-shell 协议的设计而非框架 bug；GNOME 下可借合成器自己的窗口菜单让用户手动置顶（`tauri-plugin-window-manager` 有此能力），但位置仍无解。纯 Rust 自绘（winit/xdg-shell）同样受限，只有 `wlr-layer-shell` 能在 wlroots 系合成器（Sway/Hyprland）实现边缘吸附，GNOME 不支持。**结论：Linux Wayland 上「胶囊吸附边缘」两方案都要降级，与 UI 框架无关。**
 - 硅基流动 `https://api.siliconflow.cn/v1` OpenAI 兼容，免费层 1000 RPM / 50K TPM、9B 以下模型永久免费、新用户 2000 万 token；智谱 `https://open.bigmodel.cn/api/paas/v4`。实测两家 `/v1/models` 与 completions **无 key 均返回 401**，故模型清单与免费模型 ID 需用户填入 key 后由 app 运行时探测，不能写死。
 - Slint 为 GPLv3 / 商业双授权，体积约 5–9MB；egui 更小但中文 IME、圆角/模糊/富文本编辑支持弱。
-- **签名与开源正交（2026）**：开源不豁免 Windows SmartScreen，也不豁免 macOS Gatekeeper。
-  - Windows：SignPath Foundation 给合格 OSS **免费 OV Authenticode 证书**（私钥在 HSM、CI 集成），但发布者名显示 "SignPath Foundation"、要求项目已发布且活跃维护、每次 release 人工审批、审核可能因 star/下载量不足被拒。低价备选 Azure Trusted Signing ~$9.99/月（个人需美/加身份）、Certum OSS ~€69。自签名无效；2024 起 EV 也不再直接跳过 SmartScreen 声誉阶段。
-  - macOS：**无免费路线**，唯一正规解是 Apple Developer $99/年 + Developer ID 签名 + 公证 + staple。ad-hoc 签名只证完整性不证身份；Sequoia 起取消「右键打开」捷径，用户须去系统设置放行。且本产品的划词需辅助功能/输入监听权限，身份不稳定会导致升级后重新授权。
-  - Linux：无强制签名，deb/rpm 用 GPG 签仓库元数据，AUR 靠 PKGBUILD checksum。
-  - **zip 便携不绕过 SmartScreen**：从下载的 zip 解压会把 Mark-of-the-Web 传给内部文件。
+- **签名与开源正交（2026）**：开源不豁免 Windows SmartScreen，也不豁免 macOS Gatekeeper。Windows 有 SignPath Foundation 免费 OSS 证书但需审核、发布者名显示基金会；macOS **无免费路线**（Apple Developer $99/年 + 公证）；Linux 无强制签名。zip 便携不绕过 SmartScreen（Mark-of-the-Web 会传递）。
 - **误报判毒**：主要触发点是 onefile 运行时自解压到 `%TEMP%`、UPX 加壳、以及 PyInstaller 预编译 bootloader 的已知指纹（onefile 误报率实测约为 onedir 的 3–5 倍）。Tauri 产出的是普通原生 PE，无自解压、无加壳；「不做单文件 + 目录形态」进一步降低误报，方向正确。
+- **竞品定位（2026-11-05 查证）**：Pot `pot-app/pot-desktop` **19,340★**、GPL-3.0、**Tauri + Rust**、同赛道且已于 2026-07 归档停更；Easydict **15,207★**、Swift、仅 macOS；Crow Translate 1,963★；krisir/floattrans 40★。这些工具的「并排」是**多引擎**（同一目标语言比服务商），不是**多语言**；「改一处其余语言同步」只存在于 Crowdin / Phrase / LexiSync / Framer 等**项目级本地化平台**。「桌面悬浮 + 多语言并排可编辑联动」是空位，D3 是唯一站得住的产品定位，README 首句须围绕它写。
+- **命名排查**：`FloatTrans` / 中文「浮译」撞 krisir/floattrans；`Lilt` 撞 lilt.com 翻译公司与 LiLT 模型；`Perch` 撞 Perch AI、ConnectWise SIEM 与 pioneering.app 同气质桌面小工具；`Capsa` 撞 Colasoft Capsa 商业网络分析仪；`Verse` 撞 Epic Games 注册商标（USPTO 2023）；`Weft` / `Unison` / `Accord` / `Echo` / `Relay` 均有高星同名项目；`Wisp` 有 USPTO 注册商标。crates.io 上短单词几乎全被占，crate 名统一用 `bead-core` 规避。
 - 本机：Windows，Python 3.13.14 / Node 22.22.2 / Rust 1.96.0 可用；`gh auth` 已登录 KrisShin（repo/workflow scope 齐全）。
 
 ## Assumptions
@@ -68,12 +70,13 @@
 
 ## Next action
 
-进入 Stage 3：已按批准的 SPEC 拆出 `TICKETS.md`，等待用户确认切片粒度与阻塞边。确认后才进 Stage 4 开始 TDD 实现。
+仍停在 Stage 3 门：`TICKETS.md` 已拆好，等待用户确认切片粒度与阻塞边。确认后才进 Stage 4 从工单 01 开始 TDD 实现。本轮完成的改名、`Agents.md`、远端创建与推送属于仓库基础设施，不视为 Stage 4 已启动。
 
 ## Later
 
-- ~~GitHub 远端仓库创建与推送~~ → 已升格为 D7 范围内交付物，待 Q13 定可见性后在 Stage 4 执行
+- ~~GitHub 远端仓库创建与推送~~ → 已升格为 D7 范围内交付物，见 D20
 - 后续可考虑：翻译历史、术语表、OCR 截图翻译、离线模型
+- 旧目录 `C:/Users/HP/WorkSpace/FloatTrans` 与 `C:/Users/HP/WorkSpace/WorkBuddy/FloatTrans` 因 Windows 句柄占用未能删除，待占用释放后清理（内容已完整拷贝到 Bead）
 
 ## Close
 

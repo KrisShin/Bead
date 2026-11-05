@@ -1,4 +1,4 @@
-# FloatTrans — tickets
+# Bead — tickets
 
 One ticket per section, numbered in dependency order. A ticket is a **tracer bullet**: it cuts a narrow but complete path through every layer, is demoable on its own, and fits one fresh context window.
 

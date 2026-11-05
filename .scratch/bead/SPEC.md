@@ -1,4 +1,4 @@
-# FloatTrans — 轻量悬浮窗多向翻译工具
+# Bead — 轻量悬浮窗多向翻译工具
 
 ## Problem Statement
 
@@ -120,6 +120,7 @@
 
 ## Implementation Decisions
 
+- **项目名与标识**：项目定名 **Bead**，中文可作「齐译」。标识统一为仓库 `KrisShin/Bead`、二进制 `bead`、PKGBUILD `bead`、crate `bead-core`、更新检查指向同一仓库的 Releases。原名 FloatTrans 与同品类 `krisir/floattrans` 撞车故弃用。README 首句须围绕「一次输入多语言并排、改任一语言其余自动同步」写，不以「轻量划词翻译」定位（避免与 Pot 正面比功能数量）。
 - **技术栈**：Tauri v2。Rust 侧持有全部系统能力与业务状态；WebView 只负责渲染与发出 intent。选它的决定性理由是中文 IME 完善的编辑体验与官方插件生态（托盘、全局快捷键、剪贴板、单实例、自启）。授权走 MIT/Apache 系。
 - **前后端契约**：单向数据流。前端只发 `dispatch(intent)`、订阅 `state` 快照；Rust 侧 `Reducer` 计算新状态。所有可测行为因此都落在 Rust，前端不含业务判断。
 - **核心域对象**：`LanguagePool`（2–5 个语言）、`Document`（每个语言一个 slot，含 `text` 与 `status: idle|syncing|error`）、`authoritative_slot`。语言池变动时，被移除的 slot 丢弃、保留的 slot 文本不变。
