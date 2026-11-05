@@ -133,7 +133,7 @@
 - **`Autostart` trait**：`enable / disable / is_enabled`，额外做路径有效性校验，路径变更时置为失效并提示。
 - **`SensitiveFilter`**：长度阈值 + 令牌/密码形态识别 + 可配置开关；命中后不进入 provider 链。日志与崩溃报告一律不写原文、不写 key。
 - **平台窗口适配**：无边框 + 置顶 + 边缘吸附在 Win/macOS/Linux X11 用标准路径；Wayland 做能力探测，不支持时降级为普通窗口 + 手动定位提示，不承诺边缘吸附。
-- **产物与 CI**：`tauri build` 的 bundle 产出 NSIS（Win）、dmg（mac）、deb + AppImage（Linux）、PKGBUILD（Arch）；另打包 zip/tar.gz **目录形态**便携版。明确不产 onefile 单文件 exe、不用 UPX。GitHub Actions matrix（windows / macos / ubuntu + Arch 容器）在 tag 时构建并上传 Release。签名以可选 secrets 钩子实现，无 secrets 时构建不失败、产物未签名。每 Release 附 SHA256SUMS。
+- **产物与 CI**：`tauri build` 的 bundle 产出 NSIS（Win）、dmg（mac）、deb + AppImage（Linux）、PKGBUILD（Arch）；另打包 zip/tar.gz **目录形态**便携版。明确不产 onefile 单文件 exe、不用 UPX、不做任何代码签名或签名钩子。GitHub Actions matrix（windows / macos / ubuntu + Arch 容器）在 tag 时构建并上传 Release。每 Release 附 SHA256SUMS。
 - **签名策略（产品决定，非阶段性妥协）**：**任何平台、任何形式都不做代码签名**，也不申请/购买证书、不接 macOS 公证、CI 不留签名钩子或 secrets 分支。定位是开源软件，信任来自源码可审计 + 每 Release 的 SHA256SUMS + 可复现的 CI 构建来源；用户若对二进制不放心，可自行看源码或从源码构建。README 需直白写明各平台首次运行的放行方式（Windows SmartScreen「更多信息 → 仍要运行」、macOS `xattr -dr com.apple.quarantine` 或系统设置放行），不回避、不美化为「已签名」。
 - **`UpdateChecker`**：启动时异步请求 GitHub Releases 的 latest tag，与编译期注入的当前版本号做语义化比较；不一致时在悬浮板内显示一条可关闭的轻提示，附跳转 Release 页的按钮；一致、离线、超时或 API 限流时静默不提示。设置页另有手动「检查更新」入口与「启动时自动检查」开关。**只比较并提示，绝不自动下载、绝不自动安装、绝不替换自身文件**（便携包尤其不能自改）。复用 provider 层的 HTTP 客户端与超时策略。
 - **配置存储**：用户配置目录单一 JSON，包含语言池、provider 配置、悬停延迟、划词开关与快捷键、自启开关、敏感过滤开关；升级兼容未知字段。
