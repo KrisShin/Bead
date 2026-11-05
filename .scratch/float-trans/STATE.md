@@ -2,7 +2,7 @@
 
 - **Slug**: `float-trans`
 - **Tier**: `L` — 跨平台桌面应用，涉及 GUI 悬浮窗、剪贴板/划词系统钩子、翻译后端、TTS、多平台打包与自启动，跨多个模块且单个会话做不完
-- **Stage**: `spec`
+- **Stage**: `tickets`
 - **Started**: 2026-11-05
 - **Base**: `6da4428850436f9a617e2e603d265e0637edde9c` — diff range `6da4428..HEAD`
 - **Repo**: `C:/Users/HP/WorkSpace/FloatTrans`
@@ -42,7 +42,9 @@
 - **D12** Q9 定案：**Tauri v2（Rust + 前端 WebView）**。决定性理由是 Q3 的「中文可编辑多语言卡」需要完善 IME，WebView 与 egui/Slint 自绘是代差；且官方插件生态覆盖托盘/全局快捷键/剪贴板/自启/单实例。Wayland 窗口定位限制两方案都存在，不构成改选 b 的理由。
 - **D13** Q13 定案：**方案 C 双轨**，且用户补充「**不做单文件启动（易被判毒）**，改为安装器 + zip 便携目录」。
 - **D14** 授权选 MIT/Apache 系，避免 Slint 的 GPLv3/商业双授权。
-- **D15** 签名策略（待 SPEC 批准确认）：CI 预留签名钩子、无 secrets 时产未签名包以保证 fork 可构建；本次不申请/购买证书；每 Release 产 SHA256SUMS；macOS 不签名并在 README 给放行说明。
+- **D15** 签名策略（**用户拍板，产品决定**）：**任何平台都不做代码签名**，不申请/购买证书、不接 macOS 公证、CI 不留签名钩子。理由：开源软件，觉得不安全自己看源码。信任来自源码可审计 + SHA256SUMS + 可复现 CI；README 如实写明首次运行放行方式。
+- **D16** 自动更新从 Out of Scope 移入范围，但**只做版本比较提示**：启动时请求 GitHub Releases latest tag 与当前版本比较，不匹配显示可关闭轻提示 + 跳转 Release 页；一致/离线/超时静默；设置页有手动检查入口与开关。**绝不自动下载或安装、绝不替换自身文件**。
+- **D17** SPEC.md 已获用户批准（附带 D15/D16 两处修改，已应用）。Stage 2 门通过。
 
 ## Facts (Stage 1 实测 / 查证)
 
@@ -66,7 +68,7 @@
 
 ## Next action
 
-进入 Stage 2：已按四轮盘问结论写出 `SPEC.md`，等待用户批准（或提出修改）。批准后才写 `TICKETS.md` 并进入 Stage 3 门；实现代码在两张门都通过前不动。
+进入 Stage 3：已按批准的 SPEC 拆出 `TICKETS.md`，等待用户确认切片粒度与阻塞边。确认后才进 Stage 4 开始 TDD 实现。
 
 ## Later
 

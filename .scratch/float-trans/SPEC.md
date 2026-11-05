@@ -110,9 +110,13 @@
 69. As a 用户, I want Arch 有 PKGBUILD / AUR 包, so that 一行命令装好。
 70. As a 用户, I want **没有单文件 exe 形态**, so that 降低杀软启发式误报。
 71. As a 维护者, I want push tag 触发 GitHub Actions matrix 自动构建四平台并上传 Release, so that 发版不用手工跑四台机器。
-72. As a 维护者, I want CI 预留签名钩子、无 secrets 时仍能产出未签名包, so that fork 也能构建、后续接证书不用改流水线。
+72. As a 维护者, I want CI 产物明确**不签名**、也不保留签名钩子或 secrets 分支, so that 构建流程保持简单、fork 与源码构建完全等价。
 73. As a 用户, I want 每个 Release 提供 SHA256SUMS 与构建来源, so that 能验证下载物确实来自该仓库。
-74. As a 用户, I want README 写明 macOS 未签名的放行方式、Linux 的 webkit2gtk 依赖、Wayland 降级说明, so that 首次使用不被卡住。
+74. As a 用户, I want README 写明「本软件未签名及原因」、macOS 首次运行放行方式、Linux 的 webkit2gtk 依赖、Wayland 降级说明, so that 首次使用不被卡住、也不被误导。
+75. As a 用户, I want 应用启动时默认异步检查仓库最新 release tag 并与当前版本比较, so that 有新版本时能及时知道。
+76. As a 用户, I want 版本不一致时只显示一条可关闭的轻提示与跳转 Release 页的按钮, so that 不被弹窗打断、装不装由我决定。
+77. As a 用户, I want 版本一致、离线、请求超时或被限流时完全静默，且更新检查绝不自动下载或安装, so that 便携包不会自改文件、断网也不报错。
+78. As a 用户, I want 设置页有手动「检查更新」入口和「启动时自动检查」开关, so that 我能自己控制这个行为。
 
 ## Implementation Decisions
 
@@ -130,7 +134,8 @@
 - **`SensitiveFilter`**：长度阈值 + 令牌/密码形态识别 + 可配置开关；命中后不进入 provider 链。日志与崩溃报告一律不写原文、不写 key。
 - **平台窗口适配**：无边框 + 置顶 + 边缘吸附在 Win/macOS/Linux X11 用标准路径；Wayland 做能力探测，不支持时降级为普通窗口 + 手动定位提示，不承诺边缘吸附。
 - **产物与 CI**：`tauri build` 的 bundle 产出 NSIS（Win）、dmg（mac）、deb + AppImage（Linux）、PKGBUILD（Arch）；另打包 zip/tar.gz **目录形态**便携版。明确不产 onefile 单文件 exe、不用 UPX。GitHub Actions matrix（windows / macos / ubuntu + Arch 容器）在 tag 时构建并上传 Release。签名以可选 secrets 钩子实现，无 secrets 时构建不失败、产物未签名。每 Release 附 SHA256SUMS。
-- **签名策略（本次范围）**：不申请也不购买证书。Windows 后续可申请 SignPath Foundation 免费 OSS 证书（发布者名显示基金会、需项目已发布且有审核门槛）；macOS 唯一正规解是 Apple Developer Program 付费签名 + 公证，本次在 README 给出 `xattr -dr com.apple.quarantine` 与系统设置放行说明。开源本身不豁免任何一方的检查。
+- **签名策略（产品决定，非阶段性妥协）**：**任何平台、任何形式都不做代码签名**，也不申请/购买证书、不接 macOS 公证、CI 不留签名钩子或 secrets 分支。定位是开源软件，信任来自源码可审计 + 每 Release 的 SHA256SUMS + 可复现的 CI 构建来源；用户若对二进制不放心，可自行看源码或从源码构建。README 需直白写明各平台首次运行的放行方式（Windows SmartScreen「更多信息 → 仍要运行」、macOS `xattr -dr com.apple.quarantine` 或系统设置放行），不回避、不美化为「已签名」。
+- **`UpdateChecker`**：启动时异步请求 GitHub Releases 的 latest tag，与编译期注入的当前版本号做语义化比较；不一致时在悬浮板内显示一条可关闭的轻提示，附跳转 Release 页的按钮；一致、离线、超时或 API 限流时静默不提示。设置页另有手动「检查更新」入口与「启动时自动检查」开关。**只比较并提示，绝不自动下载、绝不自动安装、绝不替换自身文件**（便携包尤其不能自改）。复用 provider 层的 HTTP 客户端与超时策略。
 - **配置存储**：用户配置目录单一 JSON，包含语言池、provider 配置、悬停延迟、划词开关与快捷键、自启开关、敏感过滤开关；升级兼容未知字段。
 
 ## Testing Decisions
@@ -149,16 +154,16 @@
 - 账号系统、云同步、多设备同步、额度看板
 - 移动端、浏览器扩展、命令行模式
 - 主题皮肤商店、插件市场、自定义布局、多窗口
-- 自动更新（updater）——本次只做手动下载新 Release
-- 代码签名证书的申请、购买与实际签名（CI 仅留钩子）
-- macOS 公证与 Apple Developer Program 接入
+- 自动**下载或安装**更新、静默替换自身文件、后台自升级守护进程（本次只比较与提示）
+- 代码签名（任何平台、任何形式）、证书申请与购买、CI 签名钩子、macOS 公证与 Apple Developer Program 接入
 - 对 Linux Wayland 边缘吸附/置顶做承诺（平台协议不支持）
 - 手动指定 TTS 引擎的开关
 - 单独的「双向模式」（选 2 种语言即双向，已由语言池覆盖）
 
 ## Further Notes
 
-- **签名与开源是两件事**：开源解决「源码可审计」，签名解决「发布者身份与完整性」，互不替代。zip 便携版同样带着浏览器下载的 Mark-of-the-Web，不能绕过 SmartScreen。macOS 未签名还会与划词所需的辅助功能/输入监听权限叠加，升级后可能需重新授权。
+- **签名不做，是产品决定**：开源解决「源码可审计」，签名解决「发布者身份与完整性」，两者正交；本项目主动选择前者，代价是 Windows SmartScreen 与 macOS Gatekeeper 的首次警告由用户承担，README 必须如实说明。zip 便携版同样带着浏览器下载的 Mark-of-the-Web，不能绕过 SmartScreen。macOS 未签名还会与划词所需的辅助功能/输入监听权限叠加，升级后可能需重新授权。
+- **更新检查只做比较**：latest tag 与当前版本号不匹配就提示，不碰文件系统。这条边界防止便携目录被自更新改坏，也避免未签名产物在后台替换自身带来更大的信任问题。
 - **误报判毒的规避依据**：主要触发点是 onefile 运行时自解压到临时目录、UPX 加壳、以及打包器 bootloader 的已知指纹。本项目用原生编译产物 + 目录形态 + 不压缩，天然避开了这几条。
 - **默认被动**：整个产品默认不监听剪贴板、不弹窗、不联网翻译，直到用户主动悬停。这是隐私基线，任何后续改动都不得静默打破。
 - **待用户提供的验证条件**：一个可用的免费 API key（智谱或硅基流动）用于 LLM provider 端到端验证；此项未完成时相关行为只能以 fake 覆盖，验收报告须标注。
