@@ -1,0 +1,27 @@
+name: test
+
+# 工单 01 只交付测试 job：不构建产物、不打包、不发版、不签名。
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+jobs:
+  rust-core:
+    name: cargo test (bead-core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --manifest-path bead-core/Cargo.toml
+
+  webview:
+    name: vitest (webview rendering)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npm test
