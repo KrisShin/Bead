@@ -2,7 +2,7 @@
 
 - **Slug**: `float-trans`
 - **Tier**: `L` — 跨平台桌面应用，涉及 GUI 悬浮窗、剪贴板/划词系统钩子、翻译后端、TTS、多平台打包与自启动，跨多个模块且单个会话做不完
-- **Stage**: `grill`
+- **Stage**: `spec`
 - **Started**: 2026-11-05
 - **Base**: `6da4428850436f9a617e2e603d265e0637edde9c` — diff range `6da4428..HEAD`
 - **Repo**: `C:/Users/HP/WorkSpace/FloatTrans`
@@ -38,7 +38,11 @@
 - **D9** Q11 编辑联动按推荐定案：400ms 防抖 + Enter/失焦立即提交；最后编辑的卡为权威源且不被覆盖；其余卡「同步中」保留旧值；`generation += 1` 丢弃过期响应；初始剪贴板语言检测落卡、失败落主语言
 - **D10** Q12 划词/hover 按推荐定案：未开划词完全被动（仅 hover 读一次）；开启划词后划词完成自动展开并送入文本；锁定或编辑状态下 hover 不覆盖当前内容，仅显式点「读取剪贴板」或解锁后刷新；剪贴板内容哈希去重
 - **D11** Q10 修正：GLM-4.7-Flash 不能免 key 直调，用户提出可走硅基流动 key。定案为 `OpenAICompatible` provider（base_url + model + key 全部可配），预设智谱 / 硅基流动 / 自定义；运行时探测 `/v1/models`，默认零 key 源仍为 MyMemory
-- **OPEN — 待用户决定**：Q9 技术栈（Tauri v2 vs 纯 Rust 自绘）、Q13 是否做安装器。已给出对比与推荐，等用户拍板。
+- **OPEN — 待用户决定**：Q9 技术栈（Tauri v2 vs 纯 Rust 自绘）、Q13 是否做安装器。已给出对比与推荐，等用户拍板。→ **已定，见 D12/D13**
+- **D12** Q9 定案：**Tauri v2（Rust + 前端 WebView）**。决定性理由是 Q3 的「中文可编辑多语言卡」需要完善 IME，WebView 与 egui/Slint 自绘是代差；且官方插件生态覆盖托盘/全局快捷键/剪贴板/自启/单实例。Wayland 窗口定位限制两方案都存在，不构成改选 b 的理由。
+- **D13** Q13 定案：**方案 C 双轨**，且用户补充「**不做单文件启动（易被判毒）**，改为安装器 + zip 便携目录」。
+- **D14** 授权选 MIT/Apache 系，避免 Slint 的 GPLv3/商业双授权。
+- **D15** 签名策略（待 SPEC 批准确认）：CI 预留签名钩子、无 secrets 时产未签名包以保证 fork 可构建；本次不申请/购买证书；每 Release 产 SHA256SUMS；macOS 不签名并在 README 给放行说明。
 
 ## Facts (Stage 1 实测 / 查证)
 
@@ -48,6 +52,12 @@
 - **Tauri v2 Wayland 硬限制（tauri-apps/tauri#14913，2026-02 提出、仍未关闭）**：`Window::set_position` 与 `always_on_top` 在 Wayland 下**静默 no-op**，连窗口初始位置都不生效。这是 xdg-shell 协议的设计而非框架 bug；GNOME 下可借合成器自己的窗口菜单让用户手动置顶（`tauri-plugin-window-manager` 有此能力），但位置仍无解。纯 Rust 自绘（winit/xdg-shell）同样受限，只有 `wlr-layer-shell` 能在 wlroots 系合成器（Sway/Hyprland）实现边缘吸附，GNOME 不支持。**结论：Linux Wayland 上「胶囊吸附边缘」两方案都要降级，与 UI 框架无关。**
 - 硅基流动 `https://api.siliconflow.cn/v1` OpenAI 兼容，免费层 1000 RPM / 50K TPM、9B 以下模型永久免费、新用户 2000 万 token；智谱 `https://open.bigmodel.cn/api/paas/v4`。实测两家 `/v1/models` 与 completions **无 key 均返回 401**，故模型清单与免费模型 ID 需用户填入 key 后由 app 运行时探测，不能写死。
 - Slint 为 GPLv3 / 商业双授权，体积约 5–9MB；egui 更小但中文 IME、圆角/模糊/富文本编辑支持弱。
+- **签名与开源正交（2026）**：开源不豁免 Windows SmartScreen，也不豁免 macOS Gatekeeper。
+  - Windows：SignPath Foundation 给合格 OSS **免费 OV Authenticode 证书**（私钥在 HSM、CI 集成），但发布者名显示 "SignPath Foundation"、要求项目已发布且活跃维护、每次 release 人工审批、审核可能因 star/下载量不足被拒。低价备选 Azure Trusted Signing ~$9.99/月（个人需美/加身份）、Certum OSS ~€69。自签名无效；2024 起 EV 也不再直接跳过 SmartScreen 声誉阶段。
+  - macOS：**无免费路线**，唯一正规解是 Apple Developer $99/年 + Developer ID 签名 + 公证 + staple。ad-hoc 签名只证完整性不证身份；Sequoia 起取消「右键打开」捷径，用户须去系统设置放行。且本产品的划词需辅助功能/输入监听权限，身份不稳定会导致升级后重新授权。
+  - Linux：无强制签名，deb/rpm 用 GPG 签仓库元数据，AUR 靠 PKGBUILD checksum。
+  - **zip 便携不绕过 SmartScreen**：从下载的 zip 解压会把 Mark-of-the-Web 传给内部文件。
+- **误报判毒**：主要触发点是 onefile 运行时自解压到 `%TEMP%`、UPX 加壳、以及 PyInstaller 预编译 bootloader 的已知指纹（onefile 误报率实测约为 onedir 的 3–5 倍）。Tauri 产出的是普通原生 PE，无自解压、无加壳；「不做单文件 + 目录形态」进一步降低误报，方向正确。
 - 本机：Windows，Python 3.13.14 / Node 22.22.2 / Rust 1.96.0 可用；`gh auth` 已登录 KrisShin（repo/workflow scope 齐全）。
 
 ## Assumptions
@@ -56,7 +66,7 @@
 
 ## Next action
 
-进入 Stage 1 第二轮：等待用户回答 Q9–Q13（技术栈重选型、零配置与 key 的取舍、编辑联动语义、划词与 hover 关系、产物形态与仓库可见性）。确认后写 `SPEC.md` 并请用户批准；批准前不写实现代码。
+进入 Stage 2：已按四轮盘问结论写出 `SPEC.md`，等待用户批准（或提出修改）。批准后才写 `TICKETS.md` 并进入 Stage 3 门；实现代码在两张门都通过前不动。
 
 ## Later
 
