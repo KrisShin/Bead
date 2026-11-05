@@ -8,6 +8,9 @@ const STATUS_LABEL = {
   error: '同步失败',
 };
 
+// 设置面板的候选语言：覆盖常见语系；拉丁系彼此不可字符判别，落卡靠检测回落主语言。
+const LANG_CANDIDATES = ['zh', 'en', 'ja', 'ko', 'fr', 'de', 'es', 'ru'];
+
 export function escapeHtml(value) {
   return String(value)
     .replaceAll('&', '&amp;')
@@ -44,12 +47,23 @@ export function renderBoard(view) {
     })
     .join('');
 
+  const languagePanel = view.languagesOpen
+    ? `<div class="board__langs">${LANG_CANDIDATES.map((code) => {
+        const checked = view.cards.some((card) => card.lang === code);
+        const count = view.cards.length;
+        const disabled = (!checked && count >= 5) || (checked && count <= 2);
+        return `<label class="board__lang${disabled ? ' is-disabled' : ''}"><input type="checkbox" data-lang-code="${code}"${checked ? ' checked' : ''}${disabled ? ' disabled' : ''} />${code}</label>`;
+      }).join('')}</div>`
+    : '';
+
   return `<section id="board" class="board">
   <header class="board__head">
     <span class="board__title">Bead · 悬停即译</span>
+    <button type="button" data-action="languages">语言</button>
     <button type="button" data-action="pin">${view.locked ? '已锁定' : '图钉'}</button>
     <button type="button" data-action="refresh" title="忽略去重，重新读取剪贴板">重读</button>
   </header>
+  ${languagePanel}
   ${view.notice ? `<p class="board__notice">${escapeHtml(view.notice)}</p>` : ''}
   <div class="board__cards">${cards}</div>
   <p class="board__hint">点击卡片直接编辑 · 其余语言自动同步 · ESC 收起</p>

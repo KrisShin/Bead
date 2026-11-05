@@ -71,4 +71,34 @@ describe('board rendering', () => {
     expect(html.match(/data-action="retry"/g)).toHaveLength(1);
     expect(html).toContain('重试');
   });
+
+  it('reveals the language panel with all candidates only when opened', () => {
+    expect(renderBoard(expanded)).not.toContain('board__langs');
+    const html = renderBoard({ ...expanded, languagesOpen: true });
+    expect(html).toContain('board__langs');
+    expect(html).toContain('data-action="languages"');
+    expect(html.match(/data-lang-code="/g)).toHaveLength(8);
+  });
+
+  it('checks pool members and locks changes that would break the two-to-five bound', () => {
+    const two = renderBoard({ ...expanded, languagesOpen: true });
+    // 2 张卡：移除任一都会跌破下限，被锁；新增第三种不受限
+    expect(two).toContain('<input type="checkbox" data-lang-code="zh" checked disabled />');
+    expect(two).toContain('<input type="checkbox" data-lang-code="en" checked disabled />');
+    expect(two).toContain('<input type="checkbox" data-lang-code="ja" />');
+
+    const five = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      cards: ['zh', 'en', 'ja', 'ko', 'fr'].map((lang) => ({
+        lang,
+        text: 'x',
+        status: 'idle',
+        authoritative: lang === 'zh',
+      })),
+    });
+    // 5 张卡：移除不受限，新增被锁
+    expect(five).toContain('<input type="checkbox" data-lang-code="ja" checked />');
+    expect(five).toContain('<input type="checkbox" data-lang-code="de" disabled />');
+  });
 });

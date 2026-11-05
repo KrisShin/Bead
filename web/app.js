@@ -19,6 +19,8 @@ let pendingTickKind = null;
 let pendingEdit = null;
 let composing = false;
 let lastHtml = null;
+let languagesOpen = false;
+let lastView = null;
 // 每张卡最后一次进入 Rust 的文本：失焦/回车对未变更内容不重复发起同步，
 // 也防止编辑期间被跳过的重渲染让旧值覆盖已同步的新值。
 const lastCommitted = new Map();
@@ -76,7 +78,8 @@ function scheduleEdit(lang, textarea) {
 }
 
 function draw(view) {
-  const html = renderBoard(view);
+  lastView = view;
+  const html = renderBoard({ ...view, languagesOpen });
   const unchanged = html === lastHtml;
   const editing =
     document.activeElement?.matches?.('textarea.card__text') ?? false;
@@ -130,6 +133,19 @@ function draw(view) {
   });
   root.querySelectorAll('[data-action="retry"]').forEach((button) => {
     button.addEventListener('click', () => send('retry_failed'));
+  });
+  root.querySelector('[data-action="languages"]')?.addEventListener('click', () => {
+    languagesOpen = !languagesOpen;
+    if (lastView) draw(lastView);
+  });
+  // 面板内勾选即时生效；被禁用的勾选框（会突破 2–5 边界）收不到 change。
+  root.querySelectorAll('.board__langs input[type="checkbox"]').forEach((box) => {
+    box.addEventListener('change', () => {
+      const codes = [...root.querySelectorAll('.board__langs input:checked')].map(
+        (el) => el.dataset.langCode,
+      );
+      send('set_languages', { languages: codes });
+    });
   });
   root.querySelector('[data-action="pin"]')?.addEventListener('click', () => send('pin'));
   root.querySelector('[data-action="refresh"]')?.addEventListener('click', () => send('refresh'));

@@ -10,9 +10,9 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bead_core::{
-    Clock, HoverAction, HoverEvent, HoverState, HoverStateMachine, Lang, LanguagePool, ProviderError,
-    SlotStatus, SyncCoordinator, SyncPlan, TranslationItem, TranslationSet, Translator,
-    DEFAULT_HOVER_DELAY_MS, DEFAULT_LEAVE_GRACE_MS,
+    Clock, HeuristicDetector, HoverAction, HoverEvent, HoverState, HoverStateMachine, Lang,
+    LanguagePool, ProviderError, SlotStatus, SyncCoordinator, SyncPlan, TranslationItem,
+    TranslationSet, Translator, DEFAULT_HOVER_DELAY_MS, DEFAULT_LEAVE_GRACE_MS,
 };
 use serde::Serialize;
 use tauri::{LogicalPosition, LogicalSize, Manager};
@@ -317,21 +317,67 @@ fn retry_failed(state: tauri::State<'_, AppState>) -> StateView {
     snapshot(state.inner())
 }
 
+/// 设置面板变更语言池：合法池（2–5 种、不重复）才替换；换池后窗口宽度随之重算并保持贴顶。
+#[tauri::command]
+fn set_languages(
+    languages: Vec<String>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> StateView {
+    let pool = LanguagePool::new(
+        languages
+            .iter()
+            .map(|code| Lang::new(code.as_str()))
+            .collect(),
+    );
+    match pool {
+        Ok(pool) => {
+            let count = pool.languages().len();
+            state
+                .coordinator
+                .lock()
+                .expect("coordinator poisoned")
+                .replace_pool(pool);
+            if let Some(window) = app.get_webview_window("main") {
+                let width = board_width(count);
+                let _ = window.set_size(LogicalSize::new(width, 300.0));
+                if let Ok(Some(monitor)) = window.current_monitor() {
+                    let screen_width = monitor.size().width as f64 / monitor.scale_factor();
+                    let _ = window.set_position(LogicalPosition::new(screen_width - width, 0.0));
+                }
+            }
+            *state.notice.lock().expect("notice poisoned") = None;
+        }
+        Err(error) => {
+            *state.notice.lock().expect("notice poisoned") =
+                Some(format!("语言组合无效：{error:?}"));
+        }
+    }
+    snapshot(state.inner())
+}
+
+/// 窗口宽度随语言数增长：卡片等宽不压缩。每卡目标 185px + 卡间 9px + 内边距 40px。
+fn board_width(card_count: usize) -> f64 {
+    40.0 + 185.0 * card_count as f64 + 9.0 * (card_count as f64 - 1.0)
+}
+
 fn main() {
-    // 工单 02 用固定三语池演示「改一处、其余全部联动」，语言池设置属工单 03。
+    // 默认三语池演示「改一处、其余全部联动」；工单 03 起可在设置面板改为 2–5 种。
     let pool = LanguagePool::new(vec![
         Lang::new("zh"),
         Lang::new("en"),
         Lang::new("ja"),
     ])
-    .expect("ticket 02 uses exactly three languages");
-    // 窗口宽度随语言数增长：卡片等宽不压缩。每卡目标 185px + 卡间 9px + 内边距 40px。
+    .expect("default pool uses exactly three languages");
     let card_count = pool.languages().len();
-    let board_width = 40.0 + 185.0 * card_count as f64 + 9.0 * (card_count as f64 - 1.0);
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState {
-            coordinator: Mutex::new(SyncCoordinator::new(pool, SystemClock)),
+            coordinator: Mutex::new(SyncCoordinator::new(
+                pool,
+                SystemClock,
+                Box::new(HeuristicDetector),
+            )),
             hover: Mutex::new(HoverStateMachine::new(
                 DEFAULT_HOVER_DELAY_MS,
                 DEFAULT_LEAVE_GRACE_MS,
@@ -351,19 +397,21 @@ fn main() {
             commit_edit,
             edit_start,
             edit_end,
-            retry_failed
+            retry_failed,
+            set_languages
         ])
         .setup(move |app| {
             // 贴屏幕顶缘、右缘，尺寸就位后才显示，避免窗口在默认位置闪现。
             // 多显示器与换边持久化属工单 08；这里只对主显示器取默认位。
             let window = app.get_webview_window("main").expect("main window exists");
+            let width = board_width(card_count);
             window
-                .set_size(LogicalSize::new(board_width, 300.0))
+                .set_size(LogicalSize::new(width, 300.0))
                 .expect("resize main window");
             if let Some(monitor) = window.current_monitor().expect("query current monitor") {
                 let screen_width = monitor.size().width as f64 / monitor.scale_factor();
                 window
-                    .set_position(LogicalPosition::new(screen_width - board_width, 0.0))
+                    .set_position(LogicalPosition::new(screen_width - width, 0.0))
                     .expect("position main window");
             }
             window.show().expect("show main window");

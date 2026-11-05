@@ -72,6 +72,20 @@ html, body {
 .board__head button:hover,
 .card__actions button:hover { background: #e9eef6; }
 
+.board__langs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding: 5px 8px;
+  background: #f4f7fc;
+  border: 1px solid #e2e8f2;
+  border-radius: 7px;
+  font-size: 12px;
+}
+
+.board__lang { display: inline-flex; align-items: center; gap: 3px; color: #334155; cursor: pointer; }
+.board__lang.is-disabled { color: #b6c0cf; cursor: not-allowed; }
+
 .board__notice {
   margin: 0;
   padding: 6px 9px;
