@@ -1,0 +1,17 @@
+[package]
+name = "bead-providers"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bead-core = { path = "../bead-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json", "gzip"] }
+percent-encoding = "2"
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+md-5 = "0.10"
+hex = "0.4"
+base64 = "0.22"
