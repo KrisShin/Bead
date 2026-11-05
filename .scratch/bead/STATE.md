@@ -51,6 +51,11 @@
 - **D19** 仓库沿用 Stage 0 的 `git init`，**不重复初始化**，避免抹掉 ship 证据链；用户本次要求的「git init」按「确认仓库可用 + 补齐远端」理解执行。
 - **D20** 远端仓库 `KrisShin/Bead` 已创建为 **PUBLIC**，默认分支 `main`，本地全部提交已推送，本地与远端 HEAD 一致（以 `git rev-parse HEAD` 与 `git ls-remote origin` 实时核对，不在此写死 SHA）。描述为「悬停即译、五语同步的轻量桌面多向翻译工具 (Tauri v2 + Rust)」。HTTPS 代理 `127.0.0.1:2154` 对 git 的 CONNECT 隧道返回 502，改用 SSH 远端 `git@github.com:KrisShin/Bead.git` 推送成功（`Hi KrisShin!` 认证通过）。本次推送由用户单次授权（改名 + Agents.md + 建仓推送为同一条指令）。
 - **D21** 立项期全部调研结论已归档到 `docs/`（索引 `docs/README.md`）：竞品定位、命名排查、翻译源实测与免费额度、平台约束（Wayland / 签名 / 判毒 / 安装器对比 / CI）。定位为**调研留档、非执行依据**；执行依据仍是 `SPEC.md` 与 `TICKETS.md`，代码存在后以代码与测试为准。所有数据标注 2026-11-05 时间性。
+- **D22** 用户确认 Stage 3 门与工单 01 的切片/阻塞边（按 L3 执行），并确认：CI 首刀只加测试 job、不触发发版/打包/签名；需要 `demo/` 探针；依赖清单确认后引入。工单 01 实现据此开工。
+- **D23** 本机 crates.io index 经 cargo 拉取不可用（curl 直连 200，cargo 卡住超过 6 分钟并占住 package cache 锁）。定案改用项目级 `.cargo/config.toml` 的 rsproxy sparse 镜像 + 关闭 HTTP multiplexing，不改全局 cargo 配置。
+- **D24** 工单 01 依赖定案：`tauri` 2.12.5、`tauri-build` 2.7.4、`tauri-plugin-clipboard-manager` 2.5.0、`serde`/`serde_json`；`bead-core` 保持零第三方依赖。前端**不引入** Vite/TypeScript/`@tauri-apps/api` 构建链，改由 Tauri 直接托管 `web/` 静态目录、用 `withGlobalTauri` 注入的全局 invoke —— 减少依赖，单向数据流与视觉快照复用不变。
+- **D25** `demo/` 探针结论：Windows 上 Tauri v2 的窗口定位（读回与请求一致）、置顶、剪贴板读/写/读回/恢复、hover 200ms 防抖均可行，且未注册任何监听器。剪贴板为空或非文本时 `read_text` 报错属预期空态，不是权限配置缺陷。
+- **D26** 远端无 dev 分支，定案从 `main` 新建**本地** `dev` 并切换，不推送。实施进度与验证输出另记 `.scratch/bead/STATUS.md`，本文件仍只记决策、假设与基线。
 
 ## Facts (Stage 1 实测 / 查证)
 
@@ -72,7 +77,7 @@
 
 ## Next action
 
-仍停在 **Stage 3 门**：`TICKETS.md` 已拆好（10 张 tracer bullet、初始前沿仅 01），等待用户确认切片粒度与阻塞边。确认后才进 Stage 4 从工单 01 开始 TDD 实现。本轮完成的改名、`Agents.md`、`docs/` 归档、远端创建与推送属于**仓库基础设施**，不视为 Stage 4 已启动；当前仓库无任何实现代码、无 `Cargo.toml`、0 tests（与 Stage 0 基线一致）。
+Stage 3 门已确认，工单 01（L3）开工后按用户要求**暂停**。实施现状、验证输出、未完成项与恢复顺序见 `.scratch/bead/STATUS.md`；本文件不记进度，具备实现提交后进度由 `git log` 推导。当前尚无实现提交，所有文件均未跟踪、未推送。Stage 0 基线「无 `Cargo.toml`、0 tests」仍是有效历史事实，不修改。
 
 ## 文档地图
 
@@ -82,6 +87,7 @@
 - `.scratch/bead/SPEC.md` — 已批准规格（78 条用户故事）
 - `.scratch/bead/TICKETS.md` — 工单与 Frontier
 - `.scratch/bead/STATE.md` — 本文件，只记决策/假设/基线
+- `.scratch/bead/STATUS.md` — 工单 01 实施现状快照（进度、验证输出与未完成项，非执行依据）
 
 ## Later
 
