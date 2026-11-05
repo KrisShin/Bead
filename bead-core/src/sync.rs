@@ -172,6 +172,38 @@ impl<C: Clock> SyncCoordinator<C> {
         let primary = self.pool.primary().clone();
         self.commit(&primary, text).ok()
     }
+
+    /// 对 apply 标错的卡单独重试：源仍是权威源卡的现文本，一次请求只携带失败语言
+    /// （仍是单个请求，不是每语言各发一次）。无失败卡时返回 None、不递增 generation；
+    /// 「失败不清空已填内容」由 apply 保证，这里不做文本改动。
+    pub fn retry_failed(&mut self) -> Option<SyncPlan> {
+        let authoritative = self.document.authoritative().cloned()?;
+        let source_text = self.document.slot(&authoritative)?.text.clone();
+        let targets: Vec<Lang> = self
+            .pool
+            .targets_excluding(&authoritative)
+            .into_iter()
+            .filter(|lang| {
+                self.document
+                    .slot(lang)
+                    .is_some_and(|slot| slot.status == SlotStatus::Error)
+            })
+            .collect();
+        if targets.is_empty() {
+            return None;
+        }
+        self.generation += 1;
+        for target in &targets {
+            let _ = self.document.set_status(target, SlotStatus::Syncing);
+        }
+        Some(SyncPlan {
+            generation: self.generation,
+            source_lang: authoritative,
+            source_text,
+            targets,
+            created_at_ms: self.clock.now_ms(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -321,5 +353,38 @@ mod tests {
         assert!(coordinator.accept_clipboard("   ", false).is_none());
         assert_eq!(coordinator.generation(), 0);
         assert_eq!(coordinator.document().slot(&Lang::new("zh")).unwrap().text, "");
+    }
+
+    #[test]
+    fn retrying_retranslates_only_the_failed_cards_and_keeps_successful_ones() {
+        let mut coordinator = coordinator(&["zh", "en", "ja"]);
+        let plan = coordinator.commit(&Lang::new("zh"), "你好").unwrap();
+        let mut result = EchoTranslator.translate(&plan).unwrap();
+        result.items[1].text = Err(ProviderError("timeout".into()));
+        coordinator.apply(result);
+
+        let retry = coordinator.retry_failed().expect("failed slot exists");
+        assert_eq!(retry.targets, vec![Lang::new("ja")]);
+        assert_eq!(retry.source_lang, Lang::new("zh"));
+        assert_eq!(retry.source_text, "你好");
+
+        coordinator.apply(EchoTranslator.translate(&retry).unwrap());
+        let retried = coordinator.document().slot(&Lang::new("ja")).unwrap();
+        assert_eq!(retried.text, "[ja] 你好");
+        assert_eq!(retried.status, SlotStatus::Idle);
+        let untouched = coordinator.document().slot(&Lang::new("en")).unwrap();
+        assert_eq!(untouched.text, "[en] 你好");
+        assert_eq!(untouched.status, SlotStatus::Idle);
+    }
+
+    #[test]
+    fn retry_without_any_failed_card_is_a_noop() {
+        let mut coordinator = coordinator(&["zh", "en"]);
+        let plan = coordinator.commit(&Lang::new("zh"), "你好").unwrap();
+        coordinator.apply(EchoTranslator.translate(&plan).unwrap());
+        let before = coordinator.generation();
+
+        assert!(coordinator.retry_failed().is_none());
+        assert_eq!(coordinator.generation(), before);
     }
 }
