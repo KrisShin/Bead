@@ -30,6 +30,9 @@ pub struct AppSettings {
     /// 开机自启（用户显式开启；便携包移动后启动时自动重写路径并提示）。
     #[serde(default)]
     pub autostart_enabled: bool,
+    /// 启动时自动检查更新（只比较与提示，绝不下载安装——产品红线）。
+    #[serde(default = "default_true")]
+    pub auto_check_updates: bool,
     /// 窗口位置（逻辑坐标，退出时记忆；越界回落主屏右上）。
     #[serde(default)]
     pub window_position: Option<(i32, i32)>,
@@ -67,6 +70,7 @@ impl Default for AppSettings {
             selection_hotkey: default_hotkey(),
             autostart_enabled: false,
             window_position: None,
+            auto_check_updates: true,
         }
     }
 }
@@ -120,6 +124,7 @@ mod tests {
             selection_hotkey: "Ctrl+Alt+B".into(),
             autostart_enabled: false,
             window_position: Some((100, 100)),
+            auto_check_updates: true,
             provider: ProviderConfig {
                 engine: bead_providers::Engine::Zhipu,
                 api_key: "key-1".into(),

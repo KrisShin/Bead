@@ -165,6 +165,12 @@ function draw(view) {
   });
   root.querySelector('[data-action="pin"]')?.addEventListener('click', () => send('pin'));
   root.querySelector('[data-action="refresh"]')?.addEventListener('click', () => send('refresh'));
+  root.querySelector('[data-action="check-updates"]')?.addEventListener('click', () => {
+    send('check_updates');
+  });
+  root
+    .querySelector('[data-action="open-release"]')
+    ?.addEventListener('click', () => send('open_release_page'));
 
   root.querySelector('[data-action="save-provider"]')?.addEventListener('click', () => {
     const get = (name) =>
@@ -204,10 +210,13 @@ function draw(view) {
         Number(root.querySelector('[data-setting="hover_delay_ms"]')?.value) || 200;
       const selection =
         root.querySelector('[data-setting="selection_enabled"]')?.checked ?? false;
+      const updates =
+        root.querySelector('[data-setting="auto_check_updates"]')?.checked ?? true;
       send('set_settings', {
         auto_read_clipboard: read,
         hover_delay_ms: delay,
         selection_enabled: selection,
+        auto_check_updates: updates,
       });
     });
   });

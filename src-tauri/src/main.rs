@@ -15,11 +15,12 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bead_core::{
-    ChainConfig, Clock, HeuristicDetector, HoverAction, HoverEvent, HoverState, HoverStateMachine,
-    Lang, LanguagePool, OfflineSpeaker, OnlineTts, ProviderChain, SensitiveFilter, SensitiveVerdict,
-    SlotStatus, SpeechError, SpeechManager, SpeechOutcome, SyncCoordinator, SyncPlan,
+    check_for_update, ChainConfig, Clock, HeuristicDetector, HoverAction, HoverEvent, HoverState,
+    HoverStateMachine, Lang, LanguagePool, OfflineSpeaker, OnlineTts, ProviderChain,
+    ReleaseFetcher, SensitiveFilter, SensitiveVerdict, SlotStatus, SpeechError, SpeechManager,
+    SpeechOutcome, SyncCoordinator, SyncPlan, UpdateError, UpdateStatus,
 };
-use bead_providers::{build_translator, list_models, Engine, ProviderConfig, UreqTransport};
+use bead_providers::{build_translator, list_models, Engine, GitHubReleaseFetcher, ProviderConfig, UreqTransport};
 use serde::Serialize;
 use tauri::{LogicalPosition, LogicalSize, Manager};
 use tauri_plugin_autostart::ManagerExt;
@@ -204,6 +205,7 @@ struct AppState {
     settings: Mutex<settings::AppSettings>,
     settings_dir: Mutex<Option<PathBuf>>,
     speech: Mutex<SpeechManager<GoogleTtsOnline, SapiSpeaker>>,
+    update_latest: Mutex<Option<String>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -240,6 +242,7 @@ struct SettingsView {
     selection_enabled: bool,
     selection_hotkey: String,
     autostart_enabled: bool,
+    auto_check_updates: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -251,6 +254,7 @@ struct StateView {
     provider: ProviderView,
     settings: SettingsView,
     speak: Option<SpeakView>,
+    update_latest: Option<String>,
 }
 
 fn status_name(status: SlotStatus) -> &'static str {
@@ -306,9 +310,40 @@ fn snapshot(state: &AppState) -> StateView {
             selection_enabled: settings.selection_enabled,
             selection_hotkey: settings.selection_hotkey.clone(),
             autostart_enabled: settings.autostart_enabled,
+            auto_check_updates: settings.auto_check_updates,
         },
         speak: None,
+        update_latest: state.update_latest.lock().expect("update poisoned").clone(),
     }
+}
+
+/// 启动时异步检查（不阻塞启动）；手动检查同步返回结果。失败一律静默。
+fn run_update_check(state: &AppState) {
+    let settings = state.settings.lock().expect("settings poisoned");
+    if !settings.auto_check_updates {
+        return;
+    }
+    drop(settings);
+    let status = check_for_update(&GitHubReleaseFetcher::default(), env!("CARGO_PKG_VERSION"));
+    if let UpdateStatus::UpdateAvailable(latest) = status {
+        *state.update_latest.lock().expect("update poisoned") = Some(latest.clone());
+        *state.notice.lock().expect("notice poisoned") =
+            Some(format!("发现新版本 {latest}，可在设置面板前往下载"));
+    }
+}
+
+/// 前往下载：只打开浏览器跳 Release 页，绝不下载/替换自身（产品红线）。
+#[tauri::command]
+fn open_release_page(app: tauri::AppHandle) {
+    let url = "https://github.com/KrisShin/Bead/releases/latest";
+    let _ = match std::env::consts::OS {
+        "windows" => std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .spawn(),
+        "macos" => std::process::Command::new("open").arg(url).spawn(),
+        _ => std::process::Command::new("xdg-open").arg(url).spawn(),
+    };
+    let _ = app;
 }
 
 /// 朗读一张卡：在线抓取→缓存→前端播放，失败自动降级 SAPI 自播，再失败出轻提示。
@@ -648,12 +683,39 @@ fn set_provider(
 }
 
 /// 保存面板设置（自动读剪贴板、悬停延迟）并即时生效。延迟生效通过重建状态机完成，
+/// 手动检查更新：结果写入 notice 与 update_latest（设置面板按钮）。
+#[tauri::command]
+fn check_updates(state: tauri::State<'_, AppState>) -> StateView {
+    let current = env!("CARGO_PKG_VERSION");
+    let status = check_for_update(&GitHubReleaseFetcher::default(), current);
+    let mut view = snapshot(state.inner());
+    match status {
+        UpdateStatus::UpToDate => {
+            *state.update_latest.lock().expect("update poisoned") = None;
+            *state.notice.lock().expect("notice poisoned") =
+                Some(format!("当前已是最新版本 v{current}"));
+        }
+        UpdateStatus::UpdateAvailable(latest) => {
+            *state.update_latest.lock().expect("update poisoned") = Some(latest.clone());
+            *state.notice.lock().expect("notice poisoned") =
+                Some(format!("发现新版本 {latest}（当前 v{current}）"));
+        }
+        UpdateStatus::Failed => {
+            *state.notice.lock().expect("notice poisoned") =
+                Some("检查更新失败：网络不可达或被限流，稍后再试".to_string());
+        }
+    }
+    view = snapshot(state.inner());
+    view
+}
+
 /// 展开态会复位——该动作本身就来自展开的面板，代价可接受。
 #[tauri::command(rename_all = "snake_case")]
 fn set_settings(
     auto_read_clipboard: bool,
     hover_delay_ms: u64,
     selection_enabled: bool,
+    auto_check_updates: bool,
     state: tauri::State<'_, AppState>,
 ) -> StateView {
     let delay = hover_delay_ms.clamp(50, 2000);
@@ -662,6 +724,7 @@ fn set_settings(
         settings.auto_read_clipboard = auto_read_clipboard;
         settings.hover_delay_ms = delay;
         settings.selection_enabled = selection_enabled;
+        settings.auto_check_updates = auto_check_updates;
         let grace = settings.leave_grace_ms;
         *state.hover.lock().expect("hover state poisoned") =
             HoverStateMachine::new(delay, grace);
@@ -861,6 +924,7 @@ fn main() {
                 SapiSpeaker,
                 std::env::temp_dir().join("bead-tts"),
             )),
+            update_latest: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
@@ -880,6 +944,8 @@ fn main() {
             set_provider,
             set_settings,
             set_autostart,
+            check_updates,
+            open_release_page,
             test_provider,
             list_provider_models,
             speak_card
@@ -989,6 +1055,14 @@ fn main() {
             }
             // 划词热键线程：注册失败写 notice；开关关闭时热键仍在但不动作（默认关闭，规范要求）。
             spawn_hotkey_thread(app.handle().clone());
+            // 启动时异步检查更新（auto_check_updates 开关控制），绝不阻塞启动。
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let state = handle.state::<AppState>();
+                    run_update_check(state.inner());
+                });
+            }
             // 托盘：设置 / 显隐胶囊 / 退出（工单 08）。
             build_tray(app.handle())?;
             // Wayland 能力提示：定位/置顶受限是协议限制（立项调研已记录），明确告知不静默。

@@ -106,12 +106,15 @@ export function renderBoard(view) {
     <label>悬停 <input type="number" data-setting="hover_delay_ms" value="${view.settings.hover_delay_ms}" min="50" max="2000" step="50" /> ms 后展开</label>
     <label><input type="checkbox" data-setting="selection_enabled"${view.settings.selection_enabled ? ' checked' : ''} />划词（${view.settings.selection_hotkey}，改键重启生效）</label>
     <label><input type="checkbox" data-setting="autostart" ${view.settings.autostart_enabled ? 'checked' : ''} />开机自启</label>
+    <label><input type="checkbox" data-setting="auto_check_updates" ${view.settings.auto_check_updates ? 'checked' : ''} />启动时检查更新</label>
+    <button type="button" data-action="check-updates">检查更新</button>
   </div>`
       : '';
 
   return `<section id="board" class="board">
   <header class="board__head">
     <span class="board__title">Bead · 悬停即译</span>
+    ${view.update_latest ? `<button type="button" data-action="open-release" title="前往下载">新版 ${escapeHtml(view.update_latest)}</button>` : ''}
     <button type="button" data-action="languages">设置</button>
     <button type="button" data-action="pin">${view.locked ? '已锁定' : '图钉'}</button>
     <button type="button" data-action="refresh" title="忽略去重，重新读取剪贴板">重读</button>

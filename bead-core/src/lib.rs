@@ -15,11 +15,13 @@ pub mod hover;
 pub mod sensitive;
 pub mod speech;
 pub mod sync;
+pub mod update;
 
 pub use chain::{ChainConfig, ProviderChain};
 pub use detector::{HeuristicDetector, LanguageDetector};
 pub use sensitive::{SensitiveFilter, SensitiveVerdict};
 pub use speech::{OfflineSpeaker, OnlineTts, SpeechError, SpeechManager, SpeechOutcome};
+pub use update::{check as check_for_update, compare_versions, ReleaseFetcher, UpdateError, UpdateStatus};
 pub use document::{Document, DocumentError, Lang, LanguagePool, PoolError, Slot, SlotStatus, MAX_LANGUAGES, MIN_LANGUAGES};
 pub use hover::{
     ClipboardError, ClipboardGateway, HoverAction, HoverEvent, HoverState, HoverStateMachine,
