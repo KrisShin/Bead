@@ -1,7 +1,19 @@
 # Bead — 工单实施现状快照
 
-- **记录时间**：2026-11-05 23:01 (GMT+8)；2026-11-06 更新：T01/T02 已提交，T03 已实现待确认
-- **状态**：**T03（语言池 2–5 与初始落卡）实现与验证完成**，等待确认后分条提交；未推送
+- **记录时间**：2026-11-05 23:01 (GMT+8)；2026-11-06 更新：T01–T03 已提交，**T04–T10 全权自动执行中**
+- **状态**：用户已授予全权（无须逐步确认），决策全部记入 STATE.md/STATUS.md；MVP 完成（构建+测试全绿、功能对齐 TICKETS/SPEC）后整理文档、提交并**推送 dev 分支**（不打 tag——tag 触发发版 CI，发布时机留用户）
+
+## 零、T04–T10 自动执行总计划（恢复锚点）
+
+- **T04** Provider 链与真实翻译：bead-core 增 `ProviderChain`（回退/超时/重试上限/熔断，纯逻辑 fake 测试）；新 crate `bead-providers`（HTTP provider 实现，bead-core 保持零依赖）：ZeroKey(MyMemory)、OpenAICompatible(智谱/硅基流动/自定义)、DeepL、腾讯、火山、阿里、百度、有道——请求构造/响应解析用 Transport trait 注入 fake 测试；设置面板加引擎选择与 key/model/base_url + 测试连接。规则 10 解释：单次 translate() 对上层返回全部译文，REST 按语言对的 API 在 provider 内部逐对调用属实现细节（模块文档声明）。
+- **T05** 状态机补全（图钉锁定已有基础）、SensitiveFilter、设置持久化（Tauri app_config_dir JSON，升级兼容未知字段）。
+- **T06** 复制（已有）+ Speech trait（在线优先/离线降级/缓存；Windows 离线走 SAPI PowerShell 后备或 tts crate——按依赖评估定）；界面不出现引擎选择开关。
+- **T07** 划词默认关闭：Windows 取选中文本（模拟 Ctrl+C 读剪贴板，需前台窗口焦点判断）、权限缺失明确提示；快捷键可配。
+- **T08** 开机自启（注册表 Run）、单实例、托盘菜单（设置/显隐/退出）、位置记忆与显示器回落；Wayland 探测降级提示（CI 层面）。
+- **T09** UpdateChecker：GitHub Releases latest tag 比较、可关闭提示、手动检查；绝不下载/替换自身。
+- **T10** README（首句围绕「一次输入多语言并排、改任一语言其余自动同步」）+ CI 发版 workflow（四平台 matrix、SHA256SUMS、无签名）+ 各项静态检查；**只提交不打 tag**。
+- 每张工单：测试先行（能先红的先红）→ 实现 → 全量套件 → CDP/静态冒烟 → STATUS 记录 → 分条提交。真实 IME 手感与 macOS/Linux 运行时按规范如实标注未验证。
+- 已知技术事实：headless Chrome 最小窗宽 500；IAB clip 截图有平铺 bug（整视口截图+GDI+ 裁切）；PowerShell Set-Clipboard 进程退出会清空剪贴板；竖排→横排胶囊变更后 Chromium 会对替换 DOM 补发 mouseenter（渲染层已防）；Document 用 BTreeMap，卡按语言码字典序展示。
 - **分支**：`dev`（本地新建，源自 `main` @ `b1fbc14`；`ls-remote` 确认远端无 dev，故新建本地分支）
 - **Stage 3 门**：用户已确认工单 01 的切片与阻塞边、级别 L3、CI 只做测试 job、需要 demo 探针、依赖清单
 - **本文件用途**：记录实施进度与验证输出。`STATE.md` 只记决策/假设/基线，不记进度；进度细节以本文件为准，提交后仍以 `git log` 为准

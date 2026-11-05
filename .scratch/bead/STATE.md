@@ -56,6 +56,10 @@
 - **D24** 工单 01 依赖定案：`tauri` 2.12.5、`tauri-build` 2.7.4、`tauri-plugin-clipboard-manager` 2.5.0、`serde`/`serde_json`；`bead-core` 保持零第三方依赖。前端**不引入** Vite/TypeScript/`@tauri-apps/api` 构建链，改由 Tauri 直接托管 `web/` 静态目录、用 `withGlobalTauri` 注入的全局 invoke —— 减少依赖，单向数据流与视觉快照复用不变。
 - **D25** `demo/` 探针结论：Windows 上 Tauri v2 的窗口定位（读回与请求一致）、置顶、剪贴板读/写/读回/恢复、hover 200ms 防抖均可行，且未注册任何监听器。剪贴板为空或非文本时 `read_text` 报错属预期空态，不是权限配置缺陷。
 - **D26** 远端无 dev 分支，定案从 `main` 新建**本地** `dev` 并切换，不推送。实施进度与验证输出另记 `.scratch/bead/STATUS.md`，本文件仍只记决策、假设与基线。
+- **D27** 用户于 2026-11-06 授予全权：T04–T10 无须逐步确认，按我建议执行；所有决策与原因记入 STATE/STATUS 文档；MVP 完成后整理文档、提交并**推送 dev 分支**。**不打 tag**（tag 触发发版 CI，发布时机仍归用户）；不可动清单（不签名/不做单文件/更新只比较/默认被动/池上限 5/范围不扩张）继续有效。
+- **D28** T04 依赖评估（规范第 6 条）：HTTP 客户端选 **`ureq` 2.x（rustls 特性）**——阻塞式、体积约 0.3MB、MIT/Apache-2.0，不需要为同步命令引入 tokio 运行时；替代方案 `reqwest`（重、拉 tokio 全家桶）与 `attohttpc/minreq`（生态弱）被否。签名用 RustCrypto 的 `sha2`/`hmac`/`md-5`/`hex`（MIT/Apache-2.0，各 <0.2MB）。provider 实现放**新 crate `bead-providers`**（依赖 bead-core 的 trait），`bead-core` 保持零依赖；HTTP 调用经 `Transport` trait 注入，测试用 fake 不触网。
+- **D29** 规则 10 的解释定案：「一次请求返回全部译文」约束的是上层契约——provider 内部对按语言对设计的 REST API（MyMemory/DeepL）逐对调用属实现细节，对上层仍是一次 `translate()` 返回全部；OpenAI 兼容系则真单次调用携带全部目标。写入模块文档。
+- **D30** T06 TTS 依赖届时评估；优先尝试 Windows SAPI（PowerShell System.Speech）零依赖离线路径 + 在线 TTS API 降级链，避免重依赖；若不可行再评估 crate。
 
 ## Facts (Stage 1 实测 / 查证)
 
