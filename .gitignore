@@ -1,0 +1,38 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Node / Electron ---
+node_modules/
+dist/
+out/
+*.tsbuildinfo
+
+# --- Rust ---
+target/
+
+# --- PyInstaller / build artifacts ---
+build/
+*.spec
+!*.spec.md
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# --- secrets & local state ---
+.env
+.env.*
+!.env.example
+*.log
+config.local.json
