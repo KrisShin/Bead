@@ -49,6 +49,7 @@
 - **D17** SPEC.md 已获用户批准（附带 D15/D16 两处修改，已应用）。Stage 2 门通过。
 - **D18** 项目定名 **Bead**（中文可作「齐译」，不作为交付标识）。用户拍板。标识统一：仓库 `KrisShin/Bead`、本地 `C:/Users/HP/WorkSpace/Bead`、会话工作区 `C:/Users/HP/WorkSpace/WorkBuddy/Bead`、`.scratch/bead/`、二进制 `bead`、PKGBUILD `bead`、crate `bead-core`。原名 FloatTrans 与 `krisir/floattrans`（40★ 同品类 macOS 工具）撞车故弃用。因 Windows 目录句柄占用导致 rename 被拒，改用 `cp -a` 完整拷贝迁移，7 条 git 提交与证据链原样保留。
 - **D19** 仓库沿用 Stage 0 的 `git init`，**不重复初始化**，避免抹掉 ship 证据链；用户本次要求的「git init」按「确认仓库可用 + 补齐远端」理解执行。
+- **D20** 远端仓库 `KrisShin/Bead` 已创建为 **PUBLIC**，默认分支 `main`，本地 9 条提交全部推送，本地/远端 HEAD 均为 `ae89c3c777f78f878f4413140964315ffbc55af9`。描述为「悬停即译、五语同步的轻量桌面多向翻译工具 (Tauri v2 + Rust)」。本次推送由用户单次授权（改名 + Agents.md + 建仓推送为同一条指令）。
 
 ## Facts (Stage 1 实测 / 查证)
 
@@ -74,7 +75,7 @@
 
 ## Later
 
-- ~~GitHub 远端仓库创建与推送~~ → 已升格为 D7 范围内交付物，见 D20
+- ~~GitHub 远端仓库创建与推送~~ → 已完成，见 D20（`KrisShin/Bead`，public，main）
 - 后续可考虑：翻译历史、术语表、OCR 截图翻译、离线模型
 - 旧目录 `C:/Users/HP/WorkSpace/FloatTrans` 与 `C:/Users/HP/WorkSpace/WorkBuddy/FloatTrans` 因 Windows 句柄占用未能删除，待占用释放后清理（内容已完整拷贝到 Bead）
 
