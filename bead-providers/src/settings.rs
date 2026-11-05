@@ -16,6 +16,7 @@ use crate::volc::VolcProvider;
 use crate::youdao::YoudaoProvider;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Engine {
     ZeroKey,
     Zhipu,
@@ -68,6 +69,7 @@ impl Engine {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ProviderConfig {
     pub engine: Engine,
     /// 主凭据：OpenAI 系与 DeepL 是 API key；腾讯/火山/阿里是 AccessKeyId；百度/有道是应用 ID。
