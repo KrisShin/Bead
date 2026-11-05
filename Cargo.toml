@@ -1,0 +1,4 @@
+[workspace]
+members = ["bead-core", "src-tauri"]
+exclude = ["demo"]
+resolver = "2"
