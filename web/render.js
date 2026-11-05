@@ -35,8 +35,9 @@ export function renderBoard(view) {
     ${card.authoritative ? '<span class="card__badge">权威源</span>' : ''}
     ${status ? `<span class="card__status">${status}</span>` : ''}
   </header>
-  <div class="card__text">${escapeHtml(card.text)}</div>
+  <textarea class="card__text" data-lang="${lang}" spellcheck="false">${escapeHtml(card.text)}</textarea>
   <footer class="card__actions">
+    ${card.status === 'error' ? `<button type="button" data-action="retry" data-lang="${lang}">重试</button>` : ''}
     <button type="button" data-action="copy" data-lang="${lang}">复制</button>
   </footer>
 </article>`;
@@ -51,6 +52,6 @@ export function renderBoard(view) {
   </header>
   ${view.notice ? `<p class="board__notice">${escapeHtml(view.notice)}</p>` : ''}
   <div class="board__cards">${cards}</div>
-  <p class="board__hint">ESC 收起 · 编辑联动见工单 02</p>
+  <p class="board__hint">点击卡片直接编辑 · 其余语言自动同步 · ESC 收起</p>
 </section>`;
 }

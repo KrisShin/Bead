@@ -56,4 +56,19 @@ describe('board rendering', () => {
     const html = renderBoard({ ...expanded, notice: '剪贴板为空或非文本' });
     expect(html).toContain('剪贴板为空或非文本');
   });
+
+  it('renders each card text as an editable textarea carrying the current text', () => {
+    const html = renderBoard(expanded);
+    expect(html.match(/<textarea class="card__text"/g)).toHaveLength(2);
+    expect(html).toContain('>你好</textarea>');
+  });
+
+  it('offers a retry button only on the errored card', () => {
+    const html = renderBoard({
+      ...expanded,
+      cards: [expanded.cards[0], { ...expanded.cards[1], status: 'error' }],
+    });
+    expect(html.match(/data-action="retry"/g)).toHaveLength(1);
+    expect(html).toContain('重试');
+  });
 });

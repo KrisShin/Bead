@@ -15,6 +15,7 @@ use bead_core::{
     DEFAULT_HOVER_DELAY_MS, DEFAULT_LEAVE_GRACE_MS,
 };
 use serde::Serialize;
+use tauri::{LogicalPosition, LogicalSize, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 struct SystemClock;
@@ -257,9 +258,76 @@ fn copy_card(lang: String, app: tauri::AppHandle, state: tauri::State<'_, AppSta
     snapshot(state.inner())
 }
 
+/// 编辑提交：该卡成为权威源，fake 译文立刻填充其余卡（工单 04 换成 provider 链后才引入
+/// 真正的异步与过期 generation 竞态；同步命令下 apply 天然发生在同一次调用里）。
+#[tauri::command]
+fn commit_edit(lang: String, text: String, state: tauri::State<'_, AppState>) -> StateView {
+    let plan = state
+        .coordinator
+        .lock()
+        .expect("coordinator poisoned")
+        .commit(&Lang::new(&lang), text);
+    match plan {
+        Ok(plan) => {
+            if let Ok(result) = EchoTranslator.translate(&plan) {
+                let _ = state
+                    .coordinator
+                    .lock()
+                    .expect("coordinator poisoned")
+                    .apply(result);
+            }
+            *state.notice.lock().expect("notice poisoned") = None;
+        }
+        Err(error) => {
+            *state.notice.lock().expect("notice poisoned") =
+                Some(format!("提交失败：{error:?}"));
+        }
+    }
+    snapshot(state.inner())
+}
+
+/// 编辑态进入/退出：状态机在 editing 下不产出读取 intent，hover 不覆盖正在输入的内容。
+#[tauri::command]
+fn edit_start(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> StateView {
+    dispatch(HoverEvent::EditStart, &app, state.inner(), false)
+}
+
+#[tauri::command]
+fn edit_end(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> StateView {
+    dispatch(HoverEvent::EditEnd, &app, state.inner(), false)
+}
+
+/// 只重试 apply 标错的卡：源仍是权威源卡，成功过的卡不发第二次请求。
+#[tauri::command]
+fn retry_failed(state: tauri::State<'_, AppState>) -> StateView {
+    let plan = state
+        .coordinator
+        .lock()
+        .expect("coordinator poisoned")
+        .retry_failed();
+    if let Some(plan) = plan {
+        if let Ok(result) = EchoTranslator.translate(&plan) {
+            let _ = state
+                .coordinator
+                .lock()
+                .expect("coordinator poisoned")
+                .apply(result);
+        }
+    }
+    snapshot(state.inner())
+}
+
 fn main() {
-    let pool = LanguagePool::new(vec![Lang::new("zh"), Lang::new("en")])
-        .expect("ticket 01 uses exactly two languages");
+    // 工单 02 用固定三语池演示「改一处、其余全部联动」，语言池设置属工单 03。
+    let pool = LanguagePool::new(vec![
+        Lang::new("zh"),
+        Lang::new("en"),
+        Lang::new("ja"),
+    ])
+    .expect("ticket 02 uses exactly three languages");
+    // 窗口宽度随语言数增长：卡片等宽不压缩。每卡目标 185px + 卡间 9px + 内边距 40px。
+    let card_count = pool.languages().len();
+    let board_width = 40.0 + 185.0 * card_count as f64 + 9.0 * (card_count as f64 - 1.0);
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState {
@@ -279,8 +347,28 @@ fn main() {
             outside_click,
             pin,
             refresh,
-            copy_card
+            copy_card,
+            commit_edit,
+            edit_start,
+            edit_end,
+            retry_failed
         ])
+        .setup(move |app| {
+            // 贴屏幕顶缘、右缘，尺寸就位后才显示，避免窗口在默认位置闪现。
+            // 多显示器与换边持久化属工单 08；这里只对主显示器取默认位。
+            let window = app.get_webview_window("main").expect("main window exists");
+            window
+                .set_size(LogicalSize::new(board_width, 300.0))
+                .expect("resize main window");
+            if let Some(monitor) = window.current_monitor().expect("query current monitor") {
+                let screen_width = monitor.size().width as f64 / monitor.scale_factor();
+                window
+                    .set_position(LogicalPosition::new(screen_width - board_width, 0.0))
+                    .expect("position main window");
+            }
+            window.show().expect("show main window");
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("failed to run Bead");
 }

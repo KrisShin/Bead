@@ -12,11 +12,10 @@
       {
         "label": "main",
         "title": "Bead",
-        "width": 420,
+        "width": 610,
         "height": 300,
-        "x": 1180,
-        "y": 300,
         "decorations": false,
+        "visible": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "transparent": true,
