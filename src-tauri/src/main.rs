@@ -26,6 +26,136 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 
 struct SystemClock;
 
+// --- Windows 划词取词：全局热键 + 模拟 Ctrl+C（保存/恢复剪贴板） ---
+#[cfg(windows)]
+mod win {
+    #[repr(C)]
+    pub struct Msg {
+        pub hwnd: isize,
+        pub message: u32,
+        pub wparam: usize,
+        pub lparam: isize,
+        pub time: u32,
+        pub pt_x: i32,
+        pub pt_y: i32,
+    }
+
+    extern "system" {
+        pub fn RegisterHotKey(hwnd: isize, id: u32, modifiers: u32, vk: u32) -> i32;
+        pub fn GetMessageW(msg: *mut Msg, hwnd: isize, min: u32, max: u32) -> i32;
+        pub fn keybd_event(vk: u8, scan: u8, flags: u32, extra: usize);
+    }
+
+    pub const WM_HOTKEY: u32 = 0x0312;
+    pub const MOD_CONTROL: u32 = 0x0002;
+    pub const MOD_ALT: u32 = 0x0001;
+    pub const VK_B: u8 = 0x42;
+    pub const KEYEVENTF_KEYUP: u32 = 0x0002;
+}
+
+/// 模拟 Ctrl+C 让前台程序把选中文本复制进剪贴板。
+#[cfg(windows)]
+fn simulate_copy() {
+    unsafe {
+        win::keybd_event(0x11, 0, 0, 0); // Ctrl down
+        win::keybd_event(0x43, 0, 0, 0); // C down
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        win::keybd_event(0x43, 0, win::KEYEVENTF_KEYUP, 0);
+        win::keybd_event(0x11, 0, win::KEYEVENTF_KEYUP, 0);
+    }
+}
+
+#[cfg(windows)]
+fn spawn_hotkey_thread(app: tauri::AppHandle) {
+    std::thread::spawn(move || unsafe {
+        // 快捷键目前固定 Ctrl+Alt+B（settings.selection_hotkey 为可配置位，改键重启生效并如实标注）。
+        if win::RegisterHotKey(0, 1, win::MOD_CONTROL | win::MOD_ALT, win::VK_B as u32) == 0 {
+            let state = app.state::<AppState>();
+            *state.notice.lock().expect("notice poisoned") =
+                Some("划词快捷键 Ctrl+Alt+B 注册失败：可能被其他程序占用".to_string());
+        }
+        let mut msg = win::Msg {
+            hwnd: 0,
+            message: 0,
+            wparam: 0,
+            lparam: 0,
+            time: 0,
+            pt_x: 0,
+            pt_y: 0,
+        };
+        while win::GetMessageW(&mut msg, 0, 0, 0) > 0 {
+            if msg.message == win::WM_HOTKEY && msg.wparam == 1 {
+                let state = app.state::<AppState>();
+                if !state.settings.lock().expect("settings poisoned").selection_enabled {
+                    continue;
+                }
+                capture_and_translate(&app);
+            }
+        }
+    });
+}
+
+/// 取选中文本并送入：保存剪贴板 → 模拟 Ctrl+C → 读 → 恢复 → 过滤 → 翻译。
+#[cfg(windows)]
+fn capture_and_translate(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let old_clipboard = app.clipboard().read_text().ok();
+    simulate_copy();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let text = match app.clipboard().read_text() {
+        Ok(text) => text,
+        Err(_) => {
+            *state.notice.lock().expect("notice poisoned") =
+                Some("取词失败：前台窗口没有可复制的选中文本".to_string());
+            return;
+        }
+    };
+    // 恢复用户剪贴板（取词不该留下痕迹）
+    if let Some(old) = &old_clipboard {
+        let _ = app.clipboard().write_text(old.clone());
+    }
+    // 锁定/编辑态不冲突：跳过并提示
+    match state.hover.lock().expect("hover state poisoned").state() {
+        HoverState::Expanded { locked: true, .. } | HoverState::Expanded { editing: true, .. } => {
+            *state.notice.lock().expect("notice poisoned") =
+                Some("面板已锁定或正在编辑：划词结果未送入".to_string());
+            return;
+        }
+        _ => {}
+    }
+    if let SensitiveVerdict::Skipped(reason) = SensitiveFilter::classify(&text) {
+        *state.notice.lock().expect("notice poisoned") =
+            Some(format!("已跳过敏感内容（{reason}）"));
+        return;
+    }
+    // 展开并送入（SelectionCaptured 展开无读取 intent，文本走本路径）
+    state
+        .hover
+        .lock()
+        .expect("hover state poisoned")
+        .transition(HoverEvent::SelectionCaptured);
+    let plan = {
+        let mut coordinator = state.coordinator.lock().expect("coordinator poisoned");
+        coordinator.accept_clipboard(&text, false)
+    };
+    if let Some(plan) = plan {
+        match run_chain(state.inner(), &plan) {
+            Ok(result) => {
+                let _ = state
+                    .coordinator
+                    .lock()
+                    .expect("coordinator poisoned")
+                    .apply(result);
+                *state.notice.lock().expect("notice poisoned") = None;
+            }
+            Err(_) => {
+                *state.notice.lock().expect("notice poisoned") =
+                    Some("翻译失败：全部引擎都不可用".to_string());
+            }
+        }
+    }
+}
+
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
         SystemTime::now()
@@ -106,6 +236,8 @@ struct SpeakView {
 struct SettingsView {
     auto_read_clipboard: bool,
     hover_delay_ms: u64,
+    selection_enabled: bool,
+    selection_hotkey: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -169,6 +301,8 @@ fn snapshot(state: &AppState) -> StateView {
         settings: SettingsView {
             auto_read_clipboard: settings.auto_read_clipboard,
             hover_delay_ms: settings.hover_delay_ms,
+            selection_enabled: settings.selection_enabled,
+            selection_hotkey: settings.selection_hotkey.clone(),
         },
         speak: None,
     }
@@ -516,6 +650,7 @@ fn set_provider(
 fn set_settings(
     auto_read_clipboard: bool,
     hover_delay_ms: u64,
+    selection_enabled: bool,
     state: tauri::State<'_, AppState>,
 ) -> StateView {
     let delay = hover_delay_ms.clamp(50, 2000);
@@ -523,6 +658,7 @@ fn set_settings(
         let mut settings = state.settings.lock().expect("settings poisoned");
         settings.auto_read_clipboard = auto_read_clipboard;
         settings.hover_delay_ms = delay;
+        settings.selection_enabled = selection_enabled;
         let grace = settings.leave_grace_ms;
         *state.hover.lock().expect("hover state poisoned") =
             HoverStateMachine::new(delay, grace);
@@ -758,6 +894,8 @@ fn main() {
                 *state.settings.lock().expect("settings poisoned") = loaded;
                 *state.settings_dir.lock().expect("settings dir poisoned") = Some(dir.clone());
             }
+            // 划词热键线程：注册失败写 notice；开关关闭时热键仍在但不动作（默认关闭，规范要求）。
+            spawn_hotkey_thread(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())

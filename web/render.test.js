@@ -144,4 +144,10 @@ describe('board rendering', () => {
     });
     expect(on).toContain('data-setting="auto_read_clipboard" checked');
   });
+
+  it('gives every card a speak entry next to copy', () => {
+    const html = renderBoard(expanded);
+    expect(html.match(/data-action="speak"/g)).toHaveLength(2);
+    expect(html).toContain('朗读');
+  });
 });

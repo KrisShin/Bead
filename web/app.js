@@ -63,6 +63,16 @@ async function send(intent, payload = {}) {
   draw(view);
 }
 
+function playSpeak(view) {
+  if (!view.speak || view.speak.kind !== 'file' || !view.speak.url) return;
+  try {
+    const url = window.__TAURI__?.core?.convertFileSrc(view.speak.url);
+    if (url) new Audio(url).play().catch(() => {});
+  } catch {
+    // 播放失败保持静默：朗读是增强功能，不打断翻译主流程
+  }
+}
+
 async function commitEdit(lang, textarea) {
   if (!root.contains(textarea)) return; // 面板已收起：迟到的提交不得复活已清空的文档
   if (composing) return; // 组词中的拼音不是最终文本，compositionend 会重新排程
@@ -131,6 +141,12 @@ function draw(view) {
   root.querySelectorAll('[data-action="copy"]').forEach((button) => {
     button.addEventListener('click', () => send('copy_card', { lang: button.dataset.lang }));
   });
+  root.querySelectorAll('[data-action="speak"]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const view = await send('speak_card', { lang: button.dataset.lang });
+      playSpeak(view);
+    });
+  });
   root.querySelectorAll('[data-action="retry"]').forEach((button) => {
     button.addEventListener('click', () => send('retry_failed'));
   });
@@ -175,14 +191,20 @@ function draw(view) {
     }
   });
 
-  // 设置即时生效：任一控件变化都带全量设置（两个字段一起提交）。
+  // 设置即时生效：任一控件变化都带全量设置。
   root.querySelectorAll('[data-setting]').forEach((input) => {
     input.addEventListener('change', () => {
       const read =
         root.querySelector('[data-setting="auto_read_clipboard"]')?.checked ?? true;
       const delay =
         Number(root.querySelector('[data-setting="hover_delay_ms"]')?.value) || 200;
-      send('set_settings', { auto_read_clipboard: read, hover_delay_ms: delay });
+      const selection =
+        root.querySelector('[data-setting="selection_enabled"]')?.checked ?? false;
+      send('set_settings', {
+        auto_read_clipboard: read,
+        hover_delay_ms: delay,
+        selection_enabled: selection,
+      });
     });
   });
 }

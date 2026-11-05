@@ -22,6 +22,15 @@ pub struct AppSettings {
     pub provider: ProviderConfig,
     #[serde(default = "default_languages")]
     pub languages: Vec<String>,
+    /// 划词默认关闭（规范：默认被动；开启后快捷键触发取词）。
+    #[serde(default)]
+    pub selection_enabled: bool,
+    #[serde(default = "default_hotkey")]
+    pub selection_hotkey: String,
+}
+
+fn default_hotkey() -> String {
+    "Ctrl+Alt+B".into()
 }
 
 fn default_true() -> bool {
@@ -48,6 +57,8 @@ impl Default for AppSettings {
             leave_grace_ms: default_leave_grace(),
             provider: ProviderConfig::default(),
             languages: default_languages(),
+            selection_enabled: false,
+            selection_hotkey: default_hotkey(),
         }
     }
 }
@@ -97,6 +108,8 @@ mod tests {
             auto_read_clipboard: false,
             hover_delay_ms: 350,
             leave_grace_ms: 900,
+            selection_enabled: true,
+            selection_hotkey: "Ctrl+Alt+B".into(),
             provider: ProviderConfig {
                 engine: bead_providers::Engine::Zhipu,
                 api_key: "key-1".into(),

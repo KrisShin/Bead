@@ -46,6 +46,8 @@ pub enum HoverEvent {
     Refresh,
     Esc { at_ms: u64 },
     OutsideClick { at_ms: u64 },
+    /// 划词取到文本（工单 07）：自动展开但不触发剪贴板读取（文本由命令直接送入）。
+    SelectionCaptured,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +98,19 @@ impl HoverStateMachine {
             }
             (HoverState::HoverPending { .. }, HoverEvent::HoverEnter { .. })
             | (HoverState::Expanded { .. }, HoverEvent::HoverEnter { .. }) => vec![],
+
+            // 划词：从任何被动状态自动展开（无读取 intent，文本走命令送入）；
+            // 锁定/编辑态不冲突（内容不被覆盖，送入由命令层拒绝）。
+            (HoverState::Idle, HoverEvent::SelectionCaptured)
+            | (HoverState::HoverPending { .. }, HoverEvent::SelectionCaptured)
+            | (HoverState::Collapsing { .. }, HoverEvent::SelectionCaptured) => {
+                self.state = HoverState::Expanded {
+                    locked: false,
+                    editing: false,
+                };
+                vec![HoverAction::Expand]
+            }
+            (HoverState::Expanded { .. }, HoverEvent::SelectionCaptured) => vec![],
 
             (HoverState::HoverPending { .. }, HoverEvent::HoverLeave { .. }) => {
                 self.state = HoverState::Idle;
@@ -350,5 +365,58 @@ mod tests {
             assert!(actions.contains(&HoverAction::Collapse));
             assert!(actions.contains(&HoverAction::ClearDocument));
         }
+    }
+
+    #[test]
+    fn a_captured_selection_expands_from_idle_without_reading_the_clipboard() {
+        let mut machine = machine();
+        let actions = machine.transition(HoverEvent::SelectionCaptured);
+
+        assert_eq!(
+            machine.state(),
+            HoverState::Expanded {
+                locked: false,
+                editing: false
+            }
+        );
+        assert!(actions.contains(&HoverAction::Expand));
+        assert!(!actions.contains(&HoverAction::ReadClipboardOnce));
+    }
+
+    #[test]
+    fn a_captured_selection_during_collapse_reopens_the_board() {
+        let mut machine = machine();
+        expand(&mut machine);
+        machine.transition(HoverEvent::HoverLeave { at_ms: 500 });
+        machine.transition(HoverEvent::SelectionCaptured);
+
+        assert_eq!(
+            machine.state(),
+            HoverState::Expanded {
+                locked: false,
+                editing: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_captured_selection_does_not_disturb_a_locked_or_editing_board() {
+        let mut locked_machine = machine();
+        expand(&mut locked_machine);
+        locked_machine.transition(HoverEvent::Pin);
+        locked_machine.transition(HoverEvent::SelectionCaptured);
+        assert!(matches!(
+            locked_machine.state(),
+            HoverState::Expanded { locked: true, .. }
+        ));
+
+        let mut editing = machine();
+        expand(&mut editing);
+        editing.transition(HoverEvent::EditStart);
+        editing.transition(HoverEvent::SelectionCaptured);
+        assert!(matches!(
+            editing.state(),
+            HoverState::Expanded { editing: true, .. }
+        ));
     }
 }
