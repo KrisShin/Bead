@@ -101,4 +101,31 @@ describe('board rendering', () => {
     expect(five).toContain('<input type="checkbox" data-lang-code="ja" checked />');
     expect(five).toContain('<input type="checkbox" data-lang-code="de" disabled />');
   });
+
+  it('renders the provider panel with saved credentials never echoed back', () => {
+    const html = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      provider: {
+        engine: 'zhipu',
+        has_key: true,
+        has_secret: false,
+        needs_secret: false,
+        model: 'glm-4.7-flash',
+        base_url: '',
+      },
+    });
+    expect(html).toContain('data-provider="engine"');
+    expect(html).toContain('value="zhipu" selected');
+    expect(html).toContain('type="password"');
+    expect(html).toContain('已保存（留空保持）');
+    expect(html.match(/value="glm-4\.7-flash"/g)).toHaveLength(1); // 模型可回显，密钥绝不
+    expect(html).not.toContain('value="sk-');
+  });
+
+  it('keeps the provider panel out of the default board', () => {
+    const html = renderBoard(expanded);
+    expect(html).not.toContain('board__provider');
+    expect(html).not.toContain('data-action="save-provider"');
+  });
 });

@@ -4,16 +4,18 @@
 //!
 //! 剪贴板读取只出现在 `consume` 的 `ReadClipboardOnce` 分支里，且每个 intent 最多读一次；
 //! 这里没有监听器、没有轮询、没有后台刷新。默认被动因此是结构性的，不靠设置开关去维持。
-//! 工单 01 用固定双语池和 fake translator 打通完整链路，provider、语言池设置与编辑联动留到后续工单。
+//! 翻译经 bead-core 的 ProviderChain（回退/重试/熔断）落到 bead-providers 的真实引擎；
+//! key 只存在 AppState 内存里（工单 05 起持久化到用户配置目录），不写日志、不明文回显。
 
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bead_core::{
-    Clock, HeuristicDetector, HoverAction, HoverEvent, HoverState, HoverStateMachine, Lang,
-    LanguagePool, ProviderError, SlotStatus, SyncCoordinator, SyncPlan, TranslationItem,
-    TranslationSet, Translator, DEFAULT_HOVER_DELAY_MS, DEFAULT_LEAVE_GRACE_MS,
+    ChainConfig, Clock, HeuristicDetector, HoverAction, HoverEvent, HoverState, HoverStateMachine,
+    Lang, LanguagePool, ProviderChain, SlotStatus, SyncCoordinator, SyncPlan,
+    DEFAULT_HOVER_DELAY_MS, DEFAULT_LEAVE_GRACE_MS,
 };
+use bead_providers::{build_translator, list_models, Engine, ProviderConfig, UreqTransport};
 use serde::Serialize;
 use tauri::{LogicalPosition, LogicalSize, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -29,29 +31,12 @@ impl Clock for SystemClock {
     }
 }
 
-/// 工单 01 的假翻译器：不联网、不写 key，只把源文本按目标语言包一层，用于打通完整链路。
-struct EchoTranslator;
-
-impl Translator for EchoTranslator {
-    fn translate(&self, request: &SyncPlan) -> Result<TranslationSet, ProviderError> {
-        Ok(TranslationSet {
-            generation: request.generation,
-            items: request
-                .targets
-                .iter()
-                .map(|language| TranslationItem {
-                    lang: language.clone(),
-                    text: Ok(format!("[{}] {}", language.code(), request.source_text)),
-                })
-                .collect(),
-        })
-    }
-}
-
 struct AppState {
     coordinator: Mutex<SyncCoordinator<SystemClock>>,
     hover: Mutex<HoverStateMachine>,
     notice: Mutex<Option<String>>,
+    chain: Mutex<ProviderChain<SystemClock>>,
+    provider_config: Mutex<ProviderConfig>,
 }
 
 #[derive(Serialize, Clone)]
@@ -62,12 +47,24 @@ struct CardView {
     authoritative: bool,
 }
 
+/// provider 设置视图：key/secret 绝不回传前端，只回传「是否已配置」。
+#[derive(Serialize, Clone)]
+struct ProviderView {
+    engine: String,
+    has_key: bool,
+    has_secret: bool,
+    needs_secret: bool,
+    model: String,
+    base_url: String,
+}
+
 #[derive(Serialize, Clone)]
 struct StateView {
     view: String,
     locked: bool,
     cards: Vec<CardView>,
     notice: Option<String>,
+    provider: ProviderView,
 }
 
 fn status_name(status: SlotStatus) -> &'static str {
@@ -102,12 +99,30 @@ fn snapshot(state: &AppState) -> StateView {
         })
         .collect();
 
+    let provider_config = state.provider_config.lock().expect("provider config poisoned");
     StateView {
         view: view.to_string(),
         locked,
         cards,
         notice: notice.clone(),
+        provider: ProviderView {
+            engine: provider_config.engine.code().to_string(),
+            has_key: provider_config.has_key_stored(),
+            has_secret: provider_config.has_secret_stored(),
+            needs_secret: provider_config.engine_needs_secret(),
+            model: provider_config.model.clone(),
+            base_url: provider_config.base_url.clone(),
+        },
     }
+}
+
+/// 翻译统一走链：回退/重试/熔断都在这里，调用方只看成功或「全部引擎失败」。
+fn run_chain(state: &AppState, plan: &SyncPlan) -> Result<bead_core::TranslationSet, bead_core::ProviderError> {
+    state
+        .chain
+        .lock()
+        .expect("provider chain poisoned")
+        .translate(plan)
 }
 
 /// 只有状态机产出的 intent 才能触碰系统能力。force_refresh 对应界面上的显式「读取剪贴板」。
@@ -122,15 +137,23 @@ fn consume(actions: Vec<HoverAction>, app: &tauri::AppHandle, state: &AppState, 
                         .expect("coordinator poisoned")
                         .accept_clipboard(&text, force_refresh);
                     if let Some(plan) = plan {
-                        if let Ok(result) = EchoTranslator.translate(&plan) {
-                            let _ = state
-                                .coordinator
-                                .lock()
-                                .expect("coordinator poisoned")
-                                .apply(result);
+                        match run_chain(state, &plan) {
+                            Ok(result) => {
+                                let _ = state
+                                    .coordinator
+                                    .lock()
+                                    .expect("coordinator poisoned")
+                                    .apply(result);
+                                *state.notice.lock().expect("notice poisoned") = None;
+                            }
+                            Err(_) => {
+                                *state.notice.lock().expect("notice poisoned") =
+                                    Some("翻译失败：全部引擎都不可用，稍后重试或检查引擎设置".to_string());
+                            }
                         }
+                    } else {
+                        *state.notice.lock().expect("notice poisoned") = None;
                     }
-                    *state.notice.lock().expect("notice poisoned") = None;
                 }
                 Err(_) => {
                     *state.notice.lock().expect("notice poisoned") =
@@ -258,8 +281,9 @@ fn copy_card(lang: String, app: tauri::AppHandle, state: tauri::State<'_, AppSta
     snapshot(state.inner())
 }
 
-/// 编辑提交：该卡成为权威源，fake 译文立刻填充其余卡（工单 04 换成 provider 链后才引入
-/// 真正的异步与过期 generation 竞态；同步命令下 apply 天然发生在同一次调用里）。
+/// 编辑提交：该卡成为权威源，链式翻译立刻填充其余卡。同步命令下网络耗时体现在
+/// 这一次调用的返回上，WebView 不冻结（命令在独立线程执行），渲染保留策略保证
+/// 等待期间还能继续打字。
 #[tauri::command]
 fn commit_edit(lang: String, text: String, state: tauri::State<'_, AppState>) -> StateView {
     let plan = state
@@ -268,16 +292,20 @@ fn commit_edit(lang: String, text: String, state: tauri::State<'_, AppState>) ->
         .expect("coordinator poisoned")
         .commit(&Lang::new(&lang), text);
     match plan {
-        Ok(plan) => {
-            if let Ok(result) = EchoTranslator.translate(&plan) {
+        Ok(plan) => match run_chain(state.inner(), &plan) {
+            Ok(result) => {
                 let _ = state
                     .coordinator
                     .lock()
                     .expect("coordinator poisoned")
                     .apply(result);
+                *state.notice.lock().expect("notice poisoned") = None;
             }
-            *state.notice.lock().expect("notice poisoned") = None;
-        }
+            Err(_) => {
+                *state.notice.lock().expect("notice poisoned") =
+                    Some("翻译失败：全部引擎都不可用，稍后重试或检查引擎设置".to_string());
+            }
+        },
         Err(error) => {
             *state.notice.lock().expect("notice poisoned") =
                 Some(format!("提交失败：{error:?}"));
@@ -306,15 +334,111 @@ fn retry_failed(state: tauri::State<'_, AppState>) -> StateView {
         .expect("coordinator poisoned")
         .retry_failed();
     if let Some(plan) = plan {
-        if let Ok(result) = EchoTranslator.translate(&plan) {
-            let _ = state
-                .coordinator
-                .lock()
-                .expect("coordinator poisoned")
-                .apply(result);
+        match run_chain(state.inner(), &plan) {
+            Ok(result) => {
+                let _ = state
+                    .coordinator
+                    .lock()
+                    .expect("coordinator poisoned")
+                    .apply(result);
+                *state.notice.lock().expect("notice poisoned") = None;
+            }
+            Err(_) => {
+                *state.notice.lock().expect("notice poisoned") =
+                    Some("重试失败：全部引擎都不可用".to_string());
+            }
         }
     }
     snapshot(state.inner())
+}
+
+/// 保存引擎设置并重建链。key 留空表示「保持已保存的值」（前端不回显明文）。
+#[tauri::command]
+fn set_provider(
+    engine: String,
+    api_key: String,
+    secret: String,
+    model: String,
+    base_url: String,
+    state: tauri::State<'_, AppState>,
+) -> StateView {
+    let mut config = state.provider_config.lock().expect("provider config poisoned");
+    match Engine::from_code(&engine) {
+        Some(engine) => {
+            config.engine = engine;
+            // key 留空且已保存过 → 保持旧值（前端不回显明文）；否则覆盖。
+            if !api_key.is_empty() || !config.has_key_stored() {
+                config.api_key = api_key;
+            }
+            if !secret.is_empty() || !config.has_secret_stored() {
+                config.secret = secret;
+            }
+            config.model = model;
+            config.base_url = base_url;
+            rebuild_chain(&config, state.inner());
+            *state.notice.lock().expect("notice poisoned") =
+                Some(format!("已切换到 {} 引擎", engine.code()));
+        }
+        None => {
+            *state.notice.lock().expect("notice poisoned") = Some("未知引擎".to_string());
+        }
+    }
+    drop(config);
+    snapshot(state.inner())
+}
+
+/// 测试连接：用当前配置翻译一句样例，结果写进 notice。
+#[tauri::command]
+fn test_provider(state: tauri::State<'_, AppState>) -> StateView {
+    let config = state.provider_config.lock().expect("provider config poisoned").clone();
+    match build_translator(&config, Box::new(UreqTransport)) {
+        Ok(translator) => {
+            let plan = SyncPlan {
+                generation: 0,
+                source_lang: Lang::new("zh"),
+                source_text: "你好".into(),
+                targets: vec![Lang::new("en")],
+                created_at_ms: SystemClock.now_ms(),
+            };
+            match translator.translate(&plan) {
+                Ok(result) => {
+                    let text = result
+                        .items
+                        .first()
+                        .and_then(|item| item.text.clone().ok())
+                        .unwrap_or_default();
+                    *state.notice.lock().expect("notice poisoned") =
+                        Some(format!("连接成功：{}", text));
+                }
+                Err(error) => {
+                    *state.notice.lock().expect("notice poisoned") =
+                        Some(format!("连接失败：{}", error.0));
+                }
+            }
+        }
+        Err(message) => {
+            *state.notice.lock().expect("notice poisoned") = Some(message);
+        }
+    }
+    snapshot(state.inner())
+}
+
+/// 拉取 OpenAI 兼容引擎的模型清单（运行时探测，不写死）。非兼容引擎返回空表。
+#[tauri::command]
+fn list_provider_models(state: tauri::State<'_, AppState>) -> Vec<String> {
+    list_models(&state.provider_config.lock().expect("provider config poisoned"))
+}
+
+/// 用配置重建 provider 链：当前只挂一个引擎（多引擎回退链留待设置持久化一起做）。
+fn rebuild_chain(config: &ProviderConfig, state: &AppState) {
+    let mut chain = ProviderChain::new(SystemClock, ChainConfig::default());
+    match build_translator(config, Box::new(UreqTransport)) {
+        Ok(translator) => chain.push(translator),
+        Err(message) => {
+            *state.notice.lock().expect("notice poisoned") = Some(message);
+        }
+    }
+    *state.chain.lock().expect("provider chain poisoned") = chain;
 }
 
 /// 设置面板变更语言池：合法池（2–5 种、不重复）才替换；换池后窗口宽度随之重算并保持贴顶。
@@ -370,6 +494,13 @@ fn main() {
     ])
     .expect("default pool uses exactly three languages");
     let card_count = pool.languages().len();
+    // 默认零配置引擎（MyMemory），开箱能翻；切换引擎在设置面板完成（工单 04）。
+    let default_config = ProviderConfig::default();
+    let mut chain = ProviderChain::new(SystemClock, ChainConfig::default());
+    match build_translator(&default_config, Box::new(UreqTransport)) {
+        Ok(translator) => chain.push(translator),
+        Err(message) => panic!("默认引擎装配失败：{message}"),
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState {
@@ -383,6 +514,8 @@ fn main() {
                 DEFAULT_LEAVE_GRACE_MS,
             )),
             notice: Mutex::new(None),
+            chain: Mutex::new(chain),
+            provider_config: Mutex::new(default_config),
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
@@ -398,7 +531,10 @@ fn main() {
             edit_start,
             edit_end,
             retry_failed,
-            set_languages
+            set_languages,
+            set_provider,
+            test_provider,
+            list_provider_models
         ])
         .setup(move |app| {
             // 贴屏幕顶缘、右缘，尺寸就位后才显示，避免窗口在默认位置闪现。

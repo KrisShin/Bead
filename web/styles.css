@@ -86,6 +86,32 @@ html, body {
 .board__lang { display: inline-flex; align-items: center; gap: 3px; color: #334155; cursor: pointer; }
 .board__lang.is-disabled { color: #b6c0cf; cursor: not-allowed; }
 
+.board__provider {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 5px 8px;
+  background: #f4f7fc;
+  border: 1px solid #e2e8f2;
+  border-radius: 7px;
+  font-size: 12px;
+}
+
+.board__provider select,
+.board__provider input {
+  font-size: 12px;
+  padding: 3px 6px;
+  border: 1px solid #d7dfeb;
+  border-radius: 6px;
+  background: #fff;
+  color: #1f2937;
+}
+
+.board__provider input[data-provider='api_key'],
+.board__provider input[data-provider='secret'] { width: 130px; }
+.board__provider input[data-provider='model'] { width: 150px; }
+.board__provider input[data-provider='base_url'] { width: 200px; }
+
 .board__notice {
   margin: 0;
   padding: 6px 9px;

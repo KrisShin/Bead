@@ -6,7 +6,7 @@
 // 否则每次提交的返回都会替换正在打字的输入框；失焦或收起后的下一帧统一刷新。
 // 输入法（IME）守卫：组词中的 Enter/Esc 属于选词操作，不触发提交也不收起面板。
 
-import { renderBoard } from './render.js';
+import { escapeHtml, renderBoard } from './render.js';
 
 const root = document.getElementById('root');
 const invoke = window.__TAURI__?.core?.invoke ?? window.__TAURI__?.invoke;
@@ -149,6 +149,31 @@ function draw(view) {
   });
   root.querySelector('[data-action="pin"]')?.addEventListener('click', () => send('pin'));
   root.querySelector('[data-action="refresh"]')?.addEventListener('click', () => send('refresh'));
+
+  root.querySelector('[data-action="save-provider"]')?.addEventListener('click', () => {
+    const get = (name) =>
+      root.querySelector(`[data-provider="${name}"]`)?.value ?? '';
+    send('set_provider', {
+      engine: get('engine'),
+      api_key: get('api_key'),
+      secret: get('secret'),
+      model: get('model'),
+      base_url: get('base_url'),
+    });
+  });
+  root.querySelector('[data-action="test-provider"]')?.addEventListener('click', () => {
+    send('test_provider');
+  });
+  root.querySelector('[data-action="list-models"]')?.addEventListener('click', async () => {
+    if (!invoke) return;
+    const models = await invoke('list_provider_models');
+    const datalist = root.querySelector('#model-list');
+    if (datalist) {
+      datalist.innerHTML = models
+        .map((model) => `<option value="${escapeHtml(model)}"></option>`)
+        .join('');
+    }
+  });
 }
 
 document.addEventListener('keydown', (event) => {

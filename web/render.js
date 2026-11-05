@@ -11,6 +11,29 @@ const STATUS_LABEL = {
 // 设置面板的候选语言：覆盖常见语系；拉丁系彼此不可字符判别，落卡靠检测回落主语言。
 const LANG_CANDIDATES = ['zh', 'en', 'ja', 'ko', 'fr', 'de', 'es', 'ru'];
 
+// 引擎清单：code 与 Rust Engine::code() 一一对应。
+const ENGINES = [
+  ['zerokey', '默认（免费）'],
+  ['zhipu', '智谱 GLM'],
+  ['siliconflow', '硅基流动'],
+  ['custom', '自定义 OpenAI 兼容'],
+  ['deepl', 'DeepL Free'],
+  ['tencent', '腾讯云'],
+  ['volc', '火山引擎'],
+  ['aliyun', '阿里云'],
+  ['baidu', '百度翻译'],
+  ['youdao', '有道'],
+];
+
+const EMPTY_PROVIDER = {
+  engine: 'zerokey',
+  has_key: false,
+  has_secret: false,
+  needs_secret: false,
+  model: '',
+  base_url: '',
+};
+
 export function escapeHtml(value) {
   return String(value)
     .replaceAll('&', '&amp;')
@@ -56,14 +79,34 @@ export function renderBoard(view) {
       }).join('')}</div>`
     : '';
 
+  // key/secret 一律不回显：只渲染密码框和「已保存」占位（规范第 04 条工单要求）。
+  const provider = view.provider ?? EMPTY_PROVIDER;
+  const providerPanel = view.languagesOpen
+    ? `<div class="board__provider">
+    <select data-provider="engine">${ENGINES.map(
+        ([code, label]) =>
+          `<option value="${code}"${provider.engine === code ? ' selected' : ''}>${label}</option>`,
+      ).join('')}</select>
+    <input type="password" data-provider="api_key" placeholder="${provider.has_key ? '已保存（留空保持）' : '密钥'}" />
+    <input type="password" data-provider="secret" placeholder="${provider.has_secret ? '已保存（留空保持）' : '第二密钥（腾讯/火山/阿里/百度/有道）'}" />
+    <input type="text" data-provider="model" value="${escapeHtml(provider.model)}" placeholder="模型（留空用默认）" list="model-list" />
+    <datalist id="model-list"></datalist>
+    <input type="text" data-provider="base_url" value="${escapeHtml(provider.base_url)}" placeholder="base_url（仅自定义引擎，含 /v1）" />
+    <button type="button" data-action="save-provider">保存</button>
+    <button type="button" data-action="test-provider">测试连接</button>
+    <button type="button" data-action="list-models">拉模型</button>
+  </div>`
+    : '';
+
   return `<section id="board" class="board">
   <header class="board__head">
     <span class="board__title">Bead · 悬停即译</span>
-    <button type="button" data-action="languages">语言</button>
+    <button type="button" data-action="languages">设置</button>
     <button type="button" data-action="pin">${view.locked ? '已锁定' : '图钉'}</button>
     <button type="button" data-action="refresh" title="忽略去重，重新读取剪贴板">重读</button>
   </header>
   ${languagePanel}
+  ${providerPanel}
   ${view.notice ? `<p class="board__notice">${escapeHtml(view.notice)}</p>` : ''}
   <div class="board__cards">${cards}</div>
   <p class="board__hint">点击卡片直接编辑 · 其余语言自动同步 · ESC 收起</p>
