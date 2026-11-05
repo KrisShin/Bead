@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>bead probe</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #eef1f6; font-family: system-ui, sans-serif; }
+    #capsule {
+      position: absolute; right: 8px; top: 40px;
+      padding: 10px 14px; border-radius: 999px;
+      background: #2b3a55; color: #fff; font-size: 13px;
+      user-select: none; cursor: default;
+    }
+  </style>
+</head>
+<body>
+  <div id="capsule">bead probe</div>
+  <script>
+    const invoke = window.__TAURI__?.core?.invoke ?? window.__TAURI__?.invoke;
+    const capsule = document.getElementById('capsule');
+
+    capsule.addEventListener('mouseenter', () => {
+      const started = performance.now();
+      window.setTimeout(() => {
+        const elapsedMs = Math.round(performance.now() - started);
+        invoke?.('report_hover', { elapsedMs });
+      }, 200);
+    });
+
+    // Synthetic hover proves the event chain without requiring a human pointer.
+    window.setTimeout(() => capsule.dispatchEvent(new MouseEvent('mouseenter')), 300);
+    window.setTimeout(() => invoke?.('probe_exit'), 2600);
+  </script>
+</body>
+</html>

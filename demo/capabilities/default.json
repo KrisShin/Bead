@@ -1,0 +1,10 @@
+{
+  "identifier": "probe",
+  "description": "Allow the probe window to call core and clipboard commands.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text"
+  ]
+}

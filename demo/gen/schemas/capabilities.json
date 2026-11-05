@@ -1,0 +1,1 @@
+{"probe":{"identifier":"probe","description":"Allow the probe window to call core and clipboard commands.","local":true,"windows":["main"],"permissions":["core:default","clipboard-manager:allow-read-text","clipboard-manager:allow-write-text"]}}
