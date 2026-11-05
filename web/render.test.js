@@ -128,4 +128,20 @@ describe('board rendering', () => {
     expect(html).not.toContain('board__provider');
     expect(html).not.toContain('data-action="save-provider"');
   });
+
+  it('reflects the auto-read switch and hover delay in the settings section', () => {
+    const html = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      settings: { auto_read_clipboard: false, hover_delay_ms: 350 },
+    });
+    expect(html).toContain('<input type="checkbox" data-setting="auto_read_clipboard" />');
+    expect(html).toContain('value="350"');
+    const on = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      settings: { auto_read_clipboard: true, hover_delay_ms: 200 },
+    });
+    expect(on).toContain('data-setting="auto_read_clipboard" checked');
+  });
 });

@@ -5,15 +5,19 @@
 //! 剪贴板读取只出现在 `consume` 的 `ReadClipboardOnce` 分支里，且每个 intent 最多读一次；
 //! 这里没有监听器、没有轮询、没有后台刷新。默认被动因此是结构性的，不靠设置开关去维持。
 //! 翻译经 bead-core 的 ProviderChain（回退/重试/熔断）落到 bead-providers 的真实引擎；
-//! key 只存在 AppState 内存里（工单 05 起持久化到用户配置目录），不写日志、不明文回显。
+//! key 只存在 AppState 内存与用户配置目录里，不写日志、不明文回显。
+//! 设置（自动读剪贴板、悬停延迟、引擎、语言池）持久化到系统配置目录（工单 05）。
 
+mod settings;
+
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bead_core::{
     ChainConfig, Clock, HeuristicDetector, HoverAction, HoverEvent, HoverState, HoverStateMachine,
-    Lang, LanguagePool, ProviderChain, SlotStatus, SyncCoordinator, SyncPlan,
-    DEFAULT_HOVER_DELAY_MS, DEFAULT_LEAVE_GRACE_MS,
+    Lang, LanguagePool, ProviderChain, SensitiveFilter, SensitiveVerdict, SlotStatus,
+    SyncCoordinator, SyncPlan,
 };
 use bead_providers::{build_translator, list_models, Engine, ProviderConfig, UreqTransport};
 use serde::Serialize;
@@ -37,6 +41,8 @@ struct AppState {
     notice: Mutex<Option<String>>,
     chain: Mutex<ProviderChain<SystemClock>>,
     provider_config: Mutex<ProviderConfig>,
+    settings: Mutex<settings::AppSettings>,
+    settings_dir: Mutex<Option<PathBuf>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -58,6 +64,13 @@ struct ProviderView {
     base_url: String,
 }
 
+/// 设置视图（全量回显——没有机密）。
+#[derive(Serialize, Clone)]
+struct SettingsView {
+    auto_read_clipboard: bool,
+    hover_delay_ms: u64,
+}
+
 #[derive(Serialize, Clone)]
 struct StateView {
     view: String,
@@ -65,6 +78,7 @@ struct StateView {
     cards: Vec<CardView>,
     notice: Option<String>,
     provider: ProviderView,
+    settings: SettingsView,
 }
 
 fn status_name(status: SlotStatus) -> &'static str {
@@ -100,6 +114,7 @@ fn snapshot(state: &AppState) -> StateView {
         .collect();
 
     let provider_config = state.provider_config.lock().expect("provider config poisoned");
+    let settings = state.settings.lock().expect("settings poisoned");
     StateView {
         view: view.to_string(),
         locked,
@@ -112,6 +127,10 @@ fn snapshot(state: &AppState) -> StateView {
             needs_secret: provider_config.engine_needs_secret(),
             model: provider_config.model.clone(),
             base_url: provider_config.base_url.clone(),
+        },
+        settings: SettingsView {
+            auto_read_clipboard: settings.auto_read_clipboard,
+            hover_delay_ms: settings.hover_delay_ms,
         },
     }
 }
@@ -129,37 +148,52 @@ fn run_chain(state: &AppState, plan: &SyncPlan) -> Result<bead_core::Translation
 fn consume(actions: Vec<HoverAction>, app: &tauri::AppHandle, state: &AppState, force_refresh: bool) {
     for action in actions {
         match action {
-            HoverAction::ReadClipboardOnce => match app.clipboard().read_text() {
-                Ok(text) => {
-                    let plan = state
-                        .coordinator
-                        .lock()
-                        .expect("coordinator poisoned")
-                        .accept_clipboard(&text, force_refresh);
-                    if let Some(plan) = plan {
-                        match run_chain(state, &plan) {
-                            Ok(result) => {
-                                let _ = state
-                                    .coordinator
-                                    .lock()
-                                    .expect("coordinator poisoned")
-                                    .apply(result);
+            HoverAction::ReadClipboardOnce => {
+                // 关闭自动读取后：除手动粘贴/输入外无任何读取（重读按钮也拦下，规范从严）。
+                if !state.settings.lock().expect("settings poisoned").auto_read_clipboard {
+                    *state.notice.lock().expect("notice poisoned") =
+                        Some("自动读剪贴板已关闭：可直接在卡片中粘贴或输入".to_string());
+                    continue;
+                }
+                match app.clipboard().read_text() {
+                    Ok(text) => match SensitiveFilter::classify(&text) {
+                        SensitiveVerdict::Skipped(reason) => {
+                            // 敏感内容连 provider 链都不进：过滤发生在读取之后、提交之前。
+                            *state.notice.lock().expect("notice poisoned") =
+                                Some(format!("已跳过敏感内容（{reason}），可在卡片中手动输入需要翻译的部分"));
+                        }
+                        SensitiveVerdict::Allowed => {
+                            let plan = state
+                                .coordinator
+                                .lock()
+                                .expect("coordinator poisoned")
+                                .accept_clipboard(&text, force_refresh);
+                            if let Some(plan) = plan {
+                                match run_chain(state, &plan) {
+                                    Ok(result) => {
+                                        let _ = state
+                                            .coordinator
+                                            .lock()
+                                            .expect("coordinator poisoned")
+                                            .apply(result);
+                                        *state.notice.lock().expect("notice poisoned") = None;
+                                    }
+                                    Err(_) => {
+                                        *state.notice.lock().expect("notice poisoned") =
+                                            Some("翻译失败：全部引擎都不可用，稍后重试或检查引擎设置".to_string());
+                                    }
+                                }
+                            } else {
                                 *state.notice.lock().expect("notice poisoned") = None;
                             }
-                            Err(_) => {
-                                *state.notice.lock().expect("notice poisoned") =
-                                    Some("翻译失败：全部引擎都不可用，稍后重试或检查引擎设置".to_string());
-                            }
                         }
-                    } else {
-                        *state.notice.lock().expect("notice poisoned") = None;
+                    },
+                    Err(_) => {
+                        *state.notice.lock().expect("notice poisoned") =
+                            Some("剪贴板为空或非文本".to_string());
                     }
                 }
-                Err(_) => {
-                    *state.notice.lock().expect("notice poisoned") =
-                        Some("剪贴板为空或非文本".to_string());
-                }
-            },
+            }
             HoverAction::ClearDocument => {
                 state
                     .coordinator
@@ -253,9 +287,19 @@ fn outside_click(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> St
     )
 }
 
+/// 图钉切换：已锁定则解锁，未锁定则锁定（T01 只能锁定不能解锁的缺陷在此修复）。
 #[tauri::command]
 fn pin(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> StateView {
-    dispatch(HoverEvent::Pin, &app, state.inner(), false)
+    let locked = matches!(
+        state.hover.lock().expect("hover state poisoned").state(),
+        HoverState::Expanded { locked: true, .. }
+    );
+    dispatch(
+        if locked { HoverEvent::Unpin } else { HoverEvent::Pin },
+        &app,
+        state.inner(),
+        false,
+    )
 }
 
 #[tauri::command]
@@ -353,7 +397,7 @@ fn retry_failed(state: tauri::State<'_, AppState>) -> StateView {
 }
 
 /// 保存引擎设置并重建链。key 留空表示「保持已保存的值」（前端不回显明文）。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn set_provider(
     engine: String,
     api_key: String,
@@ -376,6 +420,7 @@ fn set_provider(
             config.model = model;
             config.base_url = base_url;
             rebuild_chain(&config, state.inner());
+            state.settings.lock().expect("settings poisoned").provider = config.clone();
             *state.notice.lock().expect("notice poisoned") =
                 Some(format!("已切换到 {} 引擎", engine.code()));
         }
@@ -384,7 +429,40 @@ fn set_provider(
         }
     }
     drop(config);
+    persist(state.inner());
     snapshot(state.inner())
+}
+
+/// 保存面板设置（自动读剪贴板、悬停延迟）并即时生效。延迟生效通过重建状态机完成，
+/// 展开态会复位——该动作本身就来自展开的面板，代价可接受。
+#[tauri::command(rename_all = "snake_case")]
+fn set_settings(
+    auto_read_clipboard: bool,
+    hover_delay_ms: u64,
+    state: tauri::State<'_, AppState>,
+) -> StateView {
+    let delay = hover_delay_ms.clamp(50, 2000);
+    {
+        let mut settings = state.settings.lock().expect("settings poisoned");
+        settings.auto_read_clipboard = auto_read_clipboard;
+        settings.hover_delay_ms = delay;
+        let grace = settings.leave_grace_ms;
+        *state.hover.lock().expect("hover state poisoned") =
+            HoverStateMachine::new(delay, grace);
+    }
+    persist(state.inner());
+    snapshot(state.inner())
+}
+
+/// 设置落盘。目录在 setup 里由 Tauri app_config_dir 提供。
+fn persist(state: &AppState) {
+    let dir = state.settings_dir.lock().expect("settings dir poisoned").clone();
+    if let Some(dir) = dir {
+        let snapshot_settings = state.settings.lock().expect("settings poisoned").clone();
+        if let Err(message) = settings::save(&dir, &snapshot_settings) {
+            *state.notice.lock().expect("notice poisoned") = Some(message);
+        }
+    }
 }
 
 /// 测试连接：用当前配置翻译一句样例，结果写进 notice。
@@ -457,6 +535,10 @@ fn set_languages(
     match pool {
         Ok(pool) => {
             let count = pool.languages().len();
+            {
+                let mut settings = state.settings.lock().expect("settings poisoned");
+                settings.languages = pool.languages().iter().map(|l| l.code().to_string()).collect();
+            }
             state
                 .coordinator
                 .lock()
@@ -471,6 +553,7 @@ fn set_languages(
                 }
             }
             *state.notice.lock().expect("notice poisoned") = None;
+            persist(state.inner());
         }
         Err(error) => {
             *state.notice.lock().expect("notice poisoned") =
@@ -510,12 +593,14 @@ fn main() {
                 Box::new(HeuristicDetector),
             )),
             hover: Mutex::new(HoverStateMachine::new(
-                DEFAULT_HOVER_DELAY_MS,
-                DEFAULT_LEAVE_GRACE_MS,
+                settings::AppSettings::default().hover_delay_ms,
+                settings::AppSettings::default().leave_grace_ms,
             )),
             notice: Mutex::new(None),
             chain: Mutex::new(chain),
             provider_config: Mutex::new(default_config),
+            settings: Mutex::new(settings::AppSettings::default()),
+            settings_dir: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
@@ -533,6 +618,7 @@ fn main() {
             retry_failed,
             set_languages,
             set_provider,
+            set_settings,
             test_provider,
             list_provider_models
         ])
@@ -551,6 +637,42 @@ fn main() {
                     .expect("position main window");
             }
             window.show().expect("show main window");
+
+            // 加载用户设置并应用：语言池、悬停延迟、引擎链（工单 05 持久化）。
+            let state = app.state::<AppState>();
+            let dir = app.path().app_config_dir().ok();
+            if let Some(dir) = &dir {
+                let loaded = settings::load(dir);
+                if let Ok(pool) = LanguagePool::new(
+                    loaded
+                        .languages
+                        .iter()
+                        .map(|code| Lang::new(code.as_str()))
+                        .collect(),
+                ) {
+                    let count = pool.languages().len();
+                    state
+                        .coordinator
+                        .lock()
+                        .expect("coordinator poisoned")
+                        .replace_pool(pool);
+                    let width = board_width(count);
+                    let _ = window.set_size(LogicalSize::new(width, 300.0));
+                    if let Ok(Some(monitor)) = window.current_monitor() {
+                        let screen_width =
+                            monitor.size().width as f64 / monitor.scale_factor();
+                        let _ =
+                            window.set_position(LogicalPosition::new(screen_width - width, 0.0));
+                    }
+                }
+                *state.hover.lock().expect("hover state poisoned") =
+                    HoverStateMachine::new(loaded.hover_delay_ms, loaded.leave_grace_ms);
+                *state.provider_config.lock().expect("provider config poisoned") =
+                    loaded.provider.clone();
+                rebuild_chain(&loaded.provider, state.inner());
+                *state.settings.lock().expect("settings poisoned") = loaded;
+                *state.settings_dir.lock().expect("settings dir poisoned") = Some(dir.clone());
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

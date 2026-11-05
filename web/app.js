@@ -174,6 +174,17 @@ function draw(view) {
         .join('');
     }
   });
+
+  // 设置即时生效：任一控件变化都带全量设置（两个字段一起提交）。
+  root.querySelectorAll('[data-setting]').forEach((input) => {
+    input.addEventListener('change', () => {
+      const read =
+        root.querySelector('[data-setting="auto_read_clipboard"]')?.checked ?? true;
+      const delay =
+        Number(root.querySelector('[data-setting="hover_delay_ms"]')?.value) || 200;
+      send('set_settings', { auto_read_clipboard: read, hover_delay_ms: delay });
+    });
+  });
 }
 
 document.addEventListener('keydown', (event) => {
