@@ -60,6 +60,9 @@
 - **D28** T04 依赖评估（规范第 6 条）：HTTP 客户端选 **`ureq` 2.x（rustls 特性）**——阻塞式、体积约 0.3MB、MIT/Apache-2.0，不需要为同步命令引入 tokio 运行时；替代方案 `reqwest`（重、拉 tokio 全家桶）与 `attohttpc/minreq`（生态弱）被否。签名用 RustCrypto 的 `sha2`/`hmac`/`md-5`/`hex`（MIT/Apache-2.0，各 <0.2MB）。provider 实现放**新 crate `bead-providers`**（依赖 bead-core 的 trait），`bead-core` 保持零依赖；HTTP 调用经 `Transport` trait 注入，测试用 fake 不触网。
 - **D29** 规则 10 的解释定案：「一次请求返回全部译文」约束的是上层契约——provider 内部对按语言对设计的 REST API（MyMemory/DeepL）逐对调用属实现细节，对上层仍是一次 `translate()` 返回全部；OpenAI 兼容系则真单次调用携带全部目标。写入模块文档。
 - **D30** T06 TTS 依赖届时评估；优先尝试 Windows SAPI（PowerShell System.Speech）零依赖离线路径 + 在线 TTS API 降级链，避免重依赖；若不可行再评估 crate。
+- **D31** 许可定为 MIT 单许可（LICENSE 文件已入库）：全部依赖 MIT/Apache-2.0 兼容，未来需要时可加 Apache-2.0 双许可。
+- **D32** MVP 完成后推送 dev 分支到 origin；**不打 tag**——tag 触发发版 CI（release.yml），发布时机归用户。release.yml 的三平台 tauri-action + Arch 容器构建 + SHA256SUMS job 需 tag 首跑验证，可能需小幅调整（已如实标注）。
+- **D33** 敏感过滤与复制链路的运行时端到端验证被环境阻塞（本机剪贴板被外部进程整体锁死，PowerShell Get/Set-Clipboard 同报错误），逻辑由单元测试覆盖（47+ 项），运行时复验留待剪贴板恢复后执行。
 
 ## Facts (Stage 1 实测 / 查证)
 
