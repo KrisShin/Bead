@@ -91,13 +91,21 @@ impl<C: Clock> SyncCoordinator<C> {
         &self.document
     }
 
+    /// 语言池的槽位顺序即卡片顺序；改语言只替换同一槽位，不重排。
+    pub fn pool(&self) -> &LanguagePool {
+        &self.pool
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
+    /// 清空文档并让在途翻译失效：`generation` 递增后，旧计划回来的结果在
+    /// `apply` 里整包丢弃，不会把刚清空的卡又被填回去。
     pub fn clear(&mut self) {
         self.document.clear();
         self.last_clipboard_hash = None;
+        self.generation += 1;
     }
 
     /// 把一张卡设成权威源，并产出一次覆盖所有目标语言的请求。
@@ -162,8 +170,10 @@ impl<C: Clock> SyncCoordinator<C> {
     }
 
     /// hover 读到的剪贴板文本入口。`force` 对应界面上的「刷新」，忽略哈希去重。
-    /// 空文本按空态处理，不发起请求；初始落卡走语言检测：命中池内语言落到对应卡
-    /// （该卡即权威源），检测不出或语言不在池内回落主语言卡。
+    /// 空文本按空态处理，不发起请求；初始落卡走语言检测：
+    /// - 命中池内语言 → 落到对应卡（该卡即权威源）；
+    /// - 识别到语言但池里没有这张卡 → **不粘贴**（不回退到权威源或其他卡）；
+    /// - 完全识别不出（如西里尔字母/纯符号）→ 回落主语言卡，保持旧行为。
     pub fn accept_clipboard(&mut self, text: &str, force: bool) -> Option<SyncPlan> {
         let hash = content_hash(text);
         if !force && self.last_clipboard_hash == Some(hash) {
@@ -173,11 +183,11 @@ impl<C: Clock> SyncCoordinator<C> {
         if text.trim().is_empty() {
             return None;
         }
-        let source = self
-            .detector
-            .detect(text)
-            .filter(|lang| self.pool.contains(lang))
-            .unwrap_or_else(|| self.pool.primary().clone());
+        let source = match self.detector.detect(text) {
+            Some(lang) if self.pool.contains(&lang) => lang,
+            Some(_) => return None,
+            None => self.pool.primary().clone(),
+        };
         self.commit(&source, text).ok()
     }
 
@@ -397,6 +407,19 @@ mod tests {
     }
 
     #[test]
+    fn clearing_the_document_discards_a_translation_that_was_already_in_flight() {
+        let mut coordinator = coordinator(&["zh", "en"]);
+        let plan = coordinator.commit(&Lang::new("zh"), "你好").unwrap();
+        let result = EchoTranslator.translate(&plan).unwrap();
+
+        coordinator.clear();
+
+        assert_eq!(coordinator.apply(result), ApplyOutcome::StaleDiscarded);
+        assert_eq!(coordinator.document().slot(&Lang::new("en")).unwrap().text, "");
+        assert_eq!(coordinator.document().authoritative(), None);
+    }
+
+    #[test]
     fn refresh_forces_a_new_request_for_unchanged_clipboard_content() {
         let mut coordinator = coordinator(&["zh", "en"]);
         coordinator.accept_clipboard("Hello world", false);
@@ -467,24 +490,38 @@ mod tests {
     }
 
     #[test]
-    fn undetected_content_falls_back_to_the_primary_card() {
-        let mut coordinator = coordinator(&["zh", "en"]);
+    fn english_content_lands_on_the_english_card() {
+        let mut coordinator = coordinator_with(
+            Box::new(crate::detector::HeuristicDetector),
+            &["zh", "en"],
+        );
         let plan = coordinator.accept_clipboard("Hello world", false).unwrap();
+        assert_eq!(plan.source_lang, Lang::new("en"));
+        assert_eq!(coordinator.document().authoritative(), Some(&Lang::new("en")));
+    }
+
+    #[test]
+    fn undetected_content_falls_back_to_the_primary_card() {
+        // 纯符号/无法判别书写系统：仍回落主语言卡
+        let mut coordinator = coordinator_with(Box::new(FixedDetector(None)), &["zh", "en"]);
+        let plan = coordinator.accept_clipboard("1234", false).unwrap();
         assert_eq!(plan.source_lang, Lang::new("zh"));
         assert_eq!(
             coordinator.document().slot(&Lang::new("zh")).unwrap().text,
-            "Hello world"
+            "1234"
         );
     }
 
     #[test]
-    fn a_detected_language_outside_the_pool_falls_back_to_the_primary_card() {
+    fn a_detected_language_outside_the_pool_is_not_pasted_at_all() {
         let mut coordinator = coordinator_with(
             Box::new(FixedDetector(Some(Lang::new("ko")))),
             &["zh", "en"],
         );
-        let plan = coordinator.accept_clipboard("안녕하세요", false).unwrap();
-        assert_eq!(plan.source_lang, Lang::new("zh"));
+        // 池里没有 ko 卡：不粘贴，也不回退到 zh/en
+        assert!(coordinator.accept_clipboard("안녕하세요", false).is_none());
+        assert_eq!(coordinator.document().slot(&Lang::new("zh")).unwrap().text, "");
+        assert_eq!(coordinator.document().slot(&Lang::new("en")).unwrap().text, "");
     }
 
     #[test]
@@ -520,5 +557,29 @@ mod tests {
         );
         assert_eq!(coordinator.document().authoritative(), Some(&Lang::new("zh")));
         assert_eq!(coordinator.document().slot(&Lang::new("ja")), None);
+    }
+
+    #[test]
+    fn replacing_a_card_language_keeps_its_slot_position() {
+        let mut coordinator = coordinator(&["zh", "en", "ja"]);
+        let plan = coordinator.commit(&Lang::new("zh"), "你好").unwrap();
+        coordinator.apply(EchoTranslator.translate(&plan).unwrap());
+
+        coordinator.replace_pool(
+            LanguagePool::new(vec![Lang::new("fr"), Lang::new("en"), Lang::new("ja")])
+                .expect("three languages"),
+        );
+
+        let order: Vec<&str> = coordinator
+            .pool()
+            .languages()
+            .iter()
+            .map(|l| l.code())
+            .collect();
+        assert_eq!(order, vec!["fr", "en", "ja"]);
+        assert_eq!(
+            coordinator.document().slot(&Lang::new("en")).unwrap().text,
+            "[en] 你好"
+        );
     }
 }

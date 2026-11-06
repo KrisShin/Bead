@@ -17,7 +17,9 @@ pub struct UreqByteTransport;
 
 impl ByteTransport for UreqByteTransport {
     fn fetch_bytes(&self, request: &HttpRequest) -> Result<Vec<u8>, SpeechError> {
-        let mut req = ureq::get(&request.url).timeout(std::time::Duration::from_secs(8));
+        // 朗读是即时交互：网络不可达时宁可 2.5s 后走离线 SAPI，也不要让用户干等。
+        // 翻译链另有自己的 10s 超时，这里不受影响。
+        let mut req = ureq::get(&request.url).timeout(std::time::Duration::from_millis(2500));
         for (name, value) in &request.headers {
             req = req.set(name, value);
         }

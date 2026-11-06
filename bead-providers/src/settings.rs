@@ -165,8 +165,8 @@ pub fn build_translator(
             require_key(config)?;
             Box::new(TencentProvider::new(
                 transport,
-                config.api_key.clone(), // SecretId 借用 key 字段；SecretKey 见 secret 字段说明
-                config.model.clone(),   // 模型字段在此引擎存 SecretKey（界面占位文案说明）
+                config.api_key.clone(), // SecretId
+                config.secret.clone(),  // SecretKey
                 Box::new(now_secs)
             ))
         }
@@ -175,7 +175,7 @@ pub fn build_translator(
             Box::new(VolcProvider::new(
                 transport,
                 config.api_key.clone(), // AccessKeyId
-                config.model.clone(),   // SecretKey
+                config.secret.clone(),  // SecretKey
                 Box::new(now_secs),
             ))
         }
@@ -184,7 +184,7 @@ pub fn build_translator(
             Box::new(AliyunProvider::new(
                 transport,
                 config.api_key.clone(), // AccessKeyId
-                config.model.clone(),   // AccessKeySecret
+                config.secret.clone(),  // AccessKeySecret
                 Box::new(|| {
                     use std::time::{SystemTime, UNIX_EPOCH};
                     SystemTime::now()
@@ -200,7 +200,7 @@ pub fn build_translator(
             Box::new(BaiduProvider::new(
                 transport,
                 config.api_key.clone(), // APP ID
-                config.model.clone(),   // 密钥
+                config.secret.clone(),  // 密钥
                 Box::new(|| {
                     use std::time::{SystemTime, UNIX_EPOCH};
                     SystemTime::now()
@@ -215,7 +215,7 @@ pub fn build_translator(
             Box::new(YoudaoProvider::new(
                 transport,
                 config.api_key.clone(), // 应用 ID
-                config.model.clone(),   // 应用密钥
+                config.secret.clone(),  // 应用密钥
                 Box::new(|| {
                     use std::time::{SystemTime, UNIX_EPOCH};
                     SystemTime::now()
