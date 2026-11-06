@@ -49,6 +49,8 @@ powershell -File build.ps1            # 完整流程
 powershell -File build.ps1 -SkipTests # 跳过测试快速出包
 ```
 
+脚本会在缺少 `node_modules` 时自动执行 `npm ci`（干净 clone 无需先手动装依赖）。
+
 产物：`target/release/bead.exe`（裸 exe，目录形态便携可用）与
 `target/release/bundle/`（NSIS 安装器；macOS/Linux 上对应 dmg/deb/AppImage）。
 
