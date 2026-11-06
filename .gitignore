@@ -39,3 +39,6 @@ config.local.json
 
 # --- Tauri 生成物（tauri-build 每次构建重新生成）---
 src-tauri/gen/schemas/
+
+# --- 工具产物（HTML 分享包等本地导出物）---
+.trae-html-share-packages/
