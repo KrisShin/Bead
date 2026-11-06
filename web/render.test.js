@@ -4,11 +4,11 @@ import { escapeHtml, renderBoard } from './render.js';
 const expanded = {
   view: 'expanded',
   locked: false,
-  notice: null,
   cards: [
     { lang: 'zh', text: '你好', status: 'idle', authoritative: true },
     { lang: 'en', text: 'Hello', status: 'idle', authoritative: false },
   ],
+  settings: { selection_enabled: false },
 };
 
 describe('board rendering', () => {
@@ -46,15 +46,9 @@ describe('board rendering', () => {
     expect(escapeHtml("it's & done")).toBe('it&#39;s &amp; done');
   });
 
-  it('returns only the capsule when the state is not expanded', () => {
+  it('returns empty string when state is not expanded (capsule is a permanent node)', () => {
     const html = renderBoard({ ...expanded, view: 'capsule' });
-    expect(html).toContain('id="capsule"');
-    expect(html).not.toContain('id="board"');
-  });
-
-  it('shows the clipboard empty notice without an error state', () => {
-    const html = renderBoard({ ...expanded, notice: '剪贴板为空或非文本' });
-    expect(html).toContain('剪贴板为空或非文本');
+    expect(html).toBe('');
   });
 
   it('renders each card text as an editable textarea carrying the current text', () => {
@@ -63,43 +57,27 @@ describe('board rendering', () => {
     expect(html).toContain('>你好</textarea>');
   });
 
-  it('offers a retry button only on the errored card', () => {
+  it('offers a clear-all button instead of the clipboard refresh button', () => {
+    const html = renderBoard(expanded);
+    expect(html).toContain('data-action="clear"');
+    expect(html).not.toContain('data-action="refresh"');
+    expect(html).not.toContain('重读');
+  });
+
+  it('offers a retry icon only on the errored card', () => {
     const html = renderBoard({
       ...expanded,
       cards: [expanded.cards[0], { ...expanded.cards[1], status: 'error' }],
     });
     expect(html.match(/data-action="retry"/g)).toHaveLength(1);
-    expect(html).toContain('重试');
   });
 
-  it('reveals the language panel with all candidates only when opened', () => {
-    expect(renderBoard(expanded)).not.toContain('board__langs');
+  it('hides the translation cards while settings are open and offers no language options', () => {
+    expect(renderBoard(expanded)).toContain('board__cards');
     const html = renderBoard({ ...expanded, languagesOpen: true });
-    expect(html).toContain('board__langs');
-    expect(html).toContain('data-action="languages"');
-    expect(html.match(/data-lang-code="/g)).toHaveLength(8);
-  });
-
-  it('checks pool members and locks changes that would break the two-to-five bound', () => {
-    const two = renderBoard({ ...expanded, languagesOpen: true });
-    // 2 张卡：移除任一都会跌破下限，被锁；新增第三种不受限
-    expect(two).toContain('<input type="checkbox" data-lang-code="zh" checked disabled />');
-    expect(two).toContain('<input type="checkbox" data-lang-code="en" checked disabled />');
-    expect(two).toContain('<input type="checkbox" data-lang-code="ja" />');
-
-    const five = renderBoard({
-      ...expanded,
-      languagesOpen: true,
-      cards: ['zh', 'en', 'ja', 'ko', 'fr'].map((lang) => ({
-        lang,
-        text: 'x',
-        status: 'idle',
-        authoritative: lang === 'zh',
-      })),
-    });
-    // 5 张卡：移除不受限，新增被锁
-    expect(five).toContain('<input type="checkbox" data-lang-code="ja" checked />');
-    expect(five).toContain('<input type="checkbox" data-lang-code="de" disabled />');
+    expect(html).not.toContain('board__cards');
+    expect(html).not.toContain('board__langs');
+    expect(html).not.toContain('data-lang-code');
   });
 
   it('renders the provider panel with saved credentials never echoed back', () => {
@@ -107,19 +85,21 @@ describe('board rendering', () => {
       ...expanded,
       languagesOpen: true,
       provider: {
-        engine: 'zhipu',
+        engine: 'deepl',
         has_key: true,
         has_secret: false,
         needs_secret: false,
-        model: 'glm-4.7-flash',
+        model: '',
         base_url: '',
       },
     });
     expect(html).toContain('data-provider="engine"');
-    expect(html).toContain('value="zhipu" selected');
+    expect(html).toContain('value="deepl" selected');
     expect(html).toContain('type="password"');
     expect(html).toContain('已保存（留空保持）');
-    expect(html.match(/value="glm-4\.7-flash"/g)).toHaveLength(1); // 模型可回显，密钥绝不
+    expect(html).not.toContain('data-provider="model"');
+    expect(html).not.toContain('data-provider="base_url"');
+    expect(html).not.toContain('智谱 GLM');
     expect(html).not.toContain('value="sk-');
   });
 
@@ -145,13 +125,13 @@ describe('board rendering', () => {
     expect(on).toContain('data-setting="auto_read_clipboard" checked');
   });
 
-  it('gives every card a speak entry next to copy', () => {
+  it('gives every card a speak icon next to copy', () => {
     const html = renderBoard(expanded);
     expect(html.match(/data-action="speak"/g)).toHaveLength(2);
-    expect(html).toContain('朗读');
+    expect(html.match(/data-action="copy"/g)).toHaveLength(2);
   });
 
-  it('shows the autostart switch in the settings section', () => {
+  it('shows autostart switch in the settings section', () => {
     const html = renderBoard({
       ...expanded,
       languagesOpen: true,
@@ -165,5 +145,53 @@ describe('board rendering', () => {
     });
     expect(html).toContain('data-setting="autostart" checked');
     expect(html).toContain('开机自启');
+  });
+
+  // --- 新增功能测试 ---
+
+  it('shows close buttons only when there are more than 2 cards', () => {
+    // 2 张卡：不显示关闭按钮
+    const two = renderBoard(expanded);
+    expect(two).not.toContain('data-action="close_card"');
+
+    // 3 张卡：每张都显示关闭按钮
+    const three = renderBoard({
+      ...expanded,
+      cards: [
+        { lang: 'zh', text: '你好', status: 'idle', authoritative: true },
+        { lang: 'en', text: 'Hello', status: 'idle', authoritative: false },
+        { lang: 'ja', text: 'こんにちは', status: 'idle', authoritative: false },
+      ],
+    });
+    expect(three).toContain('data-action="close_card"');
+    expect(three.match(/data-action="close_card"/g)).toHaveLength(3);
+  });
+
+  it('shows add-card button only when there are fewer than 5 cards', () => {
+    // 3 张卡：显示加号
+    const three = renderBoard({
+      ...expanded,
+      cards: [
+        { lang: 'zh', text: '你好', status: 'idle', authoritative: true },
+        { lang: 'en', text: 'Hello', status: 'idle', authoritative: false },
+        { lang: 'ja', text: 'こんにちは', status: 'idle', authoritative: false },
+      ],
+    });
+    expect(three).toContain('data-action="add_card"');
+
+    // 5 张卡：加号隐藏
+    const five = renderBoard({
+      ...expanded,
+      cards: ['zh', 'en', 'ja', 'ko', 'fr'].map((lang) => ({
+        lang, text: 'x', status: 'idle', authoritative: lang === 'zh',
+      })),
+    });
+    expect(five).not.toContain('data-action="add_card"');
+  });
+
+  it('renders autocomplete language selector on every card', () => {
+    const html = renderBoard(expanded);
+    expect(html).toContain('lang-select');
+    expect(html.match(/data-action="change_lang"/g)).toHaveLength(2);
   });
 });

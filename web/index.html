@@ -7,7 +7,12 @@
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
-  <main id="root"></main>
+  <!-- 两个容器都常驻：只在 board-host 内部替换 HTML，绝不重建根节点。
+       重建根节点会让 Chromium 补发 mouseenter/leave，悬浮触发就会抖动。 -->
+  <main id="root" data-view="capsule">
+    <div id="capsule" role="button" aria-label="展开 Bead"><img class="capsule__mark" src="./assets/bead-wordmark.png" alt="" draggable="false" /></div>
+    <div id="board-host"></div>
+  </main>
   <script type="module" src="./app.js"></script>
 </body>
 </html>

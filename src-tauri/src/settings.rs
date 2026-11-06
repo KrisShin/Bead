@@ -33,9 +33,13 @@ pub struct AppSettings {
     /// 启动时自动检查更新（只比较与提示，绝不下载安装——产品红线）。
     #[serde(default = "default_true")]
     pub auto_check_updates: bool,
-    /// 窗口位置（逻辑坐标，退出时记忆；越界回落主屏右上）。
+    /// 窗口位置（旧字段，逻辑坐标；保留写入以兼容旧构建）。
     #[serde(default)]
     pub window_position: Option<(i32, i32)>,
+    /// 胶囊锚点：胶囊左上角逻辑坐标，拖拽后记忆。形态切换只向左/下生长，
+    /// 右缘与上缘由这个锚点决定，因此展开不会把胶囊挪走。
+    #[serde(default)]
+    pub capsule_anchor: Option<(i32, i32)>,
 }
 
 fn default_hotkey() -> String {
@@ -47,7 +51,7 @@ fn default_true() -> bool {
 }
 
 fn default_hover_delay() -> u64 {
-    200
+    400
 }
 
 fn default_leave_grace() -> u64 {
@@ -70,6 +74,7 @@ impl Default for AppSettings {
             selection_hotkey: default_hotkey(),
             autostart_enabled: false,
             window_position: None,
+            capsule_anchor: None,
             auto_check_updates: true,
         }
     }
@@ -124,6 +129,7 @@ mod tests {
             selection_hotkey: "Ctrl+Alt+B".into(),
             autostart_enabled: false,
             window_position: Some((100, 100)),
+            capsule_anchor: Some((100, 100)),
             auto_check_updates: true,
             provider: ProviderConfig {
                 engine: bead_providers::Engine::Zhipu,
@@ -141,6 +147,7 @@ mod tests {
         assert_eq!(loaded.provider.engine, bead_providers::Engine::Zhipu);
         assert_eq!(loaded.provider.api_key, "key-1");
         assert_eq!(loaded.languages, vec!["zh".to_string(), "de".to_string()]);
+        assert_eq!(loaded.capsule_anchor, Some((100, 100)));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -155,7 +162,7 @@ mod tests {
         std::fs::write(settings_path(&dir), legacy).unwrap();
         let loaded = load(&dir);
         assert!(!loaded.auto_read_clipboard);
-        assert_eq!(loaded.hover_delay_ms, 200); // 缺失字段回落默认
+        assert_eq!(loaded.hover_delay_ms, 400); // 缺失字段回落默认
         assert_eq!(loaded.provider.engine, bead_providers::Engine::DeepL);
         std::fs::remove_dir_all(&dir).ok();
     }

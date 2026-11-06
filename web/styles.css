@@ -1,9 +1,15 @@
 :root {
   font-family: "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
   color: #1f2937;
+  --bead-primary: #2b3a55;
+  --bead-primary-soft: #344e78;
+  --bead-surface: #ffffff;
+  --bead-surface-alt: #fbfcfe;
+  --bead-border: #e2e8f2;
+  --bead-muted: #8a94a6;
 }
 
-* { box-sizing: border-box; }
+* { box-sizing: border-box; outline: none; }
 
 html, body {
   margin: 0;
@@ -11,36 +17,153 @@ html, body {
   height: 100%;
   background: transparent;
   overflow: hidden;
+  outline: none;
+  -webkit-tap-highlight-color: transparent;
 }
 
-#root { width: 100%; height: 100%; }
+#root { position: relative; width: 100%; height: 100%; }
 
+/* ========== 胶囊 ==========
+   贴满窗口 68x28，顶边与屏幕顶边齐平；内容为 logo 的字母词组。 */
+/* 纯 div 绘制胶囊：不依赖任何原生控件样式，也不使用 box-shadow
+   （WebView2 透明窗口里阴影的半透明像素会被错误合成成亮色描边）。 */
 #capsule {
   position: absolute;
-  right: 12px;
+  /* 胶囊在窗口内的横向位置由 data-shape 决定：
+       capsule（窗口 68×28）：贴窗口左缘，与屏幕锚点重合；
+       panel（窗口 613×300，位置 = 锚点 - 272）：left 272px，胶囊在屏幕上仍是同一处。
+     272 必须是整数；(613-68)/2 = 272.5 会让胶囊在两种形态之间抖动半像素。 */
+  left: 0;
   top: 0;
-  width: 72px;
+  width: 68px;
   height: 26px;
-  /* 横置标签：平顶紧贴屏幕顶缘，下缘圆角 */
+  border: none;
   border-radius: 0 0 13px 13px;
-  background: #2b3a55;
+  /* 实色卡片，不用渐变/阴影/边框：任何 alpha 渐变边缘在透明窗口里都会被看成描边 */
+  background: #ffffff;
   color: #fff;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 14px;
-  box-shadow: 0 4px 14px rgba(20, 30, 50, 0.28);
-  cursor: default;
+  line-height: 1;
+  cursor: grab;
+  user-select: none;
+  /* 未 hover 时降低不透明度，悬停恢复；不给 transform 建层，避免边缘重采样 */
+  opacity: 0.55;
+  transition: opacity 0.22s cubic-bezier(0.4, 0, 0.2, 1),
+              filter 0.22s ease;
+}
+
+/* logo 字母词组：透明底，等比缩放到胶囊高度内 */
+.capsule__mark {
+  display: block;
+  height: 18px;
+  width: auto;
+  pointer-events: none;
   user-select: none;
 }
 
+#capsule:hover,
+#root[data-view='hover_pending'] #capsule { opacity: 1; }
+#capsule:active { cursor: grabbing; }
+#root[data-view='hover_pending'] #capsule { filter: brightness(0.98); }
+/* 面板形态：胶囊始终隐藏（面板会把这块盖住，露出来就是一块白斑），
+   同时把 left 挪到 272px，等收起缩回窗口时它已经在正确的位置上。 */
+#root[data-shape='panel'] #capsule {
+  left: 272px;
+  opacity: 0;
+  pointer-events: none;
+  transition: none;
+}
+/* 缩回胶囊的那一帧：胶囊要立刻在原位出现，不能从 0 再淡 220ms */
+#root[data-capsule-instant] #capsule { transition: none; }
+
+/* ========== 面板宿主动画 ==========
+   相位（data-phase）由 app.js 驱动，唯一铁律是：
+   **窗口 resize 只发生在画面不可见的那一帧** —— 展开时先全透明再变大，
+   收起时先淡到 0 再缩回。可见期间改窗口尺寸，合成器会把上一帧的白底面板
+   留在胶囊大小的窗口里，就是那块偶发的白色「Bead」矩形。
+   只补间 opacity / transform；面板不做 box-shadow / filter / backdrop-filter 过渡。
+   窗口本体、html、body、宿主背景全部透明，新尺寸窗口在首帧不会露白。 */
+#board-host {
+  position: absolute;
+  inset: 0;
+  background: transparent;
+  /* 由 app.js 在两帧全透明画面提交之后才切到 visible */
+  visibility: hidden;
+  pointer-events: none;
+}
+#board-host[data-visible='true'] {
+  visibility: visible;
+  pointer-events: auto;
+}
+/* will-change 只在动画窗口期内挂上，结束后由 app.js 移除 */
+#board-host[data-motion='on'] .board,
+#board-host[data-motion='on'] .card {
+  will-change: opacity, transform;
+}
+
+/* 进入态：与 closing 终态完全一致 —— 弹出就是回收的逆向 */
+#board-host[data-phase='entering'] .board {
+  opacity: 0;
+  transform: translateY(-4px) scale(0.99);
+}
+/* 展开：opacity 140ms / transform 160ms，与 closing 参数相同、方向相反 */
+#board-host[data-phase='shown'] .board {
+  opacity: 1;
+  transform: none;
+  transition: opacity 140ms cubic-bezier(0.4, 0, 1, 1),
+              transform 160ms cubic-bezier(0.4, 0, 1, 1);
+}
+/* 收起：opacity 140ms / transform 160ms，cubic-bezier(0.4, 0, 1, 1)；
+   这一段走完（transitionend 或 180ms 兜底）之前绝不碰窗口尺寸 */
+#board-host[data-phase='closing'] .board {
+  opacity: 0;
+  transform: translateY(-4px) scale(0.99);
+  transition: opacity 140ms cubic-bezier(0.4, 0, 1, 1),
+              transform 160ms cubic-bezier(0.4, 0, 1, 1);
+}
+/* 收起途中回到胶囊：从当前计算值反向补间，200ms 回正，不改窗口尺寸 */
+#board-host[data-phase='reversing'] .board {
+  opacity: 1;
+  transform: none;
+  transition: opacity 200ms cubic-bezier(0.16, 1, 0.3, 1),
+              transform 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* 卡片错峰：第 n 张 delay = min(n*30ms, 120ms)，各自 200ms 淡入 + 下移归位。 */
+#board-host[data-cards='enter'] .card {
+  /* 展开时的卡片入场：只动 opacity/transform（不动 flex），从下方 6px 归位。
+     不复用 card-pop-in：它带 1.02 的过冲和 -6px 的反向起点，展开时看起来是回弹。 */
+  animation: bead-card-enter 200ms cubic-bezier(0.16, 1, 0.3, 1) var(--card-delay, 0ms) both;
+}
+/* 入场结束后停在 settled：不回退到 card-pop-in（否则会再播放一次过冲动画） */
+#board-host[data-cards='settled'] .card {
+  animation: none;
+}
+@keyframes bead-card-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #capsule,
+  #board-host .board,
+  #board-host .card {
+    transition-duration: 0.01ms;
+    animation-duration: 0.01ms;
+  }
+}
+
+/* ========== 面板本体 ==========
+   inset 1px（仅留 1px 呼吸空间）；用实色 1px 边框代替投影，
+   避免透明窗口把阴影的半透明像素合成成亮边。 */
 .board {
   position: absolute;
-  inset: 8px;
-  background: #ffffff;
-  border: 1px solid #dfe5ee;
+  inset: 1px;
+  background: var(--bead-surface);
   border-radius: 14px;
-  box-shadow: 0 12px 36px rgba(20, 30, 50, 0.22);
+  border: 1px solid #dde5f0;
   padding: 12px;
   overflow: hidden;
   display: flex;
@@ -54,49 +177,115 @@ html, body {
   flex-wrap: wrap;
   gap: 6px;
   font-size: 13px;
+  cursor: grab;
+}
+.board__head:active { cursor: grabbing; }
+
+.board__title {
+  font-weight: 600;
+  color: var(--bead-primary);
+  margin-right: auto;
+  font-size: 14px;
+  letter-spacing: 0.5px;
 }
 
-.board__title { font-weight: 600; margin-right: auto; color: #2b3a55; }
+.board__actions {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+}
 
-.board__head button,
-.card__actions button {
-  border: 1px solid #d7dfeb;
-  background: #f6f8fb;
-  color: #334155;
-  border-radius: 7px;
-  padding: 4px 9px;
-  font-size: 12px;
+/* ========== icon 按钮 ========== */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: #5a6778;
+  border-radius: 6px;
   cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, transform 0.15s ease;
+  position: relative;
+}
+.icon-btn:hover { background: #eef1f6; color: var(--bead-primary); }
+.icon-btn:active { transform: scale(0.93); }
+.icon-btn__svg { display: block; }
+.icon-btn[disabled] { opacity: 0.35; cursor: not-allowed; }
+
+/* 小号 icon 按钮（卡片内） */
+.icon-btn--sm { width: 24px; height: 24px; }
+
+/* 添加卡片按钮（带加号样式） */
+.icon-btn--add {
+  border: 1.5px dashed #c3cddd;
+  border-radius: 8px;
+  width: 28px;
+  height: 28px;
+  color: #94a1b5;
+  background: transparent;
+}
+.icon-btn--add:hover {
+  border-color: var(--bead-primary);
+  color: var(--bead-primary);
+  background: #f0f4fb;
 }
 
-.board__head button:hover,
-.card__actions button:hover { background: #e9eef6; }
+/* tooltip 用 data-tooltip 实现（纯 CSS） */
+.icon-btn[data-tooltip]:hover::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: #2b3a55;
+  color: #fff;
+  font-size: 11px;
+  padding: 3px 7px;
+  border-radius: 4px;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 50;
+}
+.icon-btn[data-tooltip]:hover::before {
+  content: '';
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 50%;
+  transform: translateX(-50%);
+  border: 4px solid transparent;
+  border-bottom-color: #2b3a55;
+  pointer-events: none;
+  z-index: 50;
+}
 
+/* ========== 语言池面板 ========== */
 .board__langs {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 10px;
   padding: 5px 8px;
   background: #f4f7fc;
-  border: 1px solid #e2e8f2;
+  border: 1px solid var(--bead-border);
   border-radius: 7px;
   font-size: 12px;
 }
-
 .board__lang { display: inline-flex; align-items: center; gap: 3px; color: #334155; cursor: pointer; }
 .board__lang.is-disabled { color: #b6c0cf; cursor: not-allowed; }
 
+/* ========== Provider ========== */
 .board__provider {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
   padding: 5px 8px;
   background: #f4f7fc;
-  border: 1px solid #e2e8f2;
+  border: 1px solid var(--bead-border);
   border-radius: 7px;
   font-size: 12px;
 }
-
 .board__provider select,
 .board__provider input {
   font-size: 12px;
@@ -106,64 +295,157 @@ html, body {
   background: #fff;
   color: #1f2937;
 }
-
+.board__provider button {
+  border: 1px solid #d7dfeb;
+  background: #f6f8fb;
+  color: #334155;
+  border-radius: 6px;
+  padding: 3px 9px;
+  font-size: 12px;
+  cursor: pointer;
+}
 .board__provider input[data-provider='api_key'],
 .board__provider input[data-provider='secret'] { width: 130px; }
 .board__provider input[data-provider='model'] { width: 150px; }
 .board__provider input[data-provider='base_url'] { width: 200px; }
 
+/* ========== 设置 ========== */
 .board__settings {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 14px;
   padding: 5px 8px;
   background: #f4f7fc;
-  border: 1px solid #e2e8f2;
+  border: 1px solid var(--bead-border);
   border-radius: 7px;
   font-size: 12px;
   color: #334155;
 }
-
 .board__settings label { display: inline-flex; align-items: center; gap: 4px; }
 .board__settings input[type='number'] { width: 60px; font-size: 12px; padding: 2px 4px; border: 1px solid #d7dfeb; border-radius: 6px; }
-
-.board__notice {
-  margin: 0;
-  padding: 6px 9px;
-  background: #fff7e6;
-  border: 1px solid #f5d9a8;
-  border-radius: 7px;
+.board__settings button {
+  border: 1px solid #d7dfeb;
+  background: #f6f8fb;
+  color: #334155;
+  border-radius: 6px;
+  padding: 3px 9px;
   font-size: 12px;
-  color: #8a5a12;
+  cursor: pointer;
 }
 
+/* ========== 卡片区 ========== */
+/* 卡片宽度固定 189px + 间距 10px：面板宽度随卡片数增长（Rust board_width 同步计算），
+   加卡不再压缩已有卡片，卡片头部的「权威源」tag 也不会被挤位。 */
 .board__cards {
   display: flex;
-  gap: 9px;
+  gap: 10px;
   flex: 1;
   min-height: 0;
 }
 
+/* 卡片：加入/移除缩放动画 */
 .card {
-  border: 1px solid #e2e8f2;
+  border: 1px solid var(--bead-border);
   border-radius: 10px;
   padding: 9px;
-  background: #fbfcfe;
+  background: var(--bead-surface-alt);
   display: flex;
   flex-direction: column;
   gap: 7px;
-  flex: 1 1 0;
+  flex: 0 0 189px;
   min-width: 0;
   min-height: 0;
+  position: relative;
+  /* 卡片增减时的缩放淡入动画 */
+  animation: card-pop-in 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes card-pop-in {
+  0% { opacity: 0; transform: scale(0.92) translateY(-6px); flex: 0 1 0; min-width: 0; }
+  60% { opacity: 1; transform: scale(1.02); }
+  100% { opacity: 1; transform: scale(1); }
 }
 
 .card--authoritative { border-color: #9bb6e4; background: #f4f8ff; }
 .card--error { border-color: #e8a9a9; }
 
-.card__head { display: flex; align-items: center; gap: 6px; font-size: 12px; }
-.card__lang { font-weight: 600; color: #2b3a55; }
-.card__badge { background: #2b3a55; color: #fff; border-radius: 4px; padding: 1px 5px; font-size: 10px; }
+.card__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  position: relative;
+}
+
+.card__lang { font-weight: 600; color: var(--bead-primary); }
+/* 不参与压缩、不换行：卡片数变化时 tag 始终贴在语言选择器右侧 */
+.card__badge {
+  flex: none;
+  white-space: nowrap;
+  background: var(--bead-primary);
+  color: #fff;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 10px;
+}
 .card__status { color: #b26a12; font-size: 11px; }
+
+/* 卡片关闭按钮（hover 显示） */
+.card__close {
+  position: absolute;
+  right: -4px;
+  top: -4px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: none;
+  background: #cbd3de;
+  color: #fff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transform: scale(0.6);
+  transition: opacity 0.2s ease, transform 0.2s ease, background 0.15s ease;
+  z-index: 5;
+}
+.card:hover .card__close {
+  opacity: 1;
+  transform: scale(1);
+}
+.card__close:hover { background: #e25c5c; }
+.card__close-svg { display: block; }
+
+/* 语言选择器 */
+.lang-select {
+  position: relative;
+  display: inline-block;
+}
+.lang-select__select {
+  appearance: none;
+  -webkit-appearance: none;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--bead-primary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 2px 18px 2px 4px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.lang-select__select:hover { border-color: #d7dfeb; background: #f6f8fb; }
+.lang-select__select:focus { outline: none; border-color: var(--bead-primary); background: #fff; }
+.lang-select__chevron {
+  position: absolute;
+  right: 3px;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+  color: #8a94a6;
+}
 
 .card__text {
   flex: 1;
@@ -179,9 +461,31 @@ html, body {
   padding: 0;
   word-break: break-word;
 }
-
 .card__text:focus { outline: none; }
 
-.card__actions { display: flex; flex-shrink: 0; justify-content: flex-end; gap: 6px; }
+.card__actions { display: flex; flex-shrink: 0; justify-content: flex-end; gap: 4px; }
 
-.board__hint { margin: 0; font-size: 11px; color: #8a94a6; }
+/* 旧按钮样式保留（provider / settings 里还在用） */
+.board__head button:not(.icon-btn),
+.card__actions button:not(.icon-btn) {
+  border: 1px solid #d7dfeb;
+  background: #f6f8fb;
+  color: #334155;
+  border-radius: 7px;
+  padding: 4px 9px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.board__head button:not(.icon-btn):hover,
+.card__actions button:not(.icon-btn):hover { background: #e9eef6; }
+
+.board__hint { margin: 0; font-size: 11px; color: var(--bead-muted); }
+
+/* ========== 卡片移除动画 ========== */
+.card.is-removing {
+  animation: card-pop-out 0.28s cubic-bezier(0.55, 0, 0.68, 0.2) forwards;
+}
+@keyframes card-pop-out {
+  0% { opacity: 1; transform: scale(1); flex: 1 1 0; min-width: 0; }
+  100% { opacity: 0; transform: scale(0.88); flex: 0 1 0; min-width: 0; padding: 0; margin: 0; }
+}
