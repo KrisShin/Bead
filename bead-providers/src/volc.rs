@@ -2,11 +2,11 @@
 //!
 //! 与规则 10 对齐：一次请求的 TextList 就是全部原文（这里只有一个原文），目标语言逐对调用。
 
-use bead_core::{Lang, ProviderError, SyncPlan, TranslationItem, TranslationSet, Translator};
+use bead_core::{ProviderError, SyncPlan, TranslationItem, TranslationSet, Translator};
 use serde_json::{json, Value};
 
 use crate::signing::{hmac_sha256_hex, hmac_sha256_raw, sha256_hex, utc_parts};
-use crate::transport::{HttpMethod, HttpRequest, HttpResponse, Transport};
+use crate::transport::{HttpMethod, HttpRequest, Transport};
 
 const HOST: &str = "translate.volcengineapi.com";
 const REGION: &str = "cn-north-1";
@@ -117,6 +117,8 @@ impl Translator for VolcProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::HttpResponse;
+    use bead_core::{Lang, SyncPlan};
     use std::sync::{Arc, Mutex};
     
     

@@ -2,10 +2,10 @@
 //!
 //! key 不写入日志；错误直接透传 provider 的 JSON 说明。
 
-use bead_core::{Lang, ProviderError, SyncPlan, TranslationItem, TranslationSet, Translator};
+use bead_core::{ProviderError, SyncPlan, TranslationItem, TranslationSet, Translator};
 use serde_json::{json, Value};
 
-use crate::transport::{HttpMethod, HttpRequest, HttpResponse, Transport};
+use crate::transport::{HttpMethod, HttpRequest, Transport};
 
 pub struct DeepLProvider {
     transport: Box<dyn Transport>,
@@ -80,6 +80,8 @@ impl Translator for DeepLProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::HttpResponse;
+    use bead_core::{Lang, SyncPlan};
     use std::sync::{Arc, Mutex};
     
     

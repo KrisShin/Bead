@@ -7,7 +7,7 @@
 use bead_core::{Lang, ProviderError, SyncPlan, TranslationItem, TranslationSet, Translator};
 use serde_json::Value;
 
-use crate::transport::{encode_query, HttpMethod, HttpRequest, HttpResponse, Transport};
+use crate::transport::{encode_query, HttpMethod, HttpRequest, Transport};
 
 pub struct MyMemoryProvider {
     transport: Box<dyn Transport>,
@@ -95,6 +95,7 @@ fn translate_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::HttpResponse;
     use std::sync::{Arc, Mutex};
     
     

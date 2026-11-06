@@ -1,10 +1,10 @@
 //! 腾讯云文本翻译（TMT）：TC3-HMAC-SHA256 签名，单次请求一个目标语言（D29 解释适用）。
 
-use bead_core::{Lang, ProviderError, SyncPlan, TranslationItem, TranslationSet, Translator};
+use bead_core::{ProviderError, SyncPlan, TranslationItem, TranslationSet, Translator};
 use serde_json::{json, Value};
 
 use crate::signing::{hmac_sha256_hex, hmac_sha256_raw, sha256_hex, utc_parts};
-use crate::transport::{HttpMethod, HttpRequest, HttpResponse, Transport};
+use crate::transport::{HttpMethod, HttpRequest, Transport};
 
 const HOST: &str = "tmt.tencentcloudapi.com";
 const SERVICE: &str = "tmt";
@@ -115,6 +115,8 @@ impl Translator for TencentProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::HttpResponse;
+    use bead_core::{Lang, SyncPlan};
     use std::sync::{Arc, Mutex};
     
     

@@ -1,10 +1,10 @@
 //! 阿里云机器翻译（Alimt 2018-12-25）：RPC HMAC-SHA1 签名，按目标语言逐对请求（D29 解释适用）。
 
-use bead_core::{Lang, ProviderError, SyncPlan, TranslationItem, TranslationSet, Translator};
+use bead_core::{ProviderError, SyncPlan, TranslationItem, TranslationSet, Translator};
 use serde_json::Value;
 
 use crate::signing::{hmac_sha1_base64, utc_parts};
-use crate::transport::{encode_query, HttpMethod, HttpRequest, HttpResponse, Transport};
+use crate::transport::{encode_query, HttpMethod, HttpRequest, Transport};
 
 pub struct AliyunProvider {
     transport: Box<dyn Transport>,
@@ -104,6 +104,8 @@ impl Translator for AliyunProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::HttpResponse;
+    use bead_core::{Lang, SyncPlan};
     use std::sync::{Arc, Mutex};
     
     

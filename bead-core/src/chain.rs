@@ -11,8 +11,7 @@
 //! - 熔断按引擎计数而不是按请求：连续失败达到阈值后该引擎进入冷却，冷却期内直接跳过，
 //!   到期自动半开重试。计数在成功时清零。
 
-use crate::document::Lang;
-use crate::sync::{Clock, ProviderError, SyncPlan, TranslationItem, TranslationSet, Translator};
+use crate::sync::{Clock, ProviderError, SyncPlan, TranslationSet, Translator};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ChainConfig {
@@ -129,6 +128,8 @@ impl<C: Clock> ProviderChain<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::Lang;
+    use crate::sync::TranslationItem;
     use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;

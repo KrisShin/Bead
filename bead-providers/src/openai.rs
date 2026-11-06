@@ -4,10 +4,10 @@
 //! 运行时探测（shell 层职责），这里只负责「构造请求 → 解析严格 JSON 译文」。
 //! 模型输出常被围栏或寒暄包裹，解析前先抠 JSON 对象。
 
-use bead_core::{Lang, ProviderError, SyncPlan, TranslationItem, TranslationSet, Translator};
+use bead_core::{ProviderError, SyncPlan, TranslationItem, TranslationSet, Translator};
 use serde_json::{json, Value};
 
-use crate::transport::{extract_json_object, HttpMethod, HttpRequest, HttpResponse, Transport};
+use crate::transport::{extract_json_object, HttpMethod, HttpRequest, Transport};
 
 pub struct OpenAiCompatibleProvider {
     transport: Box<dyn Transport>,
@@ -149,6 +149,8 @@ impl Translator for OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::HttpResponse;
+    use bead_core::{Lang, SyncPlan};
     use std::sync::{Arc, Mutex};
     
     

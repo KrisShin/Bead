@@ -39,9 +39,18 @@
 ```bash
 cargo test --manifest-path bead-core/Cargo.toml   # 核心行为测试
 npm test                                          # 前端渲染测试
-cargo build -p bead                               # 调试构建
-cargo tauri build                                 # 出包（各平台产物见 src-tauri/tauri.conf.json）
+cargo build -p bead                               # 调试构建（debug）
 ```
+
+一键打包（Windows，含全量测试 + NSIS 安装器产出）：
+
+```powershell
+powershell -File build.ps1            # 完整流程
+powershell -File build.ps1 -SkipTests # 跳过测试快速出包
+```
+
+产物：`target/release/bead.exe`（裸 exe，目录形态便携可用）与
+`target/release/bundle/`（NSIS 安装器；macOS/Linux 上对应 dmg/deb/AppImage）。
 
 ## 许可
 

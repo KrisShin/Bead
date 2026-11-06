@@ -16,9 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bead_core::{
     check_for_update, ChainConfig, Clock, HeuristicDetector, HoverAction, HoverEvent, HoverState,
-    HoverStateMachine, Lang, LanguagePool, OfflineSpeaker, OnlineTts, ProviderChain,
-    ReleaseFetcher, SensitiveFilter, SensitiveVerdict, SlotStatus, SpeechError, SpeechManager,
-    SpeechOutcome, SyncCoordinator, SyncPlan, UpdateError, UpdateStatus,
+    HoverStateMachine, Lang, LanguagePool, OfflineSpeaker, OnlineTts, ProviderChain, SensitiveFilter, SensitiveVerdict, SlotStatus, SpeechError, SpeechManager,
+    SpeechOutcome, SyncCoordinator, SyncPlan, UpdateStatus,
 };
 use bead_providers::{build_translator, list_models, Engine, GitHubReleaseFetcher, ProviderConfig, UreqTransport};
 use serde::Serialize;
@@ -136,6 +135,7 @@ fn capture_and_translate(app: &tauri::AppHandle) {
         .lock()
         .expect("hover state poisoned")
         .transition(HoverEvent::SelectionCaptured);
+    apply_window_shape(app, state.inner(), "expanded");
     let plan = {
         let mut coordinator = state.coordinator.lock().expect("coordinator poisoned");
         coordinator.accept_clipboard(&text, false)
@@ -384,6 +384,22 @@ fn speak_card(lang: String, state: tauri::State<'_, AppState>) -> StateView {
     view
 }
 
+/// 窗口形态跟随状态：胶囊态只留顶部一条（其余桌面区域不被透明窗口挡住点击），
+/// 展开态恢复整板。位置始终贴屏幕顶缘右缘。
+fn apply_window_shape(app: &tauri::AppHandle, state: &AppState, view_kind: &str) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let expanded = view_kind == "expanded";
+    let height = if expanded { 300.0 } else { CAPSULE_WINDOW_HEIGHT };
+    let width = board_width(state.settings.lock().expect("settings poisoned").languages.len());
+    if let Ok(Some(monitor)) = window.current_monitor() {
+        let screen_width = monitor.size().width as f64 / monitor.scale_factor();
+        let _ = window.set_size(LogicalSize::new(width, height));
+        let _ = window.set_position(LogicalPosition::new(screen_width - width, 0.0));
+    }
+}
+
 /// 翻译统一走链：回退/重试/熔断都在这里，调用方只看成功或「全部引擎失败」。
 fn run_chain(state: &AppState, plan: &SyncPlan) -> Result<bead_core::TranslationSet, bead_core::ProviderError> {
     state
@@ -468,12 +484,16 @@ fn dispatch(
         .expect("hover state poisoned")
         .transition(event);
     consume(actions, app, state, force_refresh);
-    snapshot(state)
+    let view = snapshot(state);
+    apply_window_shape(app, state, &view.view);
+    view
 }
 
 #[tauri::command]
-fn get_state(state: tauri::State<'_, AppState>) -> StateView {
-    snapshot(state.inner())
+fn get_state(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> StateView {
+    let view = snapshot(state.inner());
+    apply_window_shape(&app, state.inner(), &view.view);
+    view
 }
 
 #[tauri::command]
@@ -682,13 +702,11 @@ fn set_provider(
     snapshot(state.inner())
 }
 
-/// 保存面板设置（自动读剪贴板、悬停延迟）并即时生效。延迟生效通过重建状态机完成，
 /// 手动检查更新：结果写入 notice 与 update_latest（设置面板按钮）。
 #[tauri::command]
 fn check_updates(state: tauri::State<'_, AppState>) -> StateView {
     let current = env!("CARGO_PKG_VERSION");
     let status = check_for_update(&GitHubReleaseFetcher::default(), current);
-    let mut view = snapshot(state.inner());
     match status {
         UpdateStatus::UpToDate => {
             *state.update_latest.lock().expect("update poisoned") = None;
@@ -705,11 +723,11 @@ fn check_updates(state: tauri::State<'_, AppState>) -> StateView {
                 Some("检查更新失败：网络不可达或被限流，稍后再试".to_string());
         }
     }
-    view = snapshot(state.inner());
-    view
+    snapshot(state.inner())
 }
 
-/// 展开态会复位——该动作本身就来自展开的面板，代价可接受。
+/// 保存面板设置（自动读剪贴板、悬停延迟、划词、更新开关）并即时生效。
+/// 延迟生效通过重建状态机完成，展开态会复位——该动作本身就来自展开的面板，代价可接受。
 #[tauri::command(rename_all = "snake_case")]
 fn set_settings(
     auto_read_clipboard: bool,
@@ -872,6 +890,9 @@ fn set_languages(
 fn board_width(card_count: usize) -> f64 {
     40.0 + 185.0 * card_count as f64 + 9.0 * (card_count as f64 - 1.0)
 }
+
+/// 胶囊态窗口高度：胶囊 26px + 1px 余量，保证除胶囊外没有任何可点透明区。
+const CAPSULE_WINDOW_HEIGHT: f64 = 27.0;
 
 fn main() {
     // 默认三语池演示「改一处、其余全部联动」；工单 03 起可在设置面板改为 2–5 种。

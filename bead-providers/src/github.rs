@@ -5,7 +5,7 @@
 
 use bead_core::UpdateError;
 
-use crate::transport::{HttpRequest, Transport};
+use crate::transport::HttpRequest;
 
 pub const RELEASES_API: &str = "https://api.github.com/repos/KrisShin/Bead/releases/latest";
 
@@ -49,6 +49,7 @@ impl bead_core::ReleaseFetcher for GitHubReleaseFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::HttpResponse;
     use bead_core::ReleaseFetcher;
     use std::cell::RefCell;
     use std::sync::{Arc, Mutex};

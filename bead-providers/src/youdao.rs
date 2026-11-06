@@ -1,10 +1,10 @@
 //! 有道智云文本翻译：SHA-256 v3 签名，表单提交，按目标语言逐对请求（D29 解释适用）。
 
-use bead_core::{Lang, ProviderError, SyncPlan, TranslationItem, TranslationSet, Translator};
+use bead_core::{ProviderError, SyncPlan, TranslationItem, TranslationSet, Translator};
 use serde_json::Value;
 
-use crate::signing::{sha256_hex, utc_parts};
-use crate::transport::{encode_query, HttpMethod, HttpRequest, HttpResponse, Transport};
+use crate::signing::sha256_hex;
+use crate::transport::{encode_query, HttpMethod, HttpRequest, Transport};
 
 pub struct YoudaoProvider {
     transport: Box<dyn Transport>,
@@ -114,6 +114,9 @@ impl Translator for YoudaoProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signing::utc_parts;
+    use crate::transport::HttpResponse;
+    use bead_core::{Lang, SyncPlan};
     use std::sync::{Arc, Mutex};
 
     #[test]

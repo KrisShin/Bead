@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "build": "powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2",
     "vitest": "^2.1.9"
   }
 }

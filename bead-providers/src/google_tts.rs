@@ -6,7 +6,7 @@
 
 use bead_core::{Lang, SpeechError};
 
-use crate::transport::{encode_query, HttpRequest, Transport};
+use crate::transport::{encode_query, HttpRequest};
 
 /// 抓取音频字节的传输抽象（ureq 实现返回原始字节）。
 pub trait ByteTransport: Send {
