@@ -423,6 +423,24 @@ html, body {
 }
 .card__status { color: #b26a12; font-size: 11px; }
 
+/* 卡片顶部拖拽把手：[::::] 抓握纹，只有这条 bar 能起拖。 */
+.card__grip {
+  flex: none;
+  height: 12px;
+  margin: -3px 0 -2px;
+  border-radius: 4px;
+  background-image: repeating-linear-gradient(90deg, #c3cddd 0 2px, transparent 2px 6px);
+  background-size: 20px 8px;
+  background-position: center;
+  background-repeat: no-repeat;
+  opacity: 0.75;
+  cursor: grab;
+  user-select: none;
+  transition: opacity 0.15s ease, background-color 0.15s ease;
+}
+.card__grip:hover { opacity: 1; background-color: #eef2f8; }
+.card__grip:active { cursor: grabbing; }
+
 /* 卡片关闭按钮（hover 显示） */
 .card__close {
   position: absolute;
@@ -432,8 +450,10 @@ html, body {
   height: 18px;
   border-radius: 50%;
   border: none;
-  background: #cbd3de;
-  color: #fff;
+  /* 按钮 UA 默认内边距会把 14px 图标压成 6px 宽，看起来就像一个点。 */
+  padding: 0;
+  background: #dbe3ee;
+  color: #5c6a7c;
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -447,8 +467,8 @@ html, body {
   opacity: 1;
   transform: scale(1);
 }
-.card__close:hover { background: #e25c5c; }
-.card__close-svg { display: block; }
+.card__close:hover { background: #e25c5c; color: #fff; }
+.card__close-svg { display: block; flex: none; }
 
 /* 语言选择器 */
 .lang-select {

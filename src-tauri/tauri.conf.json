@@ -20,7 +20,8 @@
         "skipTaskbar": true,
         "transparent": true,
         "resizable": false,
-        "shadow": false
+        "shadow": false,
+        "dragDropEnabled": false
       }
     ],
     "security": {

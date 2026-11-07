@@ -167,6 +167,31 @@ describe('board rendering', () => {
     expect(three.match(/data-action="close_card"/g)).toHaveLength(3);
   });
 
+  it('renders the close icon as a 14px cross, not a dot', () => {
+    const three = renderBoard({
+      ...expanded,
+      cards: [
+        { lang: 'zh', text: '你好', status: 'idle', authoritative: true },
+        { lang: 'en', text: 'Hello', status: 'idle', authoritative: false },
+        { lang: 'ja', text: 'こんにちは', status: 'idle', authoritative: false },
+      ],
+    });
+    const closeButton = three.match(/<button[^>]*class="card__close"[\s\S]*?<\/button>/)?.[0];
+
+    expect(closeButton).toContain('width="14" height="14"');
+    expect(closeButton).toContain('M2.5 2.5l11 11M13.5 2.5l-11 11');
+  });
+
+  it('gives every card a drag grip and keeps the card body undraggable', () => {
+    const html = renderBoard(expanded);
+
+    expect(html.match(/class="card__grip" draggable="true"/g)).toHaveLength(2);
+    expect(html).toContain('aria-roledescription="拖拽手柄"');
+    expect(html).toContain('aria-label="按住并拖动以调整卡片顺序"');
+    // 正文、输入框、按钮都不再是拖拽源，只有把手能起拖。
+    expect(html).not.toMatch(/<article[^>]*draggable/);
+  });
+
   it('shows add-card button only when there are fewer than 5 cards', () => {
     // 3 张卡：显示加号
     const three = renderBoard({

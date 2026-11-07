@@ -34,9 +34,9 @@ export const ICONS = {
     stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
   </svg>`,
 
-  // 关闭/X
+  // 关闭/X（对角线撑满 viewBox，14px 下也能看清是叉而不是点）
   close: `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+    <path d="M2.5 2.5l11 11M13.5 2.5l-11 11" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
   </svg>`,
 
   // 加号

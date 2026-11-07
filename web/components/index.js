@@ -39,7 +39,7 @@ export function CardButton({ action, lang, iconName, title }) {
 /** 关闭按钮（卡片 hover 显示） */
 export function CloseButton({ lang }) {
   return `<button type="button" class="card__close" data-action="close_card" data-lang="${lang}" title="关闭此卡片">
-    ${icon('close', { size: 12, className: 'card__close-svg' })}
+    ${icon('close', { size: 14, className: 'card__close-svg' })}
   </button>`;
 }
 
@@ -84,7 +84,8 @@ export function Card({ card, canClose, usedCodes }) {
   // 其他卡片已用的语言（不包括自己）
   const otherUsed = usedCodes.filter((c) => c !== card.lang);
 
-  return `<article class="${classes.join(' ')}" data-lang="${lang}" draggable="true">
+  return `<article class="${classes.join(' ')}" data-lang="${lang}">
+  <div class="card__grip" draggable="true" role="button" aria-roledescription="拖拽手柄" aria-label="按住并拖动以调整卡片顺序" title="按住并拖动调整顺序"></div>
   <header class="card__head">
     ${canClose ? CloseButton({ lang: card.lang }) : ''}
     ${LangAutocomplete({ current: card.lang, usedCodes: otherUsed })}
