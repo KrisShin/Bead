@@ -71,6 +71,18 @@ Bead：轻量、免安装、点开即用的全平台桌面悬浮窗多向翻译�
 - 流程状态：`.scratch/bead/STATE.md`（stage `tickets`）、`SPEC.md`（78 条用户故事，已批准）、`TICKETS.md`（10 张 tracer-bullet 工单，等待 Stage 3 门确认）。基线：改动前 0 tests、无测试命令；工单 01 必须同时交付 `cargo test` 脚手架与最小闭环。
 - 竞品定位：Pot（19.3k★，同 Tauri 技术栈，2026-07 已归档）、Easydict（15.2k★，仅 macOS）、Crow Translate 的「并排」是**多引擎**；「改一处其余语言同步」只存在于 Crowdin / Phrase 等**项目级本地化平台**。桌面悬浮 + 多语言联动是空位，README 首句须围绕它写。
 
+## 交互与几何实现约定
+
+以下由代码与测试保证；改交互或窗口几何时先对齐这里，细节见 `.scratch/bead/STATE.md` D35、D39–D42。
+
+- **锚点单一**：位置记忆只有 `capsule_anchor`（胶囊左上角逻辑坐标），由 `Moved` 实时维护；胶囊态横向夹进多显示器可用区并集、纵向贴显示器上缘。展开 / 收起默认窗口左缘 = 锚点 − 272，贴边时整块面板 clamp 进当前显示器可用区，收起仍按锚点还原；**面板态禁止用窗口 `left + 272` 反推锚点**（贴边后不成立）。
+- **宽度公式**：`board_width(n) = 26 + 189·n + 10·(n−1)`，2–5 卡对应 414 / 613 / 812 / 1011，窗口高固定 300；面板宽度只由语言池计数决定。
+- **一帧一次几何提交**：`resize_window` / `sync_panel_width` 每次调用内部各一次 `SetWindowPos`；增删卡顺序为「加卡先窗口后内容、删卡先内容后窗口」，剩余卡用 FLIP，只有贴边才遮一帧内容。`panel_frame()` 是**只读**查询（不移动窗口、不改状态），几何与前两者同源。
+- **卡片拖拽**：只能用卡片顶部 grip 起拖，不得把 `draggable` 放回卡片正文；拖动只做本地 DOM 重排 + FLIP，松手且顺序变化才调 `reorder_cards`；编辑态（textarea 聚焦 / 组字）全局禁拖；拖到面板外视为取消；卡片拖拽不得走 `start_drag` 链路（不产生 `Moved`）。
+- **Windows 拖放**：窗口必须保持 `"dragDropEnabled": false`，否则 WebView2 接管拖放、HTML5 `dragstart` 不触发；改该项必须重新构建壳层。
+- **图标尺寸**：SVG 放进 `<button>` 时先确认按钮内边距没有挤压图标（关闭按钮曾因 UA 默认 padding 从 14px 压成 6px 宽，看起来像一个点）；调图标先量 `getBoundingClientRect`，不要只改 path。
+- **降级**：`prefers-reduced-motion` 下面板补间降为 1ms、卡片重排与增删动画时长 0，功能不变。
+
 ## 不可动
 
 - **不做任何代码签名**：不申请/购买证书、不接 macOS 公证、CI 不含签名钩子或 secrets 分支。信任来自开源可审计 + SHA256SUMS + 可复现构建。

@@ -1,8 +1,10 @@
 # Bead — 工单实施现状快照
 
-- **记录时间**：2026-11-05 23:01 (GMT+8)；2026-11-06 凌晨：**T01–T10 全部完成，MVP 构建与测试全绿，已推送**
-- **状态**：**MVP 完成，会话已收尾**。推送核对：本地 HEAD = origin/dev = ef1e1d3；四套件 107 项测试收尾前复跑全绿；进程/端口/自启动/剪贴板无残留；按用户授权（D34）执行定时关机
-- **恢复指针**：下次会话从本文件「已知边界」与「环境阻塞项」开始——敏感过滤运行时复验（剪贴板恢复后）、真实 IME 手感、release.yml tag 首跑验证、打 tag 发布时机归用户
+- **记录时间**：2026-11-05 23:01 (GMT+8)；2026-11-06 凌晨 T01–T10 全部完成并推送（ef1e1d3）；2026-11-06 晚间同步至 `4ac886a` 并回填 MVP 后改动；**2026-11-07 真机验收后收尾：面板几何 / 增删动画、卡片拖拽换序、把手与关闭图标共 4 条功能提交 + 1 条文档提交**
+- **状态**：MVP 已完成；MVP 后的交互重构与缺陷修复（D35–D42）已全部落库并推送 `dev`。当前基线四套件 **158 项全绿**；用户真机复验确认本轮拖拽、把手、关闭按钮与面板增删动画效果良好。**未打 tag**（发布时机归用户）。
+- **当前基线（2026-11-07 本轮复跑）**：vitest 45、shell 20、bead-core 65、bead-providers 28，合计 **158**（上一轮 113）。
+- **恢复指针**：下次会话从「十二 · 未验证 / 风险」开始——多显示器与混合 DPI 的 clamp（仅单测）、补间落窗时机的低性能设备表现、reduced-motion 真机、`release.yml` tag 首跑（归用户）、敏感过滤运行时复验（需剪贴板恢复）、macOS/Linux 运行时（仅 CI 保证可构建）。
+- **说明**：下方「零～十一」是各自时间点的历史快照，当前状态以「十二」为准。
 
 ## 十、MVP 终验记录（2026-11-06 凌晨）
 
@@ -21,6 +23,68 @@
 **工单→提交对照**：T01 六条提交、T02 三条、T03 三条、T04 三条+docs、T05 两条、T06 两条、T07 一条、T08 一条、T09 一条、T10 一条（详见 git log）。
 
 **已知边界（文档已声明）**：MyMemory 免费引擎质量一般（尽力而为定位）；日语纯汉字句判 zh；检测拉丁系不判别；同步命令下「同步中」状态不可见（工单 04 异步化后可见）；改划词键位重启生效。
+
+## 十一、MVP 后交互重构与缺陷修复（2026-11-06 日间，回填）
+
+**范围**：`87adbbb`（MVP 文档收尾）→ `4ac886a`，5 条提交，无新工单；属对已交付 MVP 的形态打磨、交互修复与打包/文案补齐。决策见 STATE.md D35–D38。
+
+**已落地**：
+
+1. `c804b99` 胶囊态透明区不再拦截点击（用户实测反馈）：窗口形态跟随状态，胶囊 / HoverPending / Collapsing 收缩为顶部胶囊条，展开恢复面板尺寸；`bundle.active=true`（nsis/dmg/app/deb/appimage）；新增 `build.ps1` 一键打包；`package.json` 加 `@tauri-apps/cli`。该提交自记真机冒烟「胶囊 36px / 展开 309px」、NSIS `Bead_0.1.0_x64-setup.exe` 2.89 MiB。
+2. `cbf0ba5` 胶囊贴边与面板重构：胶囊纯 div + logo 词组、贴屏幕上缘、未悬停降透明度；拖拽改系统级 `start_dragging`，`Moved` 实时 clamp；窗口固定 68×28 / 613×300（3 语池），位置以 `capsule_anchor` 一次 `SetWindowPos` 提交；开合动画严格对称、resize 只在内容不可见帧执行；新增 `sync_panel_width` 命令（前端先淡出 → resize → 淡入），卡片增删不左右滑移；卡片顺序跟随语言池槽位；设置页移除语言选项（语言入口移到面板内「语言」开关）；图标集补齐多分辨率 + 托盘图标，`shadow=false`；设置结构新增 `capsule_anchor`、默认 `hover_delay_ms` 200→400。
+3. `4bebb0b` 行为修正：拉丁字母过半判 `en`；识别到池外语言改为**不粘贴**（不再回落主语言卡）；`clear()` 递增 `generation`，清空前的在途结果整包丢弃；`replace_pool` 只替换槽位内容、保持顺序；腾讯/火山/阿里/百度/有道第二密钥改读 `secret`；在线朗读超时 8s→2.5s。
+4. `8e5ce7e` `build.ps1` 依赖自举（缺 `node_modules` 自动 `npm ci`）、错误可读化、产物清单尊重 `CARGO_TARGET_DIR`；README 补一键打包说明。
+5. `4ac886a` `.gitignore` 忽略 HTML 分享包等本地工具产物。
+
+**当前测试基线（本轮真跑，2026-11-06 21:31）**：
+
+- `cargo test --offline --manifest-path bead-core/Cargo.toml` → `65 passed; 0 failed`（MVP 基线 61，+4：拉丁字母判 en、非拉丁不猜、英文落 en 卡、清空作废在途结果、换池保持槽位等新增/改写用例）
+- `cargo test --offline -p bead-providers` → `28 passed; 0 failed`（不变）
+- `cargo test --offline -p bead` → `3 passed; 0 failed`（不变）
+- `npm test` → `Tests 17 passed (17)`（MVP 基线 15，+2；覆盖新增：设置页无语言选项、每卡语言自动完成选择器、朗读图标等）
+- 合计 **113**（MVP 终验 107）
+
+**验证状态变化**：
+
+- 本轮只跑测试与静态阅读，**未做 CDP / 真机冒烟**。`cbf0ba5` 的动画对称性、拖拽 clamp、面板宽度同步、多显示器/缩放边界**未见冒烟记录**（该提交未附 Verified），仅由编译与单元测试间接保证；手感需实机复核。
+- `c804b99` 的 NSIS 产物与胶囊/展开尺寸为其提交自记的冒烟结果，本轮未复跑打包（按约束不跑长任务）。
+- MVP 遗留的四项未验证项全部保持：① 敏感过滤/复制运行时端到端（剪贴板被外部进程锁死，D33）；② 真实中文 IME 手感；③ `release.yml` 四平台 tag 首跑；④ macOS/Linux/Arch 运行时（仅 CI 保证可构建）。未打 tag、未 push 本次文档改动。
+- 新增未验证：胶囊拖拽与贴边的真实手感、多显示器与 DPI 缩放下锚点回落、`sync_panel_width` 在真实渲染帧中的表现。
+
+
+## 十二、面板几何 / 动画、卡片拖拽与图标修复（2026-11-07 收尾）
+
+**范围**：`92ac328` 之后本轮，4 条功能提交 + 1 条文档提交，无新工单；属对已交付 MVP 的交互补全与缺陷修复。用户真机复验确认效果良好。决策见 STATE.md D39–D42。
+
+**已落地**：
+
+1. 面板几何 clamp 与只读 `panel_frame()`：`place_panel` 把面板整体收进当前显示器可用区（贴边时允许平移以保证完整可见，收起仍按锚点还原）；新增只读命令只返回 `{left, top, width, height}`，不移动窗口，几何与 `resize_window` / `sync_panel_width` 同源；胶囊锚点改由 `Moved` 实时维护（`start_dragging` 是 `PostMessage` 立即返回），面板态禁止用 `left + 272` 反推锚点；`geometry_tests` 覆盖左右贴边、顶部任务栏、超窄可用区、双屏并集、150% 缩放。
+2. 面板增删的扩展 / 收缩补间：`web/panel-sync.js` 纯函数（`planPanelResize` / `flipOffsets` / `createPanelWidthTracker`）；一帧一次 `SetWindowPos`、加卡先窗口后内容、删卡先内容后窗口、剩余卡 FLIP、只有贴边才遮一帧内容（方案 A）；补间期间到达的状态快照走 `pendingView`，不打断窗口时序；卡片数基线展开时 `prime`、收起时 `clear`。
+3. 卡片拖拽换序：`web/card-drag.js` 纯函数；只有顶部 grip 能起拖、复用 `reorder_cards`、编辑态全局禁拖、拖到面板外视为取消、`prefers-reduced-motion` 下时长 0。
+4. 拖拽把手、关闭图标与 Windows 拖放配置：`[::::]` 抓握条（`role="button"` + `aria-roledescription="拖拽手柄"`）、close 图标 12→14 并改为撑满 viewBox 的粗叉、`padding: 0` + `flex: none` 修掉 `<button>` UA 内边距把图标压成 6px、窗口设 `dragDropEnabled: false`（Windows + WebView2 否则吞掉 HTML5 拖放）。
+
+**测试基线（本轮真跑，2026-11-07）**：
+
+- `npm test -- --run` → `Test Files 4 passed (4)`、`Tests 45 passed (45)`（panel-sync 12 / edit-sync 5 / card-drag 9 / render 19）
+- `cargo test -p bead` → `20 passed; 0 failed`（settings 3 + geometry 17；同时验证 `tauri.conf.json` 被 `generate_context!` 接受）
+- bead-core 65 / bead-providers 28 本轮未改动，沿用上一轮基线；合计 **158**（上一轮 113）
+
+**已验证**：
+
+- 用户真机（重新 `tauri build` 后）：从把手拖动换序正常、关闭按钮为清晰叉形、面板增删动画观感通过。
+- 浏览器实测（临时静态页复用真 `styles.css`）：关闭按钮 SVG 修复前 `6×14` / computed 宽 6px，修复后 `14×14`；四卡均有 12px 高、`cursor: grab` 的把手。
+- 视觉快照（本地临时目录，未入库）：`card-drag-panel.png`（四卡 + 把手 + 拖拽占位虚线 + 插入线）、`card-close-zoom.png`（关闭按钮 8 倍放大）。
+
+**未验证 / 风险（不写成「全部完美」）**：
+
+- macOS / Linux / Arch 运行时仍只有 CI 保证可构建；`dragDropEnabled` 是 Windows 专属问题，其他平台未实测。
+- 多显示器 + 混合 DPI 的 clamp 只有 `geometry_tests`（按各屏 scale_factor 折算），未见真机；胶囊跨屏手感受 `Moved` 事件频率影响。
+- 补间用固定 160ms + 40ms 等待收尾，低性能设备掉帧时落窗时机可能提前或延后，未量化。
+- 拖动期间前端不整板重绘（`pendingDragView` 暂存），若此时 Rust 推送新顺序，会被下一次非拖动刷新覆盖；该竞态未构造运行时用例。
+- 面板补间与卡片重排的 reduced-motion 分支只有单测，未在真机「减少动态效果」下观察。
+- MVP 遗留四项继续有效：敏感过滤 / 复制运行时端到端（剪贴板被外部进程锁死，D33）、真实中文 IME 手感、`release.yml` 四平台 tag 首跑、macOS/Linux/Arch 运行时。
+- `.screenshots/` 是本地视觉验证产物，`.gitignore` 未排除，本轮未入库，待所有者决定是否加入忽略规则。
+
 
 ## 零、T04–T10 自动执行总计划（恢复锚点）
 
@@ -153,8 +217,12 @@
 - `STATE.md` D18 与 `docs/naming.md` 标识清单写 `C:/Users/HP/WorkSpace/Bead`，实际工作区为 `D:/WorkSpace/Bead`。
 - `STATE.md` / `Agents.md` 写 Rust 1.96.0，实测 `rustc 1.99.0`；Node 22.22.2 一致。
 - `STATE.md` 基线写「无 Cargo.toml、0 tests」，那是 Stage 0 的有效历史事实，**不修改**；当前状态以本文件为准。
+- `SPEC.md` / `TICKETS.md` 的 T03 写「设置里能配 2–5 种语言」，MVP 后实现改为**面板内「语言」开关**、设置页不再提供语言选项（`cbf0ba5`）；运行时语义（2–5 边界、双向）不变，属入口位置偏差。
+- `SPEC.md` 交互基线写「悬停 200ms 展开」，MVP 后默认改为 **400ms**（`cbf0ba5`，`hover_delay_ms` 默认值）；此外前端设置项读取的缺省回退仍写 200ms，与 Rust 默认 400ms 存在遗留不一致，待后续统一。
 
 ## 七、会话耗时
 
 - 22:41 → 23:01，约 20 分钟。耗时点：crates.io index 卡住 6 分钟（含一次后台任务终止）、npm install 4m17s、Tauri 首次全量编译约 3 分钟、探针迭代 3 次。
 - 优化建议：把 `.cargo/config.toml` 镜像配置与 `icons/icon.ico` 前置为第一步（可省约 8 分钟）；npm 也配置国内 registry；demo 与主程序可通过 `CARGO_TARGET_DIR` 共享一份编译产物，避免两次全量编译。
+- 2026-11-06 21:18 → 21:42，约 24 分钟（本轮为同步 + 文档回填）。耗时点：逐条阅读 5 条提交的正文与关键 diff（`main.rs` 单条 +1094 行）、四套件复跑（debug 缓存命中，编译约 1–2 分钟）、两份文档改写与一致性核对。
+- 优化建议：下次先看 `git log --format` 摘要再按需展开 diff；测试基线可只跑 bead-core + vitest（providers/shell 在本轮改动中未变）。

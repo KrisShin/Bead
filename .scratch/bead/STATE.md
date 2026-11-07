@@ -64,6 +64,14 @@
 - **D32** MVP 完成后推送 dev 分支到 origin；**不打 tag**——tag 触发发版 CI（release.yml），发布时机归用户。release.yml 的三平台 tauri-action + Arch 容器构建 + SHA256SUMS job 需 tag 首跑验证，可能需小幅调整（已如实标注）。
 - **D33** 敏感过滤与复制链路的运行时端到端验证被环境阻塞（本机剪贴板被外部进程整体锁死，PowerShell Get/Set-Clipboard 同报错误），逻辑由单元测试覆盖（47+ 项），运行时复验留待剪贴板恢复后执行。
 - **D34** 会话收尾（2026-11-06 凌晨）：用户确认全权并指示「保存状态→提交推送→推送完成后关机」。终态核验：工作区干净、本地 HEAD 与 origin/dev 一致（ef1e1d3）、四套件 107 项测试全绿复跑确认、bead 进程与探针端口清零、无自启动残留、剪贴板无未恢复项（外部锁死与本会话无关）。按授权执行定时关机。
+- **D35** 胶囊与面板形态定案（用户实测反馈驱动，`c804b99` / `cbf0ba5`）：窗口尺寸跟随状态——胶囊 68×28 贴屏幕上缘，展开 613×300（3 语池，宽度按 `board_width(n)` 计算）；胶囊 / HoverPending / Collapsing 期窗口收缩为胶囊条，原先 613×300 全透明区拦截下层点击的问题因此消失。拖拽改走系统级 `start_dragging`，边界由 `Moved` 事件实时 clamp。位置以 `capsule_anchor`（胶囊左上角逻辑坐标）为单一锚点，形态切换只向左/下生长，上缘与右缘不变，并配合一次 `SetWindowPos` 提交新位置+新尺寸，避免中间帧。开合动画严格对称（进入态=收起终态），窗口 resize 只在内容不可见帧执行。卡片增删不再由 Rust 侧直接改宽，改由前端先淡出内容 → 调用新命令 `sync_panel_width` resize → 淡入，消除面板左右滑移。`shadow=false`，图标集补齐多分辨率与托盘图标。设置结构新增 `capsule_anchor`（`window_position` 保留写入，仅兼容旧配置文件）。默认悬停延迟 200→400ms；设置页移除语言选项，语言改由面板内「语言」开关选择（2–5 边界仍在渲染层锁定）。
+- **D36** 语言检测与初始落卡策略修订（`4bebb0b`）：拉丁字母过半 → `en`（池内无 en 则不粘贴）；识别到池外语言 → 不粘贴（不再回落主语言卡，避免把韩文塞进中文卡）；完全识别不出（西里尔字母、数字/符号等）→ 仍回落主语言卡。已知边界：日语纯汉字句判 `zh`，拉丁系非英文文本落 `en`。
+- **D37** 竞态与槽位语义修订（`4bebb0b`）：`clear()` 递增 `generation`，清空前已发出的翻译回来按过期整包丢弃，不会把刚清空的卡填回去；`replace_pool` 只替换同槽位内容并保持池顺序，卡片位置不因改语言而交换。provider 层：腾讯 / 火山 / 阿里 / 百度 / 有道的第二密钥改读 `secret` 字段（此前误读 `model`）；在线朗读超时 8s→2.5s，网络不可达时更快回落离线 SAPI。
+- **D38** 分发形态落地（`c804b99` / `8e5ce7e`）：`bundle.active=true`，targets `nsis / dmg / app / deb / appimage`；Tauri v2 无 zip bundle 类型，目录形态便携包即裸 exe（与 D13「不做单文件」一致）。`build.ps1` 一键打包（前端测试 + 三个 Rust 套件 → `npx tauri build` → 产物清单），缺 `node_modules` 自动 `npm ci`，清单尊重 `CARGO_TARGET_DIR`，任一步非零退出给出可读错误。npm devDependency 新增 `@tauri-apps/cli ^2`（仅打包用，不进运行时产物）。Windows 首跑产出 `Bead_0.1.0_x64-setup.exe` 2.89 MiB。
+- **D39** 面板几何 clamp 与只读 `panel_frame()`：展开宽度仍按 `board_width(n)`（2–5 卡 = 414 / 613 / 812 / 1011，高 300）；窗口左缘 = `clamp(anchor.x - 272, 可用区左, 可用区右 - 宽)`，纵向同样夹进当前显示器可用区，因此胶囊贴近屏幕边缘时面板整体平移进屏幕，收起仍按锚点还原（面板态胶囊不可见，平移不影响观感）。新增只读命令 `panel_frame()`：复用同一套 `place_panel` 与 `board_width`，只返回 `{left, top, width, height}`，**不移动窗口、不改任何状态**；`resize_window` 契约与返回类型不变，`capsule_anchor` / `Moved` / 收起锚点逻辑不变。胶囊拖拽的锚点改由 `Moved` 实时维护（`start_dragging` 是 `PostMessage` 立即返回，不等松开）：胶囊态横向夹进多显示器可用区并集、纵向贴显示器上缘；面板态只做纵向夹取，**禁止用 `left + 272` 反推锚点**（贴边 clamp 后不再成立）。
+- **D40** 面板增删的扩展 / 收缩时序契约：一帧只提交一次窗口几何（`resize_window` / `sync_panel_width` 内部各自一次 `SetWindowPos`）；**加卡先窗口后内容**——内容钉在旧宽 → 提交新窗口 → board 补间到新宽，新卡随宽度露出；**删卡先内容后窗口**——先量剩余卡（FLIP First）→ 重排并反向位移 → 位移与收宽同拍播放 → 最后缩窗；**收起与删卡同构、与展开镜像**；**只有贴边（窗口左缘因 clamp 平移 Δ≠0）才在该次 resize 帧遮一帧内容**（方案 A），非贴边全程可见；不做整板 `opacity: 0`、不逐帧改窗口尺寸。动画期间到达的状态快照只存 `pendingView`，收尾补一次 `draw`；`lastPanelFrame` 缓存 `panel_frame` 结果，卡片数基线由 `panelWidthTracker` 维护（展开那一帧 `prime`、收起 `clear`）。补间 160ms，低性能设备掉帧时的落窗时机未量化。
+- **D41** 卡片拖拽换序：只用 HTML5 拖放，**只有卡片顶部 grip（`[::::]` 抓握纹）能起拖**，正文 textarea / 按钮 / 下拉不再接受拖拽，避免与选中文字、输入框打架；把手用 `role="button"` + `aria-roledescription="拖拽手柄"` + `aria-label` 供读屏识别。拖动中每次跨越目标卡只重排 DOM + FLIP，**松手且顺序真变了才调已有的 `reorder_cards`**，拖回原位不发 IPC；拖到面板外松手 = 取消，剩余卡 FLIP 回原序；编辑态（textarea 聚焦或组字中）全局禁拖，防止 DOM 位移丢焦点 / 丢组字并触发提交；`prefers-reduced-motion` 下重排时长 0、瞬时落位。卡片拖拽不走 `start_drag` 链路，不产生 `Moved`，不影响窗口拖动与收起锚点。
+- **D42** Windows HTML5 拖放的硬开关与关闭按钮「一个点」：Tauri v2 `WindowConfig.dragDropEnabled` 默认 `true`，Windows 上它会用 WebView2 的原生拖放处理器替换页面事件，`dragstart` 根本不触发——这是「卡片拖不动」的实际根因。该窗口显式设 `"dragDropEnabled": false`；代价是不再接收系统「文件拖入窗口」事件，本项目无此功能，无损失。配置编译期嵌入前端产物，改后必须重新 `tauri build` 才生效。同轮修复关闭按钮显示成「点」：`<button>` 的 UA 默认左右内边距把 14px SVG 压成 6px 宽，解法是 `padding: 0` + `.card__close-svg { flex: none }`，同时把 close path 改成撑满 viewBox 的粗叉。教训：图标看起来变小 / 变形时先量 `getBoundingClientRect` 与 computed 宽，不要只改 path。
 
 ## Facts (Stage 1 实测 / 查证)
 
@@ -81,11 +89,14 @@
 
 ## Assumptions
 
-- 暂无。Stage 1 盘问后逐条补齐；任何未经用户确认的选择都写在这里并标 OPEN。
+- **假设（未实机验证）**：`capsule_anchor` 越界回落、多显示器 / 混合 DPI 缩放下的锚点与面板 clamp 仅由单元测试覆盖（`geometry_tests`）；真实桌面若出现胶囊漂移或面板越出可用区，按缺陷处理。
+- **假设（真机验证口径）**：2026-11-07 用户真机复验确认本轮效果良好——卡片拖拽换序、把手、关闭按钮、面板增删补间的观感均已通过；macOS / Linux 运行时仍只有 CI 保证可构建。
+- **假设（授权与记录口径）**：MVP 后的提交由项目所有者直接落库，未逐条走事前确认；本文件按「既成事实 + 决策记录」归档，交互形态若需回退以用户判断为准。
+- 其余暂无待确认项（Stage 1 盘问事项均已在 Decisions 定案）。
 
 ## Next action
 
-Stage 3 门已确认，工单 01（L3）开工后按用户要求**暂停**。实施现状、验证输出、未完成项与恢复顺序见 `.scratch/bead/STATUS.md`；本文件不记进度，具备实现提交后进度由 `git log` 推导。当前尚无实现提交，所有文件均未跟踪、未推送。Stage 0 基线「无 `Cargo.toml`、0 tests」仍是有效历史事实，不修改。
+MVP（T01–T10）已完成并推送；MVP 后的形态打磨与缺陷修复也已推送 `dev`（D35–D42），无新工单。当前分支 `dev`，工作区在本轮文档提交后干净。实施进度、当前基线（vitest 45 / shell 20 / bead-core 65 / providers 28，合计 158）与未验证项见 `.scratch/bead/STATUS.md`「十二」；本文件不记进度。发布（打 tag 触发 release.yml 首跑）仍待用户决定。
 
 ## 文档地图
 
@@ -95,14 +106,14 @@ Stage 3 门已确认，工单 01（L3）开工后按用户要求**暂停**。实
 - `.scratch/bead/SPEC.md` — 已批准规格（78 条用户故事）
 - `.scratch/bead/TICKETS.md` — 工单与 Frontier
 - `.scratch/bead/STATE.md` — 本文件，只记决策/假设/基线
-- `.scratch/bead/STATUS.md` — 工单 01 实施现状快照（进度、验证输出与未完成项，非执行依据）
+- `.scratch/bead/STATUS.md` — 实施现状快照（当前阶段、测试基线、已验证/未验证项，非执行依据）
 
 ## Later
 
 - ~~GitHub 远端仓库创建与推送~~ → 已完成，见 D20（`KrisShin/Bead`，public，main）
 - 后续可考虑：翻译历史、术语表、OCR 截图翻译、离线模型
 - 旧目录 `C:/Users/HP/WorkSpace/FloatTrans` 与 `C:/Users/HP/WorkSpace/WorkBuddy/FloatTrans` 因 Windows 句柄占用未能删除，待关闭 WorkBuddy 与预览面板后手动清理（内容已完整拷贝到 Bead）
-- README.md 尚未创建：按 SPEC 要求，首句须围绕「一次输入多语言并排、改任一语言其余自动同步」写，并说明未签名与各平台首次运行放行方式（属工单 10 范围）
+- README.md 已在收尾阶段创建（`fa4ea18`），首句围绕「一次输入多语言并排、改任一语言其余自动同步」，并说明未签名与各平台首次运行放行方式；MVP 后补充了一键打包（`build.ps1`）说明
 
 ## Close
 

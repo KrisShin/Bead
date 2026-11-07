@@ -14,6 +14,14 @@
 
 Rust release 体积优化：`strip = true`、`lto = true`、`codegen-units = 1`、`panic = "abort"`。
 
+### Windows WebView2 会替换 HTML5 拖放处理器
+
+Tauri v2 的 `WindowConfig.dragDropEnabled` 默认 `true`。在 Windows 上它会接管 WebView2 的原生拖放，结果页面的 `dragstart` / `drop` 不按 WebView 标准事件触发——前端用 HTML5 拖拽做卡片排序时会「完全拖不动」，且没有任何报错。官方文档明确要求：Windows 上要使用前端 HTML5 拖放，必须把该项设为 `false`（底层对应 `WebviewBuilder::disable_drag_drop_handler`）。
+
+- 代价：窗口不再接收系统「文件拖入窗口」事件（`onDragDropEvent`）。Bead 没有文件拖放需求，关闭无功能损失。
+- 该项与前端资源一起在编译期嵌入，改配置后必须重新 `tauri build` 才生效；只替换 `web/` 目录里的文件不会让真机产物改变。
+- macOS / Linux 不经过这条 Windows 专用处理器，但本轮未实测；跨平台行为以 CI 构建 + 实机为准，不写成「已支持」。
+
 ## 二、Wayland 硬限制（影响「胶囊吸附边缘」）
 
 - [`tauri-apps/tauri#14913`](https://github.com/tauri-apps/tauri/issues/14913)（2026-02 提出、仍未关闭）：Wayland 下 `Window::set_position` 与 `always_on_top` **静默 no-op**，连窗口初始位置都不生效；`skip_taskbar` 同样失效。官方回复是「xdg-shell 的刻意设计，我们无能为力」。
