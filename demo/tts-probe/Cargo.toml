@@ -1,0 +1,21 @@
+[workspace]
+
+[package]
+name = "tts-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# 独立探针：只验证 Windows OneCore（WinRT Windows.Media.SpeechSynthesis）能否枚举音色、
+# 能否合成 zh/en/ja，并记录耗时与音频体积。不依赖主程序，不并入主 workspace。
+[dependencies]
+[target.'cfg(windows)'.dependencies]
+# windows 0.62.2 已在主程序中传递依赖，这里只按需打开 WinRT 语音相关 feature。
+# 许可证 MIT OR Apache-2.0。
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Storage_Streams",
+    "Media_Core",
+    "Media_SpeechSynthesis",
+    "Win32_System_WinRT",
+] }

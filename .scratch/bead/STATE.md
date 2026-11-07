@@ -34,7 +34,7 @@
 - **D3** 采用 Q3-(a)：语言池最多 5 种，一次展示全部语言结果卡；只选 2 种语言即自然构成双向，不另设「双向模式」。**新增核心语义：任意一张语言卡的内容都可编辑，改任意语言后其余语言自动同步翻译**
 - **D4** 支持锁定展开；**未开启划词翻译时不主动读取剪贴板，仅鼠标主动悬停胶囊才展开并读取**
 - **D5** 划词采用 Q5-(d)：三种取词方式全做，按平台能力降级
-- **D6** TTS 采用 Q6-(c)：默认联网、失败自动降级离线，**不向用户提供手动指定引擎的开关**
+- **D6** TTS 采用 Q6-(c)：默认联网、失败自动降级离线，**不向用户提供手动指定引擎的开关**。**2026-11-07 按 `docs/tts-design.md` 修订**：改为**本地优先、在线仅在缺该语言音色时兜底**（`tts_online_fallback` 默认开启）；「在线文本会离开本机」已在设置页与 README 明示；「不提供引擎开关」仍有效。
 - **D7** 需要 GitHub 仓库 + 多平台自动打包发布 GitHub Actions
 - **D8** 隐私与设置按推荐全做：敏感内容过滤、自动读剪贴板总开关、日志不落原文、开机自启开关
 - **D9** Q11 编辑联动按推荐定案：400ms 防抖 + Enter/失焦立即提交；最后编辑的卡为权威源且不被覆盖；其余卡「同步中」保留旧值；`generation += 1` 丢弃过期响应；初始剪贴板语言检测落卡、失败落主语言
@@ -59,7 +59,7 @@
 - **D27** 用户于 2026-11-06 授予全权：T04–T10 无须逐步确认，按我建议执行；所有决策与原因记入 STATE/STATUS 文档；MVP 完成后整理文档、提交并**推送 dev 分支**。**不打 tag**（tag 触发发版 CI，发布时机仍归用户）；不可动清单（不签名/不做单文件/更新只比较/默认被动/池上限 5/范围不扩张）继续有效。
 - **D28** T04 依赖评估（规范第 6 条）：HTTP 客户端选 **`ureq` 2.x（rustls 特性）**——阻塞式、体积约 0.3MB、MIT/Apache-2.0，不需要为同步命令引入 tokio 运行时；替代方案 `reqwest`（重、拉 tokio 全家桶）与 `attohttpc/minreq`（生态弱）被否。签名用 RustCrypto 的 `sha2`/`hmac`/`md-5`/`hex`（MIT/Apache-2.0，各 <0.2MB）。provider 实现放**新 crate `bead-providers`**（依赖 bead-core 的 trait），`bead-core` 保持零依赖；HTTP 调用经 `Transport` trait 注入，测试用 fake 不触网。
 - **D29** 规则 10 的解释定案：「一次请求返回全部译文」约束的是上层契约——provider 内部对按语言对设计的 REST API（MyMemory/DeepL）逐对调用属实现细节，对上层仍是一次 `translate()` 返回全部；OpenAI 兼容系则真单次调用携带全部目标。写入模块文档。
-- **D30** T06 TTS 依赖届时评估；优先尝试 Windows SAPI（PowerShell System.Speech）零依赖离线路径 + 在线 TTS API 降级链，避免重依赖；若不可行再评估 crate。
+- **D30** T06 TTS 选型（2026-11-07 按 `docs/tts-design.md` 定案）：本地 **SAPI5**（PowerShell `System.Speech` 子进程，零新增依赖）+ 在线 Google `translate_tts` **缺音色兜底**。音色按 culture 精确/同主语言匹配；长文本写临时 UTF-8 文件再读；在线超长文本按 200 字符切块后拼接，`GoogleTts::fetch` 对 >200 字符**直接报错而非静默截断**；缓存键含 backend / voice_id / rate / lang / text。OneCore 探针实测本机只枚举到 3 个 zh-CN 音色、无 en/ja、无 Natural，故不接入主程序。
 - **D31** 许可定为 MIT 单许可（LICENSE 文件已入库）：全部依赖 MIT/Apache-2.0 兼容，未来需要时可加 Apache-2.0 双许可。
 - **D32** MVP 完成后推送 dev 分支到 origin；**不打 tag**——tag 触发发版 CI（release.yml），发布时机归用户。release.yml 的三平台 tauri-action + Arch 容器构建 + SHA256SUMS job 需 tag 首跑验证，可能需小幅调整（已如实标注）。
 - **D33** 敏感过滤与复制链路的运行时端到端验证被环境阻塞（本机剪贴板被外部进程整体锁死，PowerShell Get/Set-Clipboard 同报错误），逻辑由单元测试覆盖（47+ 项），运行时复验留待剪贴板恢复后执行。
@@ -72,6 +72,7 @@
 - **D40** 面板增删的扩展 / 收缩时序契约：一帧只提交一次窗口几何（`resize_window` / `sync_panel_width` 内部各自一次 `SetWindowPos`）；**加卡先窗口后内容**——内容钉在旧宽 → 提交新窗口 → board 补间到新宽，新卡随宽度露出；**删卡先内容后窗口**——先量剩余卡（FLIP First）→ 重排并反向位移 → 位移与收宽同拍播放 → 最后缩窗；**收起与删卡同构、与展开镜像**；**只有贴边（窗口左缘因 clamp 平移 Δ≠0）才在该次 resize 帧遮一帧内容**（方案 A），非贴边全程可见；不做整板 `opacity: 0`、不逐帧改窗口尺寸。动画期间到达的状态快照只存 `pendingView`，收尾补一次 `draw`；`lastPanelFrame` 缓存 `panel_frame` 结果，卡片数基线由 `panelWidthTracker` 维护（展开那一帧 `prime`、收起 `clear`）。补间 160ms，低性能设备掉帧时的落窗时机未量化。
 - **D41** 卡片拖拽换序：只用 HTML5 拖放，**只有卡片顶部 grip（`[::::]` 抓握纹）能起拖**，正文 textarea / 按钮 / 下拉不再接受拖拽，避免与选中文字、输入框打架；把手用 `role="button"` + `aria-roledescription="拖拽手柄"` + `aria-label` 供读屏识别。拖动中每次跨越目标卡只重排 DOM + FLIP，**松手且顺序真变了才调已有的 `reorder_cards`**，拖回原位不发 IPC；拖到面板外松手 = 取消，剩余卡 FLIP 回原序；编辑态（textarea 聚焦或组字中）全局禁拖，防止 DOM 位移丢焦点 / 丢组字并触发提交；`prefers-reduced-motion` 下重排时长 0、瞬时落位。卡片拖拽不走 `start_drag` 链路，不产生 `Moved`，不影响窗口拖动与收起锚点。
 - **D42** Windows HTML5 拖放的硬开关与关闭按钮「一个点」：Tauri v2 `WindowConfig.dragDropEnabled` 默认 `true`，Windows 上它会用 WebView2 的原生拖放处理器替换页面事件，`dragstart` 根本不触发——这是「卡片拖不动」的实际根因。该窗口显式设 `"dragDropEnabled": false`；代价是不再接收系统「文件拖入窗口」事件，本项目无此功能，无损失。配置编译期嵌入前端产物，改后必须重新 `tauri build` 才生效。同轮修复关闭按钮显示成「点」：`<button>` 的 UA 默认左右内边距把 14px SVG 压成 6px 宽，解法是 `padding: 0` + `.card__close-svg { flex: none }`，同时把 close path 改成撑满 viewBox 的粗叉。教训：图标看起来变小 / 变形时先量 `getBoundingClientRect` 与 computed 宽，不要只改 path。
+- **D43** 朗读状态与停止契约（M4，2026-11-07，工作区未提交）：`StateView` 移除 `speak`，新增独立 `speech` 事件、`SpeakResult` 返回值与 `speech_capabilities`；`speak_card` / `speak_text` 不再回整板视图，点朗读不触发重渲染、不打断编辑。全局单实例 + ticket latest-wins，晚到的在线结果按 ticket 丢弃；同卡再点=停止；面板收起 / ESC / 点外部 / 清空 / 删卡 / 改语言 / 改文本（编辑后先 flush）均停；锁定、拖卡、编辑其它卡不打断。划词入口复用 `speak_text`，不另建引擎/队列/缓存。逐句高亮按设计不做。
 
 ## Facts (Stage 1 实测 / 查证)
 
@@ -86,6 +87,9 @@
 - **竞品定位（2026-11-05 查证）**：Pot `pot-app/pot-desktop` **19,340★**、GPL-3.0、**Tauri + Rust**、同赛道且已于 2026-07 归档停更；Easydict **15,207★**、Swift、仅 macOS；Crow Translate 1,963★；krisir/floattrans 40★。这些工具的「并排」是**多引擎**（同一目标语言比服务商），不是**多语言**；「改一处其余语言同步」只存在于 Crowdin / Phrase / LexiSync / Framer 等**项目级本地化平台**。「桌面悬浮 + 多语言并排可编辑联动」是空位，D3 是唯一站得住的产品定位，README 首句须围绕它写。
 - **命名排查**：`FloatTrans` / 中文「浮译」撞 krisir/floattrans；`Lilt` 撞 lilt.com 翻译公司与 LiLT 模型；`Perch` 撞 Perch AI、ConnectWise SIEM 与 pioneering.app 同气质桌面小工具；`Capsa` 撞 Colasoft Capsa 商业网络分析仪；`Verse` 撞 Epic Games 注册商标（USPTO 2023）；`Weft` / `Unison` / `Accord` / `Echo` / `Relay` 均有高星同名项目；`Wisp` 有 USPTO 注册商标。crates.io 上短单词几乎全被占，crate 名统一用 `bead-core` 规避。
 - 本机：Windows，Python 3.13.14 / Node 22.22.2 / Rust 1.96.0 可用；`gh auth` 已登录 KrisShin（repo/workflow scope 齐全）。
+- **OneCore 探针（2026-11-07，`demo/tts-probe`，`windows 0.62.2` WinRT 实测）**：`SpeechSynthesizer::AllVoices()` 仅枚举到 3 个音色且全是 zh-CN（Huihui / Yaoyao / Kangkang），`natural_count=0`；zh 28 字 `stream_ready_ms=80`、`audio/wav`、179,406 字节、读取与落盘成功；en / ja 均 `no_voice_for_language`。**结论：本机 OneCore 语种覆盖不如 SAPI，不接入主程序。**
+- **SAPI 音色实测（2026-11-07，与 `speech_local.rs` 同一脚本）**：`Microsoft Huihui Desktop`(zh-CN)、`Microsoft Zira Desktop`(en-US)、`Microsoft Huihui` / `Kangkang` / `Yaoyao`(zh-CN)；**无 ja**。
+- **在线朗读端点（2026-11-07 本机复测）**：`translate.googleapis.com/translate_tts` HTTP 200、`audio/mpeg`、9,216 字节、1,957ms。2026-11-05 的「不可达」结论已过期（仅指 `translate_a/single` 翻译端点，且当时为超时）。
 
 ## Assumptions
 
@@ -96,7 +100,7 @@
 
 ## Next action
 
-MVP（T01–T10）已完成并推送；MVP 后的形态打磨与缺陷修复也已推送 `dev`（D35–D42），无新工单。当前分支 `dev`，工作区在本轮文档提交后干净。实施进度、当前基线（vitest 45 / shell 20 / bead-core 65 / providers 28，合计 158）与未验证项见 `.scratch/bead/STATUS.md`「十二」；本文件不记进度。发布（打 tag 触发 release.yml 首跑）仍待用户决定。
+MVP（T01–T10）已完成并推送；MVP 后的形态打磨与缺陷修复也已推送 `dev`（D35–D42），无新工单。当前分支 `dev`。**2026-11-07 按 `docs/tts-design.md` 实施的 TTS MVP（D30 / D43）留在工作区，未提交、未推送、未打包，等用户过目**；实施进度、真实测试输出与未验证项见 `docs/tts-design.md` §7.2 / §7.3 与 `.scratch/bead/STATUS.md`。发布（打 tag 触发 release.yml 首跑）仍待用户决定。
 
 ## 文档地图
 

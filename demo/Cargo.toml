@@ -1,4 +1,6 @@
 [workspace]
+# tts-probe 是独立 crate（自带 [workspace]），不参与本探针的构建。
+exclude = ["tts-probe"]
 
 [package]
 name = "bead-probe"
