@@ -21,6 +21,20 @@ export const ICONS = {
     <path d="M8 4.4V8l2.5 1.7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
   </svg>`,
 
+  // 闭合锁：已锁定。锁梁两条腿都落到锁体上，和下面的开口锁一眼可分。
+  lock: `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect x="3.5" y="7.3" width="9" height="5.9" rx="1.2" stroke="currentColor" stroke-width="1.2"/>
+    <path d="M5.6 7.3V5.3a2.4 2.4 0 0 1 4.8 0v2" stroke="currentColor" stroke-width="1.2"/>
+    <path d="M8 9.6v1.4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+  </svg>`,
+
+  // 开口锁：未锁定。锁梁右腿悬空，缺少「v2」这段收尾。
+  unlock: `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect x="3.5" y="7.3" width="9" height="5.9" rx="1.2" stroke="currentColor" stroke-width="1.2"/>
+    <path d="M5.6 7.3V5.3a2.4 2.4 0 0 1 4.6-1.1" stroke="currentColor" stroke-width="1.2"/>
+    <path d="M8 9.6v1.4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+  </svg>`,
+
   // 清空（垃圾桶）
   clear: `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M2.5 4h11M6 4V2.5h4V4M4 4l.6 9.2A1 1 0 0 0 5.6 14h4.8a1 1 0 0 0 1-.8L12 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>

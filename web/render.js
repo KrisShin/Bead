@@ -128,7 +128,14 @@ export function renderBoard(view) {
       ${HeadButton({ action: 'selection-toggle', iconName: 'selection', title: '划词翻译开关（功能待实现）', label: selectionOn ? '划词开' : '划词关' })}
       ${view.update_latest ? `<button type="button" class="icon-btn" data-action="open-release" title="下载新版 ${escapeHtml(view.update_latest)}">${escapeHtml(view.update_latest)}</button>` : ''}
       ${HeadButton({ action: 'languages', iconName: 'settings', title: '设置', label: '设置' })}
-      ${HeadButton({ action: 'pin', iconName: 'pin', label: pinLabel })}
+      ${HeadButton({
+        action: 'pin',
+        iconName: view.locked ? 'lock' : 'unlock',
+        label: pinLabel,
+        ariaLabel: '锁定',
+        pressed: Boolean(view.locked),
+        className: 'icon-btn--lock',
+      })}
       ${HeadButton({ action: 'clear', iconName: 'clear', label: '清空' })}
     </div>
   </header>

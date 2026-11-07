@@ -183,6 +183,7 @@ html, body {
   #board-host .card,
   #board-host .card.is-entering,
   #board-host .card.is-removing,
+  .icon-btn--lock,
   .icon-btn--history,
   .history__item {
     transition-duration: 0.01ms;
@@ -249,6 +250,35 @@ html, body {
 .icon-btn:active { transform: scale(0.93); }
 .icon-btn__svg { display: block; }
 .icon-btn[disabled] { opacity: 0.35; cursor: not-allowed; }
+
+/* 锁定按钮：未锁定 = 中性描边 + 开口锁；已锁定 = 实底强调 + 闭合锁。
+   底色差是扫一眼判断状态的主通道，图标形状是第二通道；不加新动画。 */
+.icon-btn--lock {
+  border: 1px solid transparent;
+  background: transparent;
+  color: #5a6778;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease,
+              transform 0.15s ease;
+}
+.icon-btn--lock:hover {
+  background: #eef1f6;
+  border-color: #dbe3ef;
+  color: var(--bead-primary);
+}
+.icon-btn--lock[aria-pressed='true'] {
+  background: var(--bead-primary);
+  border-color: var(--bead-primary);
+  color: #ffffff;
+}
+.icon-btn--lock[aria-pressed='true']:hover {
+  background: var(--bead-primary-soft);
+  border-color: var(--bead-primary-soft);
+  color: #ffffff;
+}
+.icon-btn--lock:focus-visible {
+  outline: 2px solid var(--bead-primary-soft);
+  outline-offset: 2px;
+}
 
 /* 翻译历史入口：与锁定 / 划词开关共用状态语言——关闭 = 中性描边；
    打开 = 实底强调（底色是第一通道，时钟图标形状是第二通道）。 */

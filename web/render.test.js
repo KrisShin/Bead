@@ -64,6 +64,30 @@ describe('board rendering', () => {
     expect(html).not.toContain('重读');
   });
 
+  it('shows a closed lock and reports pressed state when the board is locked', () => {
+    const html = renderBoard({ ...expanded, locked: true });
+    const pin = html.match(/<button[^>]*data-action="pin"[\s\S]*?<\/button>/)?.[0];
+
+    expect(pin).toContain('class="icon-btn icon-btn--lock"');
+    expect(pin).toContain('aria-pressed="true"');
+    expect(pin).toContain('aria-label="锁定"');
+    expect(pin).toContain('data-tooltip="已锁定（点击解锁）"');
+    // 闭合锁：锁梁右腿落到锁体（v2），不是开口锁那段悬空的弧。
+    expect(pin).toContain('4.8 0v2');
+    expect(pin).not.toContain('4.6-1.1');
+  });
+
+  it('shows an open lock and reports unpressed state when the board is unlocked', () => {
+    const pin = renderBoard(expanded)
+      .match(/<button[^>]*data-action="pin"[\s\S]*?<\/button>/)?.[0];
+
+    expect(pin).toContain('aria-pressed="false"');
+    expect(pin).toContain('data-tooltip="锁定"');
+    // 开口锁：锁梁右腿悬空。
+    expect(pin).toContain('4.6-1.1');
+    expect(pin).not.toContain('4.8 0v2');
+  });
+
   it('offers a retry icon only on the errored card', () => {
     const html = renderBoard({
       ...expanded,
