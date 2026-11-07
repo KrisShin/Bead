@@ -3,8 +3,32 @@
 //! 单元测试注入 fake transport 回放响应体，请求构造与响应解析因此完全不触网；
 //! 真实实现是 `UreqTransport`。所有 provider 共享 10 秒硬超时——重试与熔断由
 //! bead-core 的 ProviderChain 负责，这里只做一次干净的调用。
+//!
+//! 连接复用：`UreqTransport` 的所有实例共用同一个进程级 `ureq::Agent`，从而复用
+//! 连接池与 TLS 会话。旧实现每次发送都新建 Agent，每次都要重做握手，MyMemory 逐语言
+//! 请求时这部分开销会叠加。连接超时单独收紧到 3 秒：连不上时没必要占满整体超时。
+//! 整体超时保持 10 秒（实测单语言 0.59–1.71s，尾部抖动大；5 秒会让偶发慢请求变成
+//! 超时→链重试，反而更慢）。
+
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use bead_core::ProviderError;
+
+/// 单次请求的整体超时（连接 + 发送 + 读完响应）。
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// 建立连接（含 DNS/TLS）的超时；连不上时快速失败，交给链的重试与熔断处理。
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn shared_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpMethod {
@@ -26,7 +50,7 @@ pub struct HttpResponse {
     pub body: String,
 }
 
-pub trait Transport: Send {
+pub trait Transport: Send + Sync {
     fn send(&self, request: &HttpRequest) -> Result<HttpResponse, ProviderError>;
 }
 
@@ -35,11 +59,12 @@ pub struct UreqTransport;
 
 impl Transport for UreqTransport {
     fn send(&self, request: &HttpRequest) -> Result<HttpResponse, ProviderError> {
+        let agent = shared_agent();
         let mut req = match request.method {
-            HttpMethod::Get => ureq::get(&request.url),
-            HttpMethod::Post => ureq::post(&request.url),
+            HttpMethod::Get => agent.get(&request.url),
+            HttpMethod::Post => agent.post(&request.url),
         }
-        .timeout(std::time::Duration::from_secs(10));
+        .timeout(REQUEST_TIMEOUT);
         for (name, value) in &request.headers {
             req = req.set(name, value);
         }
@@ -103,5 +128,13 @@ mod tests {
     fn query_encoding_escapes_reserved_characters() {
         assert_eq!(encode_query("你好 world"), "%E4%BD%A0%E5%A5%BD%20world");
         assert_eq!(encode_query("a-b_c.d~e"), "a-b_c.d~e");
+    }
+
+    #[test]
+    fn every_transport_instance_reuses_the_same_connection_pooled_agent() {
+        // 同一进程里多次 `UreqTransport` 收发必须落到同一个 Agent，连接与 TLS 会话才复用。
+        assert!(std::ptr::eq(shared_agent(), shared_agent()));
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(10));
     }
 }
