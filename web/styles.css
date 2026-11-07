@@ -141,6 +141,16 @@ html, body {
 #board-host[data-cards='settled'] .card {
   animation: none;
 }
+/* 增卡：只有新出现的那张卡播一次入场。它先被 board 的旧宽裁住，
+   随宽度补间露出时正好在播放；其余卡不重播。 */
+#board-host .card.is-entering {
+  animation: bead-card-enter 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+/* 删卡的 0.28s 收拢优先于 settled：先让剩余卡随布局平滑左移，
+   剩下的缺口交给 app.js 的 FLIP + 收宽补齐。 */
+#board-host .card.is-removing {
+  animation: card-pop-out 0.28s cubic-bezier(0.55, 0, 0.68, 0.2) forwards;
+}
 @keyframes bead-card-enter {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: none; }
@@ -149,7 +159,9 @@ html, body {
 @media (prefers-reduced-motion: reduce) {
   #capsule,
   #board-host .board,
-  #board-host .card {
+  #board-host .card,
+  #board-host .card.is-entering,
+  #board-host .card.is-removing {
     transition-duration: 0.01ms;
     animation-duration: 0.01ms;
   }

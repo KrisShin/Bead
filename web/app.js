@@ -9,6 +9,7 @@
 // 4) 计时只把 hover / grace 的 tick 与 400ms 编辑防抖送给 Rust，业务判断全在 Rust。
 
 import { renderBoard } from './render.js';
+import { createPanelWidthTracker, flipOffsets, planPanelResize } from './panel-sync.js';
 import { createEditDebouncer, planEditingRefresh } from './edit-sync.js';
 import { Card, LangAutocomplete } from './components/index.js';
 
@@ -130,6 +131,9 @@ const REVERSE_MS = 200;      // 收起途中回来：从当前值回正
 const CARD_STAGGER_MS = 30;
 const CARD_STAGGER_MAX_MS = 120;
 const CARD_ANIM_MS = 200;
+// 卡片增删时的面板扩展/收缩：内容与窗口共用同一条 160ms 曲线，先对齐再提交。
+const PANEL_RESIZE_MS = 160;
+const PANEL_RESIZE_EASE = 'cubic-bezier(0.16, 1, 0.3, 1)';
 
 let shape = 'capsule'; // 窗口几何形态：capsule=68×28，panel=613×300
 let phase = 'hidden';  // hidden | entering | shown | closing | reversing
@@ -137,7 +141,17 @@ let phaseSeq = 0;      // 相位令牌：只有最新一次开合流程可以继
 let closeTimer = null;
 let enterDoneTimer = null;
 let pendingView = null; // 进入过渡期间的最新快照，过渡结束后再应用
-let lastPanelCardCount = 0; // 面板可见期间上次渲染的卡片数，用于检测增删触发宽度同步
+// 面板可见期间的卡片数基线：展开那一帧由 beginExpand 写入，收起时清空。
+const panelWidthTracker = createPanelWidthTracker();
+// 面板窗口当前的矩形（Rust panel_frame 的缓存）：展开提交 resize 后写入，缩回时清空。
+// 卡片增删补间靠它判断「窗口左缘会不会因贴边 clamp 平移」，从而决定要不要补 Δ。
+let lastPanelFrame = null;
+// 增删动画的互斥：动画期间到达的 state 快照只存 pendingView，结束后补一次 draw，
+// 避免翻译完成的重渲染把窗口补间打断。
+let panelAnimating = false;
+let panelAnimToken = 0;
+let panelPendingView = null;
+let activePanelResize = null;
 
 function setShape(next) {
   shape = next;
@@ -211,6 +225,200 @@ function applyCardStagger() {
   });
 }
 
+// --- 卡片增删时的面板扩展 / 收缩 ---
+//
+// 时序契约：
+// - 一帧只有一次窗口几何提交（resize_window / sync_panel_width 内部各自一次 SetWindowPos）；
+// - 加卡先窗口后内容：内容钉在旧宽 → 提交新窗口 → board 补间到新宽，新卡随宽度露出；
+// - 删卡先内容后窗口：先量剩余卡（FLIP First）→ 重排并反向位移 → 播放位移与收宽 → 最后缩窗；
+// - 贴边（窗口左缘因 clamp 平移 Δ≠0）才在该次 resize 帧遮一帧内容；
+//   非贴边全程可见，不做整板 opacity 0；
+// - 收起沿用既有「内容先出、窗口后缩」，与本函数无关。
+
+function panelBoard() {
+  return boardHost.querySelector('#board');
+}
+
+// board 的内联几何（相对窗口，逻辑像素）。必须同时写 left + width 并清掉 right，
+// 否则 inset:1px 会形成过约束，动画起点落不准。
+function applyBoardRect(rect) {
+  const board = panelBoard();
+  if (!board) return;
+  board.style.right = 'auto';
+  board.style.bottom = 'auto';
+  board.style.left = `${rect.left}px`;
+  board.style.top = `${rect.top}px`;
+  board.style.width = `${rect.width}px`;
+  board.style.height = `${rect.height}px`;
+}
+
+function clearPanelGeometry() {
+  boardHost.style.removeProperty('visibility');
+  const board = panelBoard();
+  if (board) {
+    for (const name of ['left', 'top', 'width', 'height', 'right', 'bottom', 'transition']) {
+      board.style.removeProperty(name);
+    }
+  }
+  for (const card of boardHost.querySelectorAll('.card')) {
+    card.style.removeProperty('transform');
+    card.style.removeProperty('transition');
+    card.style.removeProperty('will-change');
+    card.classList.remove('is-entering');
+  }
+}
+
+function measureCards() {
+  return [...boardHost.querySelectorAll('.card')].map((card) => {
+    const rect = card.getBoundingClientRect();
+    return { lang: card.dataset.lang, left: rect.left, top: rect.top };
+  });
+}
+
+function prefersReducedMotion() {
+  return window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false;
+}
+
+function panelResizeDuration() {
+  return prefersReducedMotion() ? 1 : PANEL_RESIZE_MS;
+}
+
+// 渲染前调用：上锁、记下旧窗口矩形与删卡的第一帧位置。
+function startPanelResize(oldCount, newCount) {
+  if (!lastPanelFrame) return null;
+  panelAnimating = true;
+  activePanelResize = {
+    token: ++panelAnimToken,
+    from: lastPanelFrame,
+    direction: newCount > oldCount ? 'expand' : 'shrink',
+    firstRects: newCount < oldCount ? measureCards() : null,
+    previousLangs: new Set(
+      [...boardHost.querySelectorAll('.card')].map((card) => card.dataset.lang),
+    ),
+  };
+  // 补间期间不需要卡片自身的入场动画：settled 让 FLIP 的内联 transform 不被
+  // card-pop-in / 展开错峰的 keyframes 覆盖。
+  boardHost.dataset.cards = 'settled';
+  return activePanelResize;
+}
+
+function abortPanelResize() {
+  if (!panelAnimating) return;
+  panelAnimToken += 1;
+  panelAnimating = false;
+  activePanelResize = null;
+  panelPendingView = null;
+  clearPanelGeometry();
+}
+
+function endPanelResize(ctx, endRect) {
+  if (ctx && ctx.token !== panelAnimToken) return;
+  if (endRect) applyBoardRect(endRect); // 落到标准 inset 矩形，随后清掉内联样式
+  clearPanelGeometry();
+  panelAnimating = false;
+  activePanelResize = null;
+  const latest = panelPendingView;
+  panelPendingView = null;
+  if (latest) draw(latest);
+}
+
+function startBoardTween(rect, duration) {
+  const board = panelBoard();
+  if (!board) return;
+  board.style.transition = `left ${duration}ms ${PANEL_RESIZE_EASE}, width ${duration}ms ${PANEL_RESIZE_EASE}`;
+  void board.getBoundingClientRect(); // 先让起点生效，下一句才是一次真实的状态变化
+  applyBoardRect(rect);
+}
+
+// 删卡的 FLIP：渲染后按 lang 对比首帧位置，先反向位移，再与收宽同拍归零。
+function applyFlip(firstRects, duration) {
+  const offsets = flipOffsets(firstRects, measureCards());
+  const moved = [];
+  for (const { lang, dx, dy } of offsets) {
+    const card = boardHost.querySelector(`.card[data-lang="${lang}"]`);
+    if (!card) continue;
+    card.style.transition = 'none';
+    card.style.transform = `translate(${dx}px, ${dy}px)`;
+    moved.push(card);
+  }
+  if (!moved.length) return;
+  void moved[0].getBoundingClientRect(); // 提交反向位移
+  for (const card of moved) {
+    card.style.willChange = 'transform';
+    card.style.transition = `transform ${duration}ms ${PANEL_RESIZE_EASE}`;
+    card.style.transform = 'none';
+  }
+}
+
+async function panelFrame() {
+  if (!invoke) return null;
+  try {
+    return await invoke('panel_frame');
+  } catch {
+    return null;
+  }
+}
+
+async function syncPanelWindow() {
+  if (!invoke) return;
+  await invoke('sync_panel_width').catch(() => {});
+}
+
+const waitMs = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+// 渲染后调用：窗口先提交还是内容先补间，由 plan 决定；结束时补一次被推迟的 draw。
+async function commitPanelResize(view, ctx) {
+  const { token, from, direction, firstRects, previousLangs } = ctx;
+  // 只读几何：与 sync_panel_width 同一套锚点 / clamp，不移动窗口。
+  const to = await panelFrame();
+  if (token !== panelAnimToken) return; // 被收起或新一轮增删打断
+  if (!to || Math.abs(to.width - from.width) < 1) {
+    endPanelResize(ctx, null); // 计数其实没变（池满等兜底）：不动窗口
+    return;
+  }
+  const plan = planPanelResize(from, to);
+  const duration = panelResizeDuration();
+
+  if (direction === 'expand') {
+    // 新卡先挂入场：它被 board 的旧宽裁住，随宽度露出时正好在播放。
+    const added = (view.cards ?? []).find((card) => !previousLangs.has(card.lang));
+    const addedCard = added
+      ? boardHost.querySelector(`.card[data-lang="${added.lang}"]`)
+      : null;
+    if (addedCard) addedCard.classList.add('is-entering');
+    applyBoardRect(plan.start); // 重新钉住旧宽（渲染换了 DOM，内联样式已丢失）
+    if (plan.hideAtResize) boardHost.style.visibility = 'hidden';
+    await syncPanelWindow(); // 窗口先长
+    if (token !== panelAnimToken) return;
+    lastPanelFrame = to;
+    if (plan.postResizeStart) applyBoardRect(plan.postResizeStart);
+    await nextFrame();
+    if (token !== panelAnimToken) return;
+    if (plan.hideAtResize) boardHost.style.removeProperty('visibility');
+    startBoardTween(plan.end, duration);
+    await waitMs(Math.max(duration, CARD_ANIM_MS) + 40);
+    if (token !== panelAnimToken) return;
+    endPanelResize(ctx, plan.end);
+    return;
+  }
+
+  // 删卡：先内容、后窗口。剩余卡的反向位移与 board 收宽同拍播放。
+  applyBoardRect(plan.start);
+  applyFlip(firstRects ?? [], duration);
+  startBoardTween(plan.preResizeEnd, duration);
+  await waitMs(duration + 40);
+  if (token !== panelAnimToken) return;
+  if (plan.hideAtResize) boardHost.style.visibility = 'hidden';
+  await syncPanelWindow(); // 内容已收好，最后缩窗
+  if (token !== panelAnimToken) return;
+  lastPanelFrame = to;
+  if (plan.postResizeStart) applyBoardRect(plan.postResizeStart);
+  await nextFrame();
+  if (token !== panelAnimToken) return;
+  if (plan.hideAtResize) boardHost.style.removeProperty('visibility');
+  endPanelResize(ctx, plan.end);
+}
+
 // 展开 68×28 → 613×300（严格六步）
 async function beginExpand(view) {
   const token = ++phaseSeq;
@@ -232,6 +440,9 @@ async function beginExpand(view) {
   setShape('panel');
   if (invoke) {
     await invoke('resize_window', { expanded: true }).catch(() => {});
+    if (token !== phaseSeq) return;
+    // 缓存展开后的窗口矩形：之后第一次增删要靠它判断窗口左缘是否贴边平移。
+    lastPanelFrame = await panelFrame();
   }
   if (token !== phaseSeq) return;
 
@@ -243,6 +454,9 @@ async function beginExpand(view) {
   boardHost.dataset.cards = 'enter'; // 这一帧同时让 board transition 和 card animation 起跑
   boardHost.dataset.visible = 'true';
   setPhase('shown');
+  // 展开这一次 resize_window 已按语言池实时计数提交了宽度：把当前卡片数写成基线，
+  // 否则展开后的第一次增删会被 observe 当成基线记录吞掉，窗口不跟随。
+  panelWidthTracker.prime(view.cards?.length ?? 0);
 
   // 5) 过渡走完再解锁内容更新，并把 will-change 撤掉
   enterDoneTimer = window.setTimeout(() => {
@@ -299,12 +513,13 @@ async function finishCollapse(token) {
   delete root.dataset.capsuleInstant;
   boardHost.removeAttribute('data-motion');
   clearBoard();
-  lastPanelCardCount = 0;
+  panelWidthTracker.clear();
+  lastPanelFrame = null;
 }
 
-// 面板开着时卡片数变了：协调一次「内容淡出 → Rust resize → 内容淡入」。
-// Rust 侧不再直接 resize（可见期 resize 会被 OS 合成器抓拍到旧内容 + 新尺寸的中间帧），
-// 改由前端用 opacity 过渡把内容暂时藏起来，resize 完成后再恢复。
+// 兜底路径：拿不到窗口矩形（没有 Tauri 注入 / panel_frame 读取失败）时才用。
+// 沿用旧的「整板淡出 → Rust resize → 淡入」，代价是一次重绘，
+// 换来任何几何下都不会露出「旧内容 + 新尺寸」的中间帧。
 let panelWidthSyncing = false;
 async function syncPanelWidthSilent() {
   if (!invoke || panelWidthSyncing) return;
@@ -313,6 +528,7 @@ async function syncPanelWidthSilent() {
   boardHost.style.opacity = '0';
   await new Promise((r) => setTimeout(r, 60));
   await invoke('sync_panel_width').catch(() => {});
+  lastPanelFrame = await panelFrame();
   await nextFrame();
   await nextFrame();
   boardHost.style.opacity = '1';
@@ -348,6 +564,17 @@ boardHost.addEventListener('transitionend', (event) => {
 
 function draw(view) {
   if (!view || typeof view !== 'object') return;
+  if (panelAnimating) {
+    if (view.view === 'expanded') {
+      // 增删补间期间到达的快照只记下，动画收尾后再补一次，避免打断窗口时序。
+      lastView = view;
+      panelPendingView = view;
+      scheduleTick(view);
+      return;
+    }
+    // 收起优先：中断补间，直接走「内容先出、窗口后缩」。
+    abortPanelResize();
+  }
   lastView = view;
   const expanded = view.view === 'expanded';
   const wasExpanded = root.dataset.view === 'expanded';
@@ -361,13 +588,26 @@ function draw(view) {
       // hidden = 正常展开；closing = 收起未完成又展开，重走完整流程（含 resize）
       beginExpand(view);
     } else {
-      renderContent(view, wasExpanded);
-      // 面板开着时卡片数变了：协调一次不可见期的窗口 resize
+      // 面板开着时卡片数变了：按「窗口 / 内容」时序做扩展或收缩。
+      const previousCount = panelWidthTracker.count();
       const curCount = view.cards?.length ?? 0;
-      if (curCount !== lastPanelCardCount && lastPanelCardCount > 0) {
-        syncPanelWidthSilent();
+      const countChanged = panelWidthTracker.observe(curCount);
+      if (countChanged) {
+        // 渲染前先上锁并量好删卡的第一帧位置；渲染后立刻进入补间。
+        const ctx = startPanelResize(previousCount ?? curCount, curCount);
+        renderContent(view, wasExpanded);
+        if (ctx) {
+          commitPanelResize(view, ctx).catch((error) => {
+            console.warn('[bead] panel-resize', error);
+            abortPanelResize();
+            syncPanelWidthSilent(); // 兜底：至少保证窗口宽度跟上计数
+          });
+        } else {
+          syncPanelWidthSilent();
+        }
+      } else {
+        renderContent(view, wasExpanded);
       }
-      lastPanelCardCount = curCount;
     }
   } else if (view.view === 'hover_pending' && shape === 'panel' && phase !== 'shown' && phase !== 'hidden') {
     // 收起未完成就回来：窗口还在，反向补间回正，不做 resize。
