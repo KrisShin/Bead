@@ -248,6 +248,50 @@ html, body {
 .icon-btn__svg { display: block; }
 .icon-btn[disabled] { opacity: 0.35; cursor: not-allowed; }
 
+
+/* 朗读中 / 在线兜底：在线角标必须可见，不能只靠 title 暗示。 */
+.icon-btn.is-speaking { color: var(--bead-primary); background: #e8eefc; }
+.icon-btn.is-speaking .icon-btn__svg { animation: speech-pulse 1s ease-in-out infinite; }
+.icon-btn.is-online::after {
+  content: "在线";
+  position: absolute;
+  right: -5px;
+  bottom: -3px;
+  font-size: 8px;
+  line-height: 1;
+  padding: 1px 2px;
+  border-radius: 3px;
+  background: var(--bead-primary);
+  color: #fff;
+  pointer-events: none;
+}
+@keyframes speech-pulse {
+  50% { opacity: 0.45; }
+}
+
+/* 朗读失败/缺音色的轻提示：不静默，也不弹窗打断翻译。 */
+.speech-hint {
+  position: fixed;
+  left: 50%;
+  bottom: 14px;
+  z-index: 20;
+  max-width: 88%;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(31, 41, 55, 0.92);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.4;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, 8px);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.speech-hint[data-visible="true"] {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
 /* 小号 icon 按钮（卡片内） */
 .icon-btn--sm { width: 24px; height: 24px; }
 

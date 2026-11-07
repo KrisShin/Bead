@@ -67,6 +67,11 @@ export function renderBoard(view) {
     <label><input type="checkbox" data-setting="selection_enabled"${view.settings.selection_enabled ? ' checked' : ''} />划词（${view.settings.selection_hotkey}，改键重启生效）</label>
     <label><input type="checkbox" data-setting="autostart" ${view.settings.autostart_enabled ? 'checked' : ''} />开机自启</label>
     <label><input type="checkbox" data-setting="auto_check_updates" ${view.settings.auto_check_updates ? 'checked' : ''} />启动时检查更新</label>
+    <label>朗读语速 <input type="number" data-setting="tts_rate" value="${Number(view.settings.tts_rate ?? 1)}" min="0.5" max="2" step="0.1" /> ×</label>
+    <label>朗读音量 <input type="number" data-setting="tts_volume" value="${Number(view.settings.tts_volume ?? 80)}" min="0" max="100" step="5" /></label>
+    <label><input type="checkbox" data-setting="tts_online_fallback"${view.settings.tts_online_fallback !== false ? ' checked' : ''} />缺音色时使用在线朗读</label>
+    <span class="board__hint">有本地音色时不联网；仅在该语言缺少音色时才把卡片文本发送给在线朗读服务。</span>
+    <button type="button" data-action="clear-history">清空历史</button>
     <button type="button" data-action="check-updates">检查更新</button>
   </div>`
       : '';

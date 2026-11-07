@@ -48,6 +48,13 @@ let sendSeq = 0;
 let dragging = false;
 let dragGuard = null;
 let currentAudio = null;
+// 朗读状态：只用于按钮样式与「同卡再点=停止」，业务状态仍由 Rust 的 speech 事件驱动。
+let speakingLang = null;
+let speakingTicket = 0;
+let speechSeq = 0;
+// 各语言朗读能力（本地/在线/不可用），由 speech_capabilities 拉取后按语言缓存。
+let speechCapabilities = null;
+let speechHintTimer = null;
 // 每张卡最后一次进入 Rust 的文本：失焦/回车对未变更内容不重复发起同步。
 const lastCommitted = new Map();
 // 输入防抖只记语言，到期时再按语言找回当前输入框（见 edit-sync.js 的说明）。
@@ -196,14 +203,19 @@ function renderContent(view, wasExpanded) {
     : null;
   if (focusedEditor && wasExpanded) {
     refreshOtherCards(view, focusedEditor.dataset.lang);
+    applySpeechUi();
     return;
   }
   const html = renderBoard({ ...view, languagesOpen });
   // html 没变就不碰 DOM
-  if (html === lastBoardHtml) return;
+  if (html === lastBoardHtml) {
+    applySpeechUi();
+    return;
+  }
   lastBoardHtml = html;
   boardHost.innerHTML = html;
   for (const card of view.cards ?? []) lastCommitted.set(card.lang, card.text);
+  applySpeechUi();
 }
 
 // 编辑期局部刷新：其余卡整卡替换（焦点在编辑卡上，不会丢光标），
@@ -220,6 +232,7 @@ function refreshOtherCards(view, editingLang) {
     lastCommitted.set(card.lang, card.text);
   }
   lastBoardHtml = null; // 编辑结束后必须再对齐一次整板
+  applySpeechUi();
 }
 
 // 卡片错峰：第 n 张 delay = min(n*30ms, 120ms)。只写内联延迟，
@@ -486,6 +499,8 @@ async function beginExpand(view) {
 // 收起 613×300 → 68×28（内容先出，全部结束之前不碰窗口尺寸）
 function beginCollapse() {
   if (phase === 'hidden' || phase === 'closing') return;
+  // 面板一旦开始收起就不该再出声（宽限到期才会到这里；ESC/点外理由 Rust 也会停）。
+  if (speakingLang || currentAudio) stopSpeaking('panel_hidden');
   clearEnterTimer();
   pendingView = null;
   const token = ++phaseSeq;
@@ -670,28 +685,174 @@ function requestLeave() {
   }, LEAVE_DEBOUNCE_MS);
 }
 
-// 朗读：在线产物走 asset 协议；SAPI 自播（kind=played）不需要前端动作。
-function playSpeak(view) {
-  const speak = view?.speak;
-  if (!speak || speak.kind !== 'file' || !speak.url || !invoke) return;
-  let url;
+// 朗读：本地引擎自己发声；在线产物走 asset 协议。失败必须可见，不再静默吞掉。
+function showSpeechHint(message) {
+  if (!message) return;
+  let hint = document.getElementById('speech-hint');
+  if (!hint) {
+    hint = document.createElement('div');
+    hint.id = 'speech-hint';
+    hint.className = 'speech-hint';
+    document.body.appendChild(hint);
+  }
+  hint.textContent = message;
+  hint.dataset.visible = 'true';
+  window.clearTimeout(speechHintTimer);
+  speechHintTimer = window.setTimeout(() => {
+    hint.dataset.visible = 'false';
+  }, 2600);
+}
+
+function applySpeechUi() {
+  for (const card of boardHost.querySelectorAll('.card')) {
+    const lang = card.dataset.lang;
+    const capability = speechCapabilities?.[lang];
+    const button = card.querySelector('[data-action="speak"]');
+    if (!button) continue;
+    const playing = speakingLang === lang;
+    button.classList.toggle('is-speaking', playing);
+    button.classList.toggle('is-online', !!capability && capability.backend === 'online');
+    button.disabled = !!capability && !capability.enabled;
+    button.title = playing ? '停止朗读' : capability?.reason || '朗读';
+    button.setAttribute('aria-pressed', playing ? 'true' : 'false');
+  }
+}
+
+async function refreshSpeechCapabilities() {
+  if (!invoke) return;
   try {
-    url = convertFileSrc
-      ? convertFileSrc(speak.url)
-      : `asset://localhost/${speak.url.replace(/\\/g, '/')}`;
-  } catch {
+    const data = await invoke('speech_capabilities');
+    if (!data?.languages) return;
+    speechCapabilities = Object.fromEntries(data.languages.map((item) => [item.lang, item]));
+    applySpeechUi();
+  } catch (error) {
+    console.warn('[bead] speech_capabilities', error);
+  }
+}
+
+function pauseSpeechAudio() {
+  if (!currentAudio) return;
+  currentAudio.onended = null;
+  currentAudio.onerror = null;
+  currentAudio.pause();
+}
+
+function playSpeechFile(result) {
+  if (!convertFileSrc) {
+    showSpeechHint('当前环境无法播放在线朗读音频');
     return;
   }
-  if (!url) return;
+  let url;
+  try {
+    url = convertFileSrc(result.url);
+  } catch (error) {
+    showSpeechHint(`朗读文件不可用：${error}`);
+    return;
+  }
   if (!currentAudio) currentAudio = new Audio();
   currentAudio.pause();
   currentAudio.src = url; // 换 src 后自然从头播；复用同一个元素，避免每点一次就泄漏一个 Audio
-  currentAudio.play().catch(() => {}); // 朗读是增强功能，失败不打断翻译主流程
+  const settings = lastView?.settings ?? {};
+  const volume = Number(settings.tts_volume ?? 80);
+  const rate = Number(settings.tts_rate ?? 1);
+  currentAudio.volume = Math.min(1, Math.max(0, volume / 100));
+  currentAudio.playbackRate = Math.min(2, Math.max(0.5, rate));
+  currentAudio.onended = () => {
+    currentAudio.onended = null;
+    currentAudio.onerror = null;
+    if (invoke && result.ticket === speakingTicket) {
+      invoke('speech_finished', { ticket: result.ticket }).catch(() => {});
+    }
+    speakingLang = null;
+    applySpeechUi();
+  };
+  currentAudio.onerror = () => {
+    currentAudio.onerror = null;
+    showSpeechHint('在线朗读音频播放失败');
+    if (invoke) {
+      invoke('speech_failed', {
+        ticket: result.ticket,
+        lang: result.lang,
+        message: '在线朗读音频播放失败',
+      }).catch(() => {});
+    }
+    speakingLang = null;
+    applySpeechUi();
+  };
+  currentAudio.play().catch((error) => {
+    showSpeechHint(`在线朗读音频播放失败：${error}`);
+    if (invoke) {
+      invoke('speech_failed', {
+        ticket: result.ticket,
+        lang: result.lang,
+        message: `在线朗读音频播放失败：${error}`,
+      }).catch(() => {});
+    }
+    speakingLang = null;
+    applySpeechUi();
+  });
+}
+
+function stopSpeaking(reason = 'user') {
+  pauseSpeechAudio();
+  speakingLang = null;
+  applySpeechUi();
+  if (invoke) invoke('stop_speaking', { reason }).catch(() => {});
+}
+
+function applySpeechEvent(view) {
+  if (!view || typeof view !== 'object') return;
+  const phase = view.phase;
+  if (phase === 'resolving' || phase === 'playing') {
+    // 旧请求的 stopped 可能排在 resolving 之前；ticket 只许前进，防旧事件清掉新状态。
+    if (view.ticket >= speakingTicket) {
+      speakingLang = view.lang || null;
+      speakingTicket = view.ticket;
+    }
+  } else if (phase === 'finished' || phase === 'stopped' || phase === 'idle' || phase === 'error') {
+    if (view.ticket >= speakingTicket) {
+      speakingLang = null;
+      speakingTicket = view.ticket;
+      pauseSpeechAudio();
+    }
+    if (phase === 'error' && view.error) showSpeechHint(view.error);
+  }
+  applySpeechUi();
 }
 
 async function speakCard(lang) {
-  const view = await send('speak_card', { lang });
-  playSpeak(view);
+  if (!invoke) return;
+  if (speakingLang === lang) {
+    stopSpeaking('user');
+    return;
+  }
+  // 编辑中的文本尚未进 Rust：先 flush，否则会读到旧内容（朗读与卡片文本不一致）。
+  const textarea = [...boardHost.querySelectorAll('textarea.card__text')].find(
+    (element) => element.dataset.lang === lang,
+  );
+  if (textarea) {
+    editDebouncer.cancel(lang);
+    await commitEdit(lang, textarea);
+  }
+  const seq = ++speechSeq;
+  let result;
+  try {
+    result = await invoke('speak_card', { lang });
+  } catch (error) {
+    if (seq === speechSeq) showSpeechHint(`朗读请求失败：${error}`);
+    return;
+  }
+  if (seq !== speechSeq || !result) return;
+  if (result.kind === 'cancelled') return;
+  if (result.kind === 'error' || result.kind === 'unavailable' || result.kind === 'empty') {
+    showSpeechHint(result.error || '当前无法朗读');
+    refreshSpeechCapabilities();
+    return;
+  }
+  speakingLang = result.lang;
+  speakingTicket = result.ticket;
+  applySpeechUi();
+  if (result.kind === 'file') playSpeechFile(result);
 }
 
 async function commitEdit(lang, textarea) {
@@ -741,7 +902,12 @@ function saveSettings() {
       Number(boardHost.querySelector('[data-setting="hover_delay_ms"]')?.value) || 200,
     selection_enabled: checked('selection_enabled'),
     auto_check_updates: checked('auto_check_updates'),
+    tts_rate: value('tts_rate') || 1,
+    tts_volume: Number.isFinite(value('tts_volume')) ? value('tts_volume') : 80,
+    tts_online_fallback: checked('tts_online_fallback', true),
   });
+  await refreshSpeechCapabilities();
+  return view;
 }
 
 // --- 事件全部委托在常驻根节点上，DOM 内部怎么替换都不影响 ---
@@ -772,6 +938,9 @@ root.addEventListener('click', (event) => {
       break;
     case 'clear':
       cancelAllEdits();
+      pauseSpeechAudio();
+      speakingLang = null;
+      applySpeechUi();
       send('clear_document');
       break;
     case 'check-updates':
@@ -845,6 +1014,7 @@ root.addEventListener('change', async (event) => {
   if (index < 0) return;
   const view = await sendSilent('change_card_lang', { from: oldLang, to: newLang });
   patchCardsAfterLanguageChange(index, view, oldLang);
+  refreshSpeechCapabilities();
 });
 
 // --- 卡片拖拽排序 ---
@@ -1079,10 +1249,12 @@ async function closeCard(lang) {
     await new Promise((r) => setTimeout(r, 280));
   }
   await send('remove_card', { lang });
+  refreshSpeechCapabilities();
 }
 
 async function addCard() {
   await send('add_card');
+  refreshSpeechCapabilities();
 }
 
 root.addEventListener('input', (event) => {
@@ -1217,10 +1389,15 @@ if (listen) {
   listen('state', (event) => {
     if (event.payload) draw(event.payload);
   }).catch(() => {});
+  // 朗读状态单独走事件：不参与 draw()，翻译刷新/面板动画都不会打断它。
+  listen('speech', (event) => {
+    applySpeechEvent(event.payload);
+  }).catch(() => {});
 }
 
 if (invoke) {
   send('get_state');
+  refreshSpeechCapabilities();
 } else {
   draw(SNAPSHOT_VIEW);
 }

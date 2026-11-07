@@ -33,6 +33,15 @@ pub struct AppSettings {
     /// 启动时自动检查更新（只比较与提示，绝不下载安装——产品红线）。
     #[serde(default = "default_true")]
     pub auto_check_updates: bool,
+    /// 朗读语速倍率（0.5–2.0）。本地引擎直接生效；在线音频由前端倍速播放。
+    #[serde(default = "default_tts_rate")]
+    pub tts_rate: f64,
+    /// 朗读音量（0–100）。
+    #[serde(default = "default_tts_volume")]
+    pub tts_volume: u8,
+    /// 该语言没有本地音色时是否允许在线兜底。默认开启；仅在缺音色时触发。
+    #[serde(default = "default_true")]
+    pub tts_online_fallback: bool,
     /// 窗口位置（旧字段，逻辑坐标；保留写入以兼容旧构建）。
     #[serde(default)]
     pub window_position: Option<(i32, i32)>,
@@ -58,6 +67,14 @@ fn default_leave_grace() -> u64 {
     800
 }
 
+fn default_tts_rate() -> f64 {
+    1.0
+}
+
+fn default_tts_volume() -> u8 {
+    80
+}
+
 fn default_languages() -> Vec<String> {
     vec!["zh".into(), "en".into(), "ja".into()]
 }
@@ -76,6 +93,9 @@ impl Default for AppSettings {
             window_position: None,
             capsule_anchor: None,
             auto_check_updates: true,
+            tts_rate: default_tts_rate(),
+            tts_volume: default_tts_volume(),
+            tts_online_fallback: true,
         }
     }
 }
@@ -131,6 +151,9 @@ mod tests {
             window_position: Some((100, 100)),
             capsule_anchor: Some((100, 100)),
             auto_check_updates: true,
+            tts_rate: 1.2,
+            tts_volume: 55,
+            tts_online_fallback: false,
             provider: ProviderConfig {
                 engine: bead_providers::Engine::Zhipu,
                 api_key: "key-1".into(),
@@ -148,6 +171,9 @@ mod tests {
         assert_eq!(loaded.provider.api_key, "key-1");
         assert_eq!(loaded.languages, vec!["zh".to_string(), "de".to_string()]);
         assert_eq!(loaded.capsule_anchor, Some((100, 100)));
+        assert_eq!(loaded.tts_rate, 1.2);
+        assert_eq!(loaded.tts_volume, 55);
+        assert!(!loaded.tts_online_fallback);
         std::fs::remove_dir_all(&dir).ok();
     }
 

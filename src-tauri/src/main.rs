@@ -150,25 +150,8 @@ impl Clock for SystemClock {
     }
 }
 
-/// 离线语音：Windows SAPI（System.Speech），零第三方依赖。子进程自己发声，不阻塞壳层。
-/// 初版不按语言挑音色（Windows 已装语音有限），按文本内容走默认语音；诚实标注为粗粒度。
-struct SapiSpeaker;
-
-impl OfflineSpeaker for SapiSpeaker {
-    fn speak(&self, _language: &Lang, text: &str) -> Result<(), SpeechError> {
-        let script = format!(
-            "(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{}')",
-            text.replace('\'', "''")
-        );
-        std::process::Command::new("powershell")
-            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| SpeechError::OfflineFailed(format!("SAPI 启动失败：{error}")))
-    }
-}
-
-/// 在线 TTS：Google translate_tts（无 key；本网络不可达时即走离线降级路径）。
+/// 在线 TTS：Google translate_tts（无 key）。只在「该语言没有本地音色」且用户允许
+/// 在线兜底时才调用；有本地音色时绝不把文本发往网络。
 struct GoogleTtsOnline {
     transport: bead_providers::UreqByteTransport,
 }
@@ -176,6 +159,338 @@ struct GoogleTtsOnline {
 impl OnlineTts for GoogleTtsOnline {
     fn fetch(&self, language: &Lang, text: &str) -> Result<Vec<u8>, SpeechError> {
         bead_providers::GoogleTts::fetch(&self.transport, language, text)
+    }
+}
+
+/// 一次朗读请求的结果。`kind`：local = 本地引擎已开口；file = 前端用 `<audio>` 播；
+/// error / unavailable / cancelled = 明确失败或已被新请求取代，前端据此出轻提示。
+#[derive(Serialize, Clone)]
+struct SpeakResult {
+    kind: String,
+    ticket: u64,
+    lang: String,
+    backend: String,
+    url: String,
+    error: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Serialize, Clone, Default)]
+struct SpeechView {
+    phase: String,
+    lang: String,
+    backend: String,
+    ticket: u64,
+    error: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct SpeechCapabilityView {
+    lang: String,
+    enabled: bool,
+    backend: String,
+    reason: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct SpeechCapabilitiesView {
+    online_fallback: bool,
+    rate: f64,
+    volume: u8,
+    languages: Vec<SpeechCapabilityView>,
+    /// 枚举系统语音失败时如实回传；此时「本地/在线」判断只能标成未知或在线。
+    voice_error: Option<String>,
+}
+
+struct VoiceCache {
+    voices: Vec<VoiceInfo>,
+    fetched_at: Option<Instant>,
+    error: Option<String>,
+}
+
+impl Default for VoiceCache {
+    fn default() -> Self {
+        Self {
+            voices: Vec::new(),
+            fetched_at: None,
+            error: None,
+        }
+    }
+}
+
+struct ActiveSpeech {
+    ticket: u64,
+    lang: String,
+    text: String,
+    backend: String,
+    playback: Option<Arc<Mutex<speech_local::LocalPlayback>>>,
+}
+
+/// 全进程唯一的朗读控制器。文档/翻译同步链完全不知道它存在：
+/// 只读一次卡片文本，之后所有状态都在这里，不写回 `Document`、不递增翻译代次、
+/// 不参与面板动画。`latest-wins` 由 ticket 保证；晚到的在线结果按 ticket 丢弃。
+struct SpeechService {
+    ticket: AtomicU64,
+    active: Mutex<Option<ActiveSpeech>>,
+    voices: Mutex<VoiceCache>,
+    status: Mutex<SpeechView>,
+    manager: SpeechManager<GoogleTtsOnline>,
+}
+
+impl SpeechService {
+    fn new(manager: SpeechManager<GoogleTtsOnline>) -> Self {
+        Self {
+            ticket: AtomicU64::new(0),
+            active: Mutex::new(None),
+            voices: Mutex::new(VoiceCache::default()),
+            status: Mutex::new(SpeechView {
+                phase: "idle".into(),
+                ..Default::default()
+            }),
+            manager,
+        }
+    }
+
+    fn current_ticket(&self) -> u64 {
+        self.ticket.load(Ordering::SeqCst)
+    }
+
+    fn is_current(&self, ticket: u64) -> bool {
+        self.current_ticket() == ticket
+    }
+
+    fn begin(&self, app: &tauri::AppHandle, lang: &str, text: &str) -> u64 {
+        let ticket = self.ticket.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(mut old) = self.active.lock().expect("speech active poisoned").take() {
+            if let Some(playback) = old.playback.take() {
+                playback.lock().expect("speech playback poisoned").stop();
+            }
+            let view = SpeechView {
+                phase: "stopped".into(),
+                lang: old.lang,
+                backend: old.backend,
+                ticket: old.ticket,
+                error: None,
+                reason: Some("superseded".into()),
+            };
+            emit_speech(app, &view);
+        }
+        *self.active.lock().expect("speech active poisoned") = Some(ActiveSpeech {
+            ticket,
+            lang: lang.to_string(),
+            text: text.to_string(),
+            backend: "pending".into(),
+            playback: None,
+        });
+        ticket
+    }
+
+    fn set_backend(&self, ticket: u64, backend: &str) {
+        if let Some(active) = self
+            .active
+            .lock()
+            .expect("speech active poisoned")
+            .as_mut()
+            .filter(|active| active.ticket == ticket)
+        {
+            active.backend = backend.to_string();
+        }
+    }
+
+    fn playing(&self, app: &tauri::AppHandle, ticket: u64, lang: &str, backend: &str) {
+        if !self.is_current(ticket) {
+            return;
+        }
+        self.set_backend(ticket, backend);
+        self.set_status(
+            app,
+            SpeechView {
+                phase: "playing".into(),
+                lang: lang.to_string(),
+                backend: backend.to_string(),
+                ticket,
+                error: None,
+                reason: None,
+            },
+        );
+    }
+
+    fn resolving(&self, app: &tauri::AppHandle, ticket: u64, lang: &str) {
+        if !self.is_current(ticket) {
+            return;
+        }
+        self.set_status(
+            app,
+            SpeechView {
+                phase: "resolving".into(),
+                lang: lang.to_string(),
+                backend: "pending".into(),
+                ticket,
+                error: None,
+                reason: None,
+            },
+        );
+    }
+
+    fn finish(&self, app: &tauri::AppHandle, ticket: u64) {
+        let removed = {
+            let mut active = self.active.lock().expect("speech active poisoned");
+            match active.as_ref() {
+                Some(current) if current.ticket == ticket => active.take(),
+                _ => None,
+            }
+        };
+        if let Some(active) = removed {
+            let view = SpeechView {
+                phase: "finished".into(),
+                lang: active.lang,
+                backend: active.backend,
+                ticket,
+                error: None,
+                reason: None,
+            };
+            self.set_status(app, view);
+        }
+    }
+
+    fn fail(&self, app: &tauri::AppHandle, ticket: u64, lang: &str, backend: &str, error: String) {
+        // 停止/抢占之后才回来的失败必须丢弃：否则会把「已停止」的界面又推成错误提示。
+        if !self.is_current(ticket) {
+            return;
+        }
+        let removed = {
+            let mut active = self.active.lock().expect("speech active poisoned");
+            match active.as_ref() {
+                Some(current) if current.ticket == ticket => active.take(),
+                _ => None,
+            }
+        };
+        let lang = removed
+            .map(|active| active.lang)
+            .unwrap_or_else(|| lang.to_string());
+        self.set_status(
+            app,
+            SpeechView {
+                phase: "error".into(),
+                lang,
+                backend: backend.to_string(),
+                ticket,
+                error: Some(error),
+                reason: None,
+            },
+        );
+    }
+
+    fn stop(&self, app: &tauri::AppHandle, reason: &str) -> SpeechView {
+        let ticket = self.ticket.fetch_add(1, Ordering::SeqCst) + 1;
+        let removed = self.active.lock().expect("speech active poisoned").take();
+        let had_active = removed.is_some();
+        if let Some(mut old) = removed {
+            if let Some(playback) = old.playback.take() {
+                playback.lock().expect("speech playback poisoned").stop();
+            }
+            let view = SpeechView {
+                phase: "stopped".into(),
+                lang: old.lang,
+                backend: old.backend,
+                ticket: old.ticket,
+                error: None,
+                reason: Some(reason.to_string()),
+            };
+            emit_speech(app, &view);
+        }
+        let idle = SpeechView {
+            phase: "idle".into(),
+            lang: String::new(),
+            backend: String::new(),
+            ticket,
+            error: None,
+            reason: had_active.then(|| reason.to_string()),
+        };
+        *self.status.lock().expect("speech status poisoned") = idle.clone();
+        idle
+    }
+
+    fn set_status(&self, app: &tauri::AppHandle, view: SpeechView) {
+        *self.status.lock().expect("speech status poisoned") = view.clone();
+        emit_speech(app, &view);
+    }
+
+    fn status_view(&self) -> SpeechView {
+        self.status.lock().expect("speech status poisoned").clone()
+    }
+
+    fn active_lang_and_text(&self) -> Option<(String, String)> {
+        self.active
+            .lock()
+            .expect("speech active poisoned")
+            .as_ref()
+            .map(|active| (active.lang.clone(), active.text.clone()))
+    }
+
+    fn refresh_voices(&self, force: bool) -> Result<Vec<VoiceInfo>, String> {
+        {
+            let cache = self.voices.lock().expect("speech voices poisoned");
+            if !force {
+                if let Some(fetched_at) = cache.fetched_at {
+                    if fetched_at.elapsed() < Duration::from_secs(60) {
+                        return match &cache.error {
+                            Some(error) if cache.voices.is_empty() => Err(error.clone()),
+                            _ => Ok(cache.voices.clone()),
+                        };
+                    }
+                }
+            }
+        }
+
+        let result = speech_local::list_voices();
+        let mut cache = self.voices.lock().expect("speech voices poisoned");
+        cache.fetched_at = Some(Instant::now());
+        match result {
+            Ok(voices) => {
+                cache.voices = voices.clone();
+                cache.error = None;
+                Ok(voices)
+            }
+            Err(error) => {
+                cache.error = Some(error.clone());
+                if cache.voices.is_empty() {
+                    Err(error)
+                } else {
+                    // 刷新失败但手里有旧列表：继续用旧列表，同时把错误留给能力查询展示。
+                    Ok(cache.voices.clone())
+                }
+            }
+        }
+    }
+
+    fn voice_snapshot(&self) -> (Vec<VoiceInfo>, Option<String>) {
+        let cache = self.voices.lock().expect("speech voices poisoned");
+        (cache.voices.clone(), cache.error.clone())
+    }
+}
+
+fn emit_speech(app: &tauri::AppHandle, view: &SpeechView) {
+    let _ = app.emit("speech", view.clone());
+}
+
+fn speak_error_result(
+    ticket: u64,
+    lang: &str,
+    backend: &str,
+    kind: &str,
+    message: String,
+    reason: Option<&str>,
+) -> SpeakResult {
+    SpeakResult {
+        kind: kind.into(),
+        ticket,
+        lang: lang.into(),
+        backend: backend.into(),
+        url: String::new(),
+        error: Some(message),
+        reason: reason.map(|value| value.to_string()),
     }
 }
 
@@ -187,7 +502,7 @@ struct AppState {
     provider_config: Mutex<ProviderConfig>,
     settings: Mutex<settings::AppSettings>,
     settings_dir: Mutex<Option<PathBuf>>,
-    speech: Mutex<SpeechManager<GoogleTtsOnline, SapiSpeaker>>,
+    speech: SpeechService,
     update_latest: Mutex<Option<String>>,
     /// 翻译任务代次：只有最新一代可以推送 state，防止慢请求回来覆盖新内容。
     translation_epoch: AtomicU64,
@@ -212,13 +527,6 @@ struct ProviderView {
     base_url: String,
 }
 
-/// 朗读结果视图：file = 前端用 convertFileSrc 播放；played = SAPI 已自播。
-#[derive(Serialize, Clone)]
-struct SpeakView {
-    kind: String,
-    url: String,
-}
-
 /// 设置视图（全量回显——没有机密）。
 #[derive(Serialize, Clone)]
 struct SettingsView {
@@ -230,6 +538,12 @@ struct SettingsView {
     selection_hotkey: String,
     autostart_enabled: bool,
     auto_check_updates: bool,
+    /// 朗读语速倍率（0.5–2.0）。本地引擎直接生效，在线音频由前端倍速播放。
+    tts_rate: f64,
+    /// 朗读音量（0–100）。
+    tts_volume: u8,
+    /// 该语言没有本地音色时，是否允许把文本发往在线朗读服务。默认开启。
+    tts_online_fallback: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -240,7 +554,6 @@ struct StateView {
 
     provider: ProviderView,
     settings: SettingsView,
-    speak: Option<SpeakView>,
     update_latest: Option<String>,
 }
 
@@ -302,8 +615,10 @@ fn snapshot(state: &AppState) -> StateView {
             selection_hotkey: settings.selection_hotkey.clone(),
             autostart_enabled: settings.autostart_enabled,
             auto_check_updates: settings.auto_check_updates,
+            tts_rate: settings.tts_rate,
+            tts_volume: settings.tts_volume,
+            tts_online_fallback: settings.tts_online_fallback,
         },
-        speak: None,
         update_latest: state.update_latest.lock().expect("update poisoned").clone(),
     }
 }
@@ -334,60 +649,389 @@ fn open_release_page(app: tauri::AppHandle) {
     let _ = app;
 }
 
-/// 朗读一张卡：在线抓取→缓存→前端播放，失败自动降级 SAPI 自播，再失败出轻提示。
-///
-/// 在线 TTS 在不可达网络里要等超时、SAPI 是外部进程，两者都不能占着 IPC 线程：
-/// 放进 blocking 线程后命令立即让出运行时，前端在点下「朗读」后仍可继续操作。
+/// 朗读一张卡：本地有音色就本机发声；只有缺音色且允许在线兜底时才联网。
+/// 返回 `SpeakResult` 而不是整份 `StateView`——点朗读不得触发整板重渲染、不能打断编辑。
+/// 网络/进程工作都在 blocking 线程，命令本身不占 IPC。
 #[tauri::command]
-async fn speak_card(lang: String, app: tauri::AppHandle) -> StateView {
-    let language = Lang::new(&lang);
+async fn speak_card(lang: String, app: tauri::AppHandle) -> SpeakResult {
     let text = {
         let state = app.state::<AppState>();
         let coordinator = state.coordinator.lock().expect("coordinator poisoned");
         coordinator
             .document()
-            .slot(&language)
+            .slot(&Lang::new(&lang))
             .map(|slot| slot.text.clone())
             .unwrap_or_default()
     };
-    if text.trim().is_empty() {
+    run_speech(text, lang, app).await
+}
+
+/// 划词 / 小窗等上层入口统一走这里：与卡片朗读共用同一个 `SpeechService`、
+/// 音色匹配、抢占与在线缓存；**不得另建引擎、队列或语音缓存**（设计 §5.1）。
+#[tauri::command]
+async fn speak_text(text: String, lang: String, app: tauri::AppHandle) -> SpeakResult {
+    run_speech(text, lang, app).await
+}
+
+/// 朗读的实际执行路径。空文本在 `begin` 之前返回，避免无意义地抢占正在播放的卡片。
+async fn run_speech(text: String, lang: String, app: tauri::AppHandle) -> SpeakResult {
+    let language = Lang::new(&lang);
+    let (rate, volume, online_fallback) = {
         let state = app.state::<AppState>();
-return snapshot(state.inner());
+        let settings = state.settings.lock().expect("settings poisoned");
+        (
+            settings.tts_rate,
+            settings.tts_volume,
+            settings.tts_online_fallback,
+        )
+    };
+    if text.trim().is_empty() {
+        return speak_error_result(
+            0,
+            &lang,
+            "",
+            "empty",
+            "没有可朗读的文本".into(),
+            Some("empty"),
+        );
     }
 
+    let ticket = {
+        let state = app.state::<AppState>();
+        state.speech.begin(&app, &lang, &text)
+    };
+
+    // 枚举系统语音可能要几百毫秒；放进 blocking 线程，避免占住异步运行时。
     let handle = app.clone();
-    let outcome = tauri::async_runtime::spawn_blocking(move || {
-        let state = handle.state::<AppState>();
-        let outcome = state
-            .speech
-            .lock()
-            .expect("speech poisoned")
-            .request(&language, &text);
-        outcome
+    let voices_result = tauri::async_runtime::spawn_blocking(move || {
+        handle.state::<AppState>().speech.refresh_voices(false)
     })
     .await;
+    let voices = match voices_result {
+        Ok(Ok(voices)) => voices,
+        other => {
+            if !online_fallback {
+                let message = match other {
+                    Ok(Err(error)) => format!("无法读取系统语音：{error}"),
+                    Err(error) => format!("系统语音查询任务失败：{error}"),
+                    _ => "无法读取系统语音".into(),
+                };
+                let state = app.state::<AppState>();
+                state
+                    .speech
+                    .fail(&app, ticket, &lang, "none", message.clone());
+                return speak_error_result(
+                    ticket,
+                    &lang,
+                    "none",
+                    "error",
+                    message,
+                    Some("voice_query_failed"),
+                );
+            }
+            Vec::new()
+        }
+    };
 
-    let state = app.state::<AppState>();
-    let mut speak = None;
-    match outcome {
-        Ok(Ok(SpeechOutcome::PlayFile(path))) => {
-            speak = Some(SpeakView {
-                kind: "file".into(),
-                url: path.to_string_lossy().to_string(),
-            });
+    match choose_voice(&language, &voices) {
+        Some(voice) => {
+            let state = app.state::<AppState>();
+            state.speech.resolving(&app, ticket, &lang);
+            let sapi_rate = speech_local::rate_to_sapi(rate);
+            match speech_local::speak(&text, &voice, sapi_rate, volume) {
+                Ok(playback) => {
+                    let playback = Arc::new(Mutex::new(playback));
+                    let stored = {
+                        let mut active = state.speech.active.lock().expect("speech active poisoned");
+                        match active.as_mut().filter(|active| active.ticket == ticket) {
+                            Some(active) => {
+                                active.backend = "local".into();
+                                active.playback = Some(playback.clone());
+                                true
+                            }
+                            None => false,
+                        }
+                    };
+                    if !stored {
+                        playback.lock().expect("speech playback poisoned").stop();
+                        return speak_error_result(
+                            ticket,
+                            &lang,
+                            "local",
+                            "cancelled",
+                            String::new(),
+                            Some("superseded"),
+                        );
+                    }
+                    state.speech.playing(&app, ticket, &lang, "local");
+                    spawn_local_monitor(app.clone(), ticket, lang.clone());
+                    SpeakResult {
+                        kind: "local".into(),
+                        ticket,
+                        lang,
+                        backend: "local".into(),
+                        url: String::new(),
+                        error: None,
+                        reason: None,
+                    }
+                }
+                Err(error) => {
+                    state
+                        .speech
+                        .fail(&app, ticket, &lang, "local", error.clone());
+                    speak_error_result(
+                        ticket,
+                        &lang,
+                        "local",
+                        "error",
+                        format!("本机朗读失败：{error}"),
+                        Some("offline_failed"),
+                    )
+                }
+            }
         }
-        Ok(Ok(SpeechOutcome::Played)) => {
-            speak = Some(SpeakView {
-                kind: "played".into(),
-                url: String::new(),
-            });
+        None => {
+            if !online_fallback {
+                let state = app.state::<AppState>();
+                let message = format!(
+                    "未安装 {lang} 语音，且在线兜底已关闭；可在 Windows 设置 → 时间和语言 → 语音 添加"
+                );
+                state
+                    .speech
+                    .fail(&app, ticket, &lang, "none", message.clone());
+                return speak_error_result(
+                    ticket,
+                    &lang,
+                    "none",
+                    "unavailable",
+                    message,
+                    Some("no_voice"),
+                );
+            }
+
+            {
+                let state = app.state::<AppState>();
+                state.speech.resolving(&app, ticket, &lang);
+            }
+            let profile = SpeechProfile::online(speech_local::rate_to_sapi(rate));
+            let handle = app.clone();
+            let request_lang = lang.clone();
+            let request_text = text.clone();
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                let state = handle.state::<AppState>();
+                state
+                    .speech
+                    .manager
+                    .request(&Lang::new(&request_lang), &request_text, &profile)
+            })
+            .await;
+
+            let state = app.state::<AppState>();
+            match result {
+                Ok(Ok(path)) => {
+                    if !state.speech.is_current(ticket) {
+                        return speak_error_result(
+                            ticket,
+                            &lang,
+                            "google",
+                            "cancelled",
+                            String::new(),
+                            Some("superseded"),
+                        );
+                    }
+                    state.speech.playing(&app, ticket, &lang, "google");
+                    SpeakResult {
+                        kind: "file".into(),
+                        ticket,
+                        lang,
+                        backend: "google".into(),
+                        url: path.to_string_lossy().to_string(),
+                        error: None,
+                        reason: None,
+                    }
+                }
+                Ok(Err(error)) => {
+                    let message = speech_error_message(&error);
+                    state
+                        .speech
+                        .fail(&app, ticket, &lang, "google", message.clone());
+                    speak_error_result(
+                        ticket,
+                        &lang,
+                        "google",
+                        "error",
+                        message,
+                        Some("online_failed"),
+                    )
+                }
+                Err(error) => {
+                    let message = format!("在线朗读任务失败：{error}");
+                    state
+                        .speech
+                        .fail(&app, ticket, &lang, "google", message.clone());
+                    speak_error_result(
+                        ticket,
+                        &lang,
+                        "google",
+                        "error",
+                        message,
+                        Some("online_failed"),
+                    )
+                }
+            }
         }
-        _ => {
-}
     }
-    let mut view = snapshot(state.inner());
-    view.speak = speak;
-    view
+}
+
+fn speech_error_message(error: &SpeechError) -> String {
+    match error {
+        SpeechError::OnlineFailed(message) => format!("在线朗读失败：{message}"),
+        SpeechError::OfflineFailed(message) => format!("本机朗读失败：{message}"),
+    }
+}
+
+fn spawn_local_monitor(app: tauri::AppHandle, ticket: u64, lang: String) {
+    std::thread::spawn(move || loop {
+        let state = app.state::<AppState>();
+        if !state.speech.is_current(ticket) {
+            return;
+        }
+        let playback = {
+            let active = state.speech.active.lock().expect("speech active poisoned");
+            match active
+                .as_ref()
+                .filter(|active| active.ticket == ticket)
+                .and_then(|active| active.playback.clone())
+            {
+                Some(playback) => playback,
+                None => return,
+            }
+        };
+        match playback
+            .lock()
+            .expect("speech playback poisoned")
+            .finished()
+        {
+            Some(0) => {
+                state.speech.finish(&app, ticket);
+                return;
+            }
+            Some(code) => {
+                state.speech.fail(
+                    &app,
+                    ticket,
+                    &lang,
+                    "local",
+                    format!("本机朗读进程异常退出（代码 {code}）"),
+                );
+                return;
+            }
+            None => {}
+        }
+        std::thread::sleep(Duration::from_millis(120));
+    });
+}
+
+/// 各语言朗读能力（只读）。前端在挂载与设置变化后调用，据此 disable 按钮、标「在线」。
+#[tauri::command]
+async fn speech_capabilities(app: tauri::AppHandle) -> SpeechCapabilitiesView {
+    let (langs, rate, volume, online_fallback) = {
+        let state = app.state::<AppState>();
+        let coordinator = state.coordinator.lock().expect("coordinator poisoned");
+        let langs = coordinator
+            .pool()
+            .languages()
+            .iter()
+            .map(|language| language.code().to_string())
+            .collect::<Vec<_>>();
+        drop(coordinator);
+        let settings = state.settings.lock().expect("settings poisoned");
+        (
+            langs,
+            settings.tts_rate,
+            settings.tts_volume,
+            settings.tts_online_fallback,
+        )
+    };
+
+    let handle = app.clone();
+    let refresh = tauri::async_runtime::spawn_blocking(move || {
+        handle.state::<AppState>().speech.refresh_voices(false)
+    })
+    .await;
+    let (voices, voice_error) = {
+        let state = app.state::<AppState>();
+        let (voices, cached_error) = state.speech.voice_snapshot();
+        let error = match refresh {
+            Ok(Ok(_)) => cached_error,
+            Ok(Err(error)) => Some(error),
+            Err(error) => Some(format!("系统语音查询任务失败：{error}")),
+        };
+        (voices, error)
+    };
+
+    let languages = langs
+        .into_iter()
+        .map(|lang| {
+            let language = Lang::new(&lang);
+            if let Some(voice) = choose_voice(&language, &voices) {
+                SpeechCapabilityView {
+                    lang,
+                    enabled: true,
+                    backend: "local".into(),
+                    reason: Some(format!("本机音色：{}", voice.id)),
+                }
+            } else if online_fallback {
+                SpeechCapabilityView {
+                    lang,
+                    enabled: true,
+                    backend: "online".into(),
+                    reason: Some("未安装该语言语音，将使用在线朗读（文本会发送到在线服务）".into()),
+                }
+            } else {
+                SpeechCapabilityView {
+                    lang,
+                    enabled: false,
+                    backend: "none".into(),
+                    reason: Some(
+                        "未安装该语言语音；可在 Windows 设置 → 时间和语言 → 语音 添加".into(),
+                    ),
+                }
+            }
+        })
+        .collect();
+
+    SpeechCapabilitiesView {
+        online_fallback,
+        rate,
+        volume,
+        languages,
+        voice_error,
+    }
+}
+
+/// 前端在 `<audio>` 播完时回传 ticket；只有仍是最新请求才收掉「朗读中」状态。
+#[tauri::command]
+fn speech_finished(ticket: u64, app: tauri::AppHandle) {
+    app.state::<AppState>().speech.finish(&app, ticket);
+}
+
+/// 在线音频播放失败（`<audio>` 报错）。不得静默吞掉，由前端出轻提示。
+#[tauri::command]
+fn speech_failed(ticket: u64, lang: String, message: String, app: tauri::AppHandle) {
+    app.state::<AppState>()
+        .speech
+        .fail(&app, ticket, &lang, "file", message);
+}
+
+#[tauri::command]
+fn speech_state(app: tauri::AppHandle) -> SpeechView {
+    app.state::<AppState>().speech.status_view()
+}
+
+#[tauri::command]
+fn stop_speaking(reason: String, app: tauri::AppHandle) -> SpeechView {
+    app.state::<AppState>().speech.stop(&app, &reason)
 }
 
 /// 前端在「画面上已经没有任何内容」的那一帧调用，位置与尺寸用一次 SetWindowPos 提交。
@@ -991,6 +1635,10 @@ fn dispatch(
         .transition(event);
     consume(actions, app, state, force_refresh);
     let view = snapshot(state);
+    // 面板不可见（收起/ESC/点外部/锁定解除）时停止朗读；锁定与拖卡不会走到这里。
+    if view.view != "expanded" && view.view != "hover_pending" {
+        state.speech.stop(app, "panel_hidden");
+    }
     // 窗口伸缩由前端在「内容不可见」的帧里调用 resize_window 完成；
     // 这里只在确实还大着的时候排一次兜底，防止前端页面失联把大窗口留在桌面上。
     if view.view != "expanded" {
@@ -1102,7 +1750,8 @@ fn pin(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> StateView {
 /// 清空全部卡片：文本、槽位状态与权威源一并复位；同时推进翻译代次，
 /// 让仍在途的结果在 `apply` 里整包丢弃，不会把刚清空的卡又填回去。
 #[tauri::command]
-fn clear_document(state: tauri::State<'_, AppState>) -> StateView {
+fn clear_document(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> StateView {
+    state.speech.stop(&app, "document_cleared");
     state
         .coordinator
         .lock()
@@ -1138,6 +1787,11 @@ fn commit_edit(
     state: tauri::State<'_, AppState>,
 ) -> StateView {
     let plan = state
+    if let Some((active_lang, active_text)) = state.speech.active_lang_and_text() {
+        if active_lang == lang && active_text != text {
+            state.speech.stop(&app, "text_changed");
+        }
+    }
         .coordinator
         .lock()
         .expect("coordinator poisoned")
@@ -1232,6 +1886,9 @@ fn set_settings(
     hover_delay_ms: u64,
     selection_enabled: bool,
     auto_check_updates: bool,
+    tts_rate: Option<f64>,
+    tts_volume: Option<u8>,
+    tts_online_fallback: Option<bool>,
     state: tauri::State<'_, AppState>,
 ) -> StateView {
     let delay = hover_delay_ms.clamp(50, 2000);
@@ -1241,6 +1898,15 @@ fn set_settings(
         settings.hover_delay_ms = delay;
         settings.selection_enabled = selection_enabled;
         settings.auto_check_updates = auto_check_updates;
+        if let Some(rate) = tts_rate {
+            settings.tts_rate = rate.clamp(0.5, 2.0);
+        }
+        if let Some(volume) = tts_volume {
+            settings.tts_volume = volume.min(100);
+        }
+        if let Some(online) = tts_online_fallback {
+            settings.tts_online_fallback = online;
+        }
         let grace = settings.leave_grace_ms;
         *state.hover.lock().expect("hover state poisoned") =
             HoverStateMachine::new(delay, grace);
@@ -1369,6 +2035,11 @@ return snapshot(state.inner());
     if !existing.contains(&lang) {
         return snapshot(state.inner());
     }
+    if let Some((active_lang, _)) = state.speech.active_lang_and_text() {
+        if active_lang == lang {
+            state.speech.stop(&app, "card_removed");
+        }
+    }
     let langs: Vec<String> = existing.into_iter().filter(|l| l != &lang).collect();
     apply_language_pool(&langs, &app, state.inner());
     snapshot(state.inner())
@@ -1393,6 +2064,11 @@ fn change_card_lang(
         .collect();
     if !existing.contains(&from) || existing.contains(&to) {
         return snapshot(state.inner());
+    }
+    if let Some((active_lang, _)) = state.speech.active_lang_and_text() {
+        if active_lang == from {
+            state.speech.stop(&app, "language_changed");
+        }
     }
     let langs: Vec<String> = existing
         .into_iter()
@@ -1595,11 +2271,10 @@ fn main() {
             provider_config: Mutex::new(default_config),
             settings: Mutex::new(settings::AppSettings::default()),
             settings_dir: Mutex::new(None),
-            speech: Mutex::new(SpeechManager::new(
+            speech: SpeechService::new(SpeechManager::new(
                 GoogleTtsOnline {
                     transport: bead_providers::UreqByteTransport,
                 },
-                SapiSpeaker,
                 std::env::temp_dir().join("bead-tts"),
             )),
             update_latest: Mutex::new(None),
@@ -1628,6 +2303,12 @@ fn main() {
             test_provider,
             list_provider_models,
             speak_card,
+            speak_text,
+            stop_speaking,
+            speech_state,
+            speech_capabilities,
+            speech_finished,
+            speech_failed,
             start_drag,
             persist_position,
             add_card,
@@ -1658,6 +2339,12 @@ fn main() {
                 .set_position(LogicalPosition::new(default_x, 0.0))
                 .expect("position main window");
             window.show().expect("show main window");
+            // 预热系统语音列表：首次点朗读不必等 PowerShell 枚举；后续按 TTL 刷新。
+            let warm = app.handle().clone();
+            std::thread::spawn(move || {
+                let state = warm.state::<AppState>();
+                let _ = state.speech.refresh_voices(false);
+            });
             // 窗口首次显示后 Tauri/tao 会把边框样式写回去，所以显示后再剥一次，
             // 并用短延时线程补一次覆盖延迟发生的样式回写。
             // 真正让「外框 = 客户区」的是配置里的 shadow: false —— tao 只在
