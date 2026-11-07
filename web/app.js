@@ -6,9 +6,10 @@
 // 2) hover 判定绑在覆盖整个窗口的 #root 上，配合 Rust 侧的真实光标位置复核，
 //    窗口从胶囊长成整板时补发的假 leave 不会把面板收回去。
 // 3) 每个 IPC 响应带序号，只应用最后一次；后台翻译完成走 state 事件单独推视图。
-// 4) 计时只把 hover / grace 的 tick 与 500ms 编辑防抖送给 Rust，业务判断全在 Rust。
+// 4) 计时只把 hover / grace 的 tick 与 400ms 编辑防抖送给 Rust，业务判断全在 Rust。
 
 import { renderBoard } from './render.js';
+import { createEditDebouncer, planEditingRefresh } from './edit-sync.js';
 import { Card, LangAutocomplete } from './components/index.js';
 
 const root = document.getElementById('root');
@@ -22,14 +23,12 @@ const WebviewWindow = tauri?.window?.WebviewWindow;
 const DEFAULT_HOVER_DELAY_MS = 400;
 const DEFAULT_LEAVE_GRACE_MS = 800;
 const LEAVE_DEBOUNCE_MS = 200;
-// 输入停止 500ms 后自动提交翻译：比键盘节奏慢半拍，又明显快于“思考后失焦”，
+// 输入停止 400ms 后自动提交翻译：比键盘节奏慢半拍，又明显快于“思考后失焦”，
 // 同时避免每敲一个字就打一次翻译接口。失焦 / Enter 仍然立即提交，并取消这个计时。
-const EDIT_DEBOUNCE_MS = 500;
 const DRAG_GUARD_MS = 3000;
 
 let pendingTick = null;
 let pendingTickKind = null;
-const pendingEdits = new Map();
 let leaveTimer = null;
 let composing = false;
 // 点「清空」会先让正在编辑的卡片失焦；这个窗口内的 blur 不得把旧文本再提交回去。
@@ -43,6 +42,10 @@ let dragGuard = null;
 let currentAudio = null;
 // 每张卡最后一次进入 Rust 的文本：失焦/回车对未变更内容不重复发起同步。
 const lastCommitted = new Map();
+// 输入防抖只记语言，到期时再按语言找回当前输入框（见 edit-sync.js 的说明）。
+const editDebouncer = createEditDebouncer({
+  onCommit: (lang) => commitPendingEdit(lang),
+});
 
 // 没有 Tauri 注入时（浏览器打开本页面做视觉快照）渲染固定样例，复用同一套 renderBoard 与样式。
 const SNAPSHOT_VIEW = {
@@ -165,15 +168,37 @@ function clearEnterTimer() {
 }
 
 function renderContent(view, wasExpanded) {
-  // 编辑中的整板替换会夺走焦点：跳过，失焦后 get_state 会补回
-  const editing = document.activeElement?.matches?.('textarea.card__text') ?? false;
-  if (editing && wasExpanded) return;
+  // 编辑中不能整板替换（会夺走焦点），但「其余语言卡已经拿到新译文」必须立刻可见：
+  // 只刷新不含正在编辑输入框的卡；编辑中的卡文本归用户，整卡保留不动。
+  const focusedEditor = document.activeElement?.matches?.('textarea.card__text')
+    ? document.activeElement
+    : null;
+  if (focusedEditor && wasExpanded) {
+    refreshOtherCards(view, focusedEditor.dataset.lang);
+    return;
+  }
   const html = renderBoard({ ...view, languagesOpen });
   // html 没变就不碰 DOM
   if (html === lastBoardHtml) return;
   lastBoardHtml = html;
   boardHost.innerHTML = html;
   for (const card of view.cards ?? []) lastCommitted.set(card.lang, card.text);
+}
+
+// 编辑期局部刷新：其余卡整卡替换（焦点在编辑卡上，不会丢光标），
+// 正在编辑的卡保持原样，避免打断输入法组字与光标位置。
+function refreshOtherCards(view, editingLang) {
+  const plan = planEditingRefresh(view, editingLang);
+  if (!plan) return;
+  const elements = [...boardHost.querySelectorAll('.card')];
+  for (const { card, replaceElement } of plan.cards) {
+    if (!replaceElement) continue;
+    const el = elements.find((node) => node.dataset.lang === card.lang);
+    if (!el) continue;
+    el.outerHTML = Card({ card, canClose: plan.canClose, usedCodes: plan.usedCodes });
+    lastCommitted.set(card.lang, card.text);
+  }
+  lastBoardHtml = null; // 编辑结束后必须再对齐一次整板
 }
 
 // 卡片错峰：第 n 张 delay = min(n*30ms, 120ms)。只写内联延迟，
@@ -420,29 +445,18 @@ async function commitEdit(lang, textarea) {
   await send('commit_edit', { lang, text });
 }
 
-function cancelEdit(lang) {
-  const timer = pendingEdits.get(lang);
-  if (timer) {
-    window.clearTimeout(timer);
-    pendingEdits.delete(lang);
-  }
+// 输入停顿到期：按语言找回「当前」输入框再提交。排程时捕获的节点可能已被
+// 重渲染替换，contains 检查会让这次提交静默消失（表现就是停多久都不同步）。
+function commitPendingEdit(lang) {
+  const textarea = [...boardHost.querySelectorAll('textarea.card__text')].find(
+    (el) => el.dataset.lang === lang,
+  );
+  if (textarea) commitEdit(lang, textarea);
 }
 
 function cancelAllEdits() {
-  for (const timer of pendingEdits.values()) window.clearTimeout(timer);
-  pendingEdits.clear();
+  editDebouncer.cancelAll();
   lastCommitted.clear();
-}
-
-function scheduleEdit(lang, textarea) {
-  cancelEdit(lang); // 按卡片各自计时，快速切卡不会把上一张的输入吞掉
-  pendingEdits.set(
-    lang,
-    window.setTimeout(() => {
-      pendingEdits.delete(lang);
-      commitEdit(lang, textarea);
-    }, EDIT_DEBOUNCE_MS),
-  );
 }
 
 function targetOf(event) {
@@ -648,7 +662,7 @@ async function addCard() {
 
 root.addEventListener('input', (event) => {
   const el = targetOf(event);
-  if (el?.matches('textarea.card__text')) scheduleEdit(el.dataset.lang, el);
+  if (el?.matches('textarea.card__text')) editDebouncer.schedule(el.dataset.lang);
 });
 
 root.addEventListener('focusin', (event) => {
@@ -658,7 +672,7 @@ root.addEventListener('focusin', (event) => {
 root.addEventListener('focusout', (event) => {
   const el = targetOf(event);
   if (!el?.matches('textarea.card__text')) return;
-  cancelEdit(el.dataset.lang);
+  editDebouncer.cancel(el.dataset.lang);
   commitEdit(el.dataset.lang, el);
   send('edit_end');
   send('get_state'); // 补上编辑期间被跳过的重绘
@@ -676,7 +690,9 @@ root.addEventListener(
   (event) => {
     composing = false;
     const el = targetOf(event);
-    if (el?.matches('textarea.card__text')) scheduleEdit(el.dataset.lang, el);
+    // 组字期间到期的那次提交被 composing 挡下，这里必须补排一次，
+    // 否则用户选完词就停手时，文本永远等不到同步。
+    if (el?.matches('textarea.card__text')) editDebouncer.schedule(el.dataset.lang);
   },
   true,
 );
@@ -687,7 +703,7 @@ root.addEventListener('keydown', (event) => {
   if (!el?.matches('textarea.card__text')) return;
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
-    cancelEdit(el.dataset.lang);
+    editDebouncer.cancel(el.dataset.lang);
     commitEdit(el.dataset.lang, el);
     el.blur();
   }
