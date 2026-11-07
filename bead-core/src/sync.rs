@@ -346,7 +346,8 @@ impl<C: Clock> SyncCoordinator<C> {
     /// 空文本按空态处理，不发起请求；初始落卡走语言检测：
     /// - 命中池内语言 → 落到对应卡（该卡即权威源）；
     /// - 识别到语言但池里没有这张卡 → **不粘贴**（不回退到权威源或其他卡）；
-    /// - 完全识别不出（如西里尔字母/纯符号）→ 回落主语言卡，保持旧行为。
+    /// - 无法确定语言（短文本/品牌名/URL/代码/纯符号/混排）→ **同样不粘贴**，
+    ///   绝不能把非英语内容默认当成 en 或主语言卡翻出错误结果。
     pub fn accept_clipboard(&mut self, text: &str, force: bool) -> Option<SyncPlan> {
         match self.accept_clipboard_inner(text, force, None)? {
             CommitOutcome::Translate(plan) => Some(plan),
@@ -380,8 +381,8 @@ impl<C: Clock> SyncCoordinator<C> {
         }
         let source = match self.detector.detect(text) {
             Some(lang) if self.pool.contains(&lang) => lang,
-            Some(_) => return None,
-            None => self.pool.primary().clone(),
+            // 识别到池外语言、或根本无法确定语言：都不落卡、不翻译。
+            Some(_) | None => return None,
         };
         let plan = self.commit(&source, text).ok()?;
         Some(match engine {
@@ -565,7 +566,10 @@ mod tests {
     }
 
     fn coordinator(codes: &[&str]) -> SyncCoordinator<FakeClock> {
-        coordinator_with(Box::new(NullDetector), codes)
+        // 多数用例假设「剪贴板文本总是识别为主语言」，显式用 FixedDetector 表达，
+        // 不再依赖检测器返回 None 时的历史兜底行为。
+        let primary = Lang::new(codes[0]);
+        coordinator_with(Box::new(FixedDetector(Some(primary))), codes)
     }
 
     fn coordinator_with(
@@ -769,15 +773,14 @@ mod tests {
     }
 
     #[test]
-    fn undetected_content_falls_back_to_the_primary_card() {
-        // 纯符号/无法判别书写系统：仍回落主语言卡
-        let mut coordinator = coordinator_with(Box::new(FixedDetector(None)), &["zh", "en"]);
-        let plan = coordinator.accept_clipboard("1234", false).unwrap();
-        assert_eq!(plan.source_lang, Lang::new("zh"));
-        assert_eq!(
-            coordinator.document().slot(&Lang::new("zh")).unwrap().text,
-            "1234"
-        );
+    fn undetected_content_is_not_pasted_at_all() {
+        // 低置信度/纯符号：既不落主语言卡，也不翻译，卡片保持原样。
+        let mut coordinator = coordinator_with(Box::new(NullDetector), &["zh", "en"]);
+        assert!(coordinator.accept_clipboard("1234", false).is_none());
+        assert_eq!(coordinator.document().slot(&Lang::new("zh")).unwrap().text, "");
+        assert_eq!(coordinator.document().slot(&Lang::new("en")).unwrap().text, "");
+        assert_eq!(coordinator.document().authoritative(), None);
+        assert_eq!(coordinator.generation(), 0);
     }
 
     #[test]
