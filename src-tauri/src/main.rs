@@ -876,13 +876,24 @@ fn persist_position(
     let _ = app;
 }
 
+/// 锁内过期判定：进入线程时的 epoch 比对只是粗筛，旧批次可能正卡在链锁上排队；
+/// 拿到锁后再看一次最新代次，认输就直接放弃、不发网络。apply 层的 generation 校验不动。
+fn locked_work_is_stale(epoch: u64, latest: u64) -> bool {
+    epoch != latest
+}
+
 /// 翻译统一走链：回退/重试/熔断都在这里，调用方只看成功或「全部引擎失败」。
-fn run_chain(state: &AppState, plan: &SyncPlan) -> Result<bead_core::TranslationSet, bead_core::ProviderError> {
-    state
-        .chain
-        .lock()
-        .expect("provider chain poisoned")
-        .translate(plan)
+/// `None` 表示这一批在等锁期间已被更新的请求取代，本次不做任何网络调用。
+fn run_chain(
+    state: &AppState,
+    plan: &SyncPlan,
+    epoch: u64,
+) -> Option<Result<bead_core::TranslationSet, bead_core::ProviderError>> {
+    let mut chain = state.chain.lock().expect("provider chain poisoned");
+    if locked_work_is_stale(epoch, state.translation_epoch.load(Ordering::SeqCst)) {
+        return None;
+    }
+    Some(chain.translate(plan))
 }
 
 /// 翻译链放进后台线程：命令立即返回（卡片已由 coordinator 标成 syncing），
@@ -899,7 +910,11 @@ fn spawn_translation(app: &tauri::AppHandle, plan: SyncPlan) {
         if epoch != state.translation_epoch.load(Ordering::SeqCst) {
             return; // 排队期间已被更新的请求取代，别再发一次网络调用
         }
-        let result = run_chain(state.inner(), &plan);
+        let result = match run_chain(state.inner(), &plan, epoch) {
+            Some(result) => result,
+            // 等链锁期间被新请求取代：旧批次直接作废，不发网络、不写文档、不推 state。
+            None => return,
+        };
         let latest = state.translation_epoch.load(Ordering::SeqCst);
         {
             let mut coordinator = state.coordinator.lock().expect("coordinator poisoned");
@@ -2045,5 +2060,21 @@ mod geometry_tests {
         let span = union_span(&[area]).expect("single monitor");
         let clamped = clamp_capsule_left(5000.0, CAPSULE_WINDOW_WIDTH, span);
         assert!((clamped - (1706.6667 - CAPSULE_WINDOW_WIDTH)).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod chain_epoch_tests {
+    use super::*;
+
+    #[test]
+    fn a_batch_that_finds_a_newer_epoch_under_the_lock_gives_up_without_calling_the_network() {
+        assert!(locked_work_is_stale(2, 3));
+    }
+
+    #[test]
+    fn the_latest_batch_proceeds_even_if_it_waited_on_the_chain_lock() {
+        assert!(!locked_work_is_stale(3, 3));
+        assert!(!locked_work_is_stale(0, 0));
     }
 }
