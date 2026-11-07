@@ -1,0 +1,72 @@
+/* 选区图标窗口：24×24 逻辑像素，圆形按钮铺满整个窗口。
+   背景全透明；窗口边界就是可点击边界，不做超出窗口的阴影（会被裁掉）。 */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#anchor {
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 50%;
+  background: #2b3a55;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  outline: none;
+  transition: transform 90ms ease, background-color 120ms ease;
+}
+
+#anchor:hover {
+  background: #344e78;
+  transform: scale(1.06);
+}
+
+#anchor:active {
+  transform: scale(0.94);
+}
+
+#anchor:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+/* 点击到达 Rust 但没有待翻译文本（已过期/被状态拦下）时的短暂反馈。 */
+body[data-missed='1'] #anchor {
+  border-color: #ffb74d;
+  background: #5a4a2a;
+  transition: none;
+}
+
+#anchor svg {
+  width: 64%;
+  height: 64%;
+  fill: #ffffff;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #anchor {
+    transition: none;
+  }
+  #anchor:hover,
+  #anchor:active {
+    transform: none;
+  }
+}

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bead 选区翻译</title>
+  <link rel="stylesheet" href="./anchor.css" />
+</head>
+<body>
+  <!-- 独立小窗：只做一件事——点击后把 Rust 暂存的选区文本送进翻译链。
+       窗口本身是 NOACTIVATE + 置顶 + 无边框，点击不会抢走原应用焦点。 -->
+  <button id="anchor" type="button" aria-label="翻译选中的文本" title="翻译选中文本">
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M12.87 15.07l-2.54-2.51.03-.03A17.52 17.52 0 0 0 14.07 6H17V4h-7v2h1.89c-.33 1.22-1.09 2.35-2.16 3.24C8.16 6.88 6.28 5.72 5.6 5.72H3.75v2c1.04 0 2.7 1.28 4.57 2.41-1.54 1.2-3.35 2.2-4.52 2.7l.76 1.8c1.3-.56 3.33-1.63 5.02-3.06l2.12 2.1 1.17-1.2zM18.5 10.73h-2l-4.45 10h2l.92-2.25h4.6l.92 2.25h2l-4.5-10zm-2.62 5.98l1.62-4.42 1.62 4.42h-3.24z" />
+    </svg>
+  </button>
+  <script>
+    const invoke = window.__TAURI__?.core?.invoke;
+    const button = document.getElementById('anchor');
+    // 图标窗是复用的同一个 WebView（只 hide/show，不重新加载页面），
+    // 因此 disabled 不能只在点击时置位、成功路径却不复位，否则第一次点击成功后
+    // 后续每次图标出现都会是一个 disabled 按钮：看得见、点不动。
+    let inFlight = false;
+    let missTimer = 0;
+
+    function resetButton() {
+      inFlight = false;
+      button.disabled = false;
+    }
+
+    function flashMissed() {
+      document.body.dataset.missed = '1';
+      window.clearTimeout(missTimer);
+      missTimer = window.setTimeout(() => {
+        delete document.body.dataset.missed;
+      }, 420);
+    }
+
+    // 兜底复位：窗口每次重新显示时，无论上一轮走到哪一步，都从干净状态开始。
+    window.addEventListener('pageshow', () => {
+      delete document.body.dataset.missed;
+      resetButton();
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        // 上一轮点击失败留下的琥珀色描边不能带到下一次图标出现。
+        delete document.body.dataset.missed;
+        resetButton();
+      }
+    });
+
+    button.addEventListener('click', async () => {
+      if (inFlight) return;
+      inFlight = true;
+      button.disabled = true;
+      try {
+        if (!invoke) {
+          console.warn('[bead] anchor: Tauri 桥不可用（window.__TAURI__ 缺失）');
+          return;
+        }
+        const view = await invoke('anchor_click');
+        if (view === null || view === undefined) {
+          // 待确认文本已过期、或点击被面板状态拦下：给出可见反馈，不留「点了没反应」。
+          console.warn('[bead] anchor_click: no pending selection');
+          flashMissed();
+        }
+      } catch (error) {
+        console.warn('[bead] anchor_click', error);
+        flashMissed();
+      } finally {
+        // 成功路径也必须复位：页面不会重新加载，下一次显示要能再次点击。
+        resetButton();
+      }
+    });
+  </script>
+</body>
+</html>

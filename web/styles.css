@@ -182,7 +182,9 @@ html, body {
   #board-host .board,
   #board-host .card,
   #board-host .card.is-entering,
-  #board-host .card.is-removing {
+  #board-host .card.is-removing,
+  .icon-btn--history,
+  .history__item {
     transition-duration: 0.01ms;
     animation-duration: 0.01ms;
   }
@@ -247,6 +249,35 @@ html, body {
 .icon-btn:active { transform: scale(0.93); }
 .icon-btn__svg { display: block; }
 .icon-btn[disabled] { opacity: 0.35; cursor: not-allowed; }
+
+/* 翻译历史入口：与锁定 / 划词开关共用状态语言——关闭 = 中性描边；
+   打开 = 实底强调（底色是第一通道，时钟图标形状是第二通道）。 */
+.icon-btn--history {
+  border: 1px solid transparent;
+  background: transparent;
+  color: #5a6778;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease,
+              transform 0.15s ease;
+}
+.icon-btn--history:hover {
+  background: #eef1f6;
+  border-color: #dbe3ef;
+  color: var(--bead-primary);
+}
+.icon-btn--history[aria-pressed='true'] {
+  background: var(--bead-primary);
+  border-color: var(--bead-primary);
+  color: #ffffff;
+}
+.icon-btn--history[aria-pressed='true']:hover {
+  background: var(--bead-primary-soft);
+  border-color: var(--bead-primary-soft);
+  color: #ffffff;
+}
+.icon-btn--history:focus-visible {
+  outline: 2px solid var(--bead-primary-soft);
+  outline-offset: 2px;
+}
 
 
 /* 朗读中 / 在线兜底：在线角标必须可见，不能只靠 title 暗示。 */
@@ -409,6 +440,61 @@ html, body {
   font-size: 12px;
   cursor: pointer;
 }
+
+/* ========== 翻译历史 ==========
+   与设置面板同层的内联面板：占满剩余高度、内部滚动，不浮在卡片编辑区上方。 */
+.board__history {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 5px 8px;
+  background: #f4f7fc;
+  border: 1px solid var(--bead-border);
+  border-radius: 7px;
+  font-size: 12px;
+  color: #334155;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.history__head { display: flex; align-items: center; gap: 8px; }
+.history__title { font-weight: 600; margin-right: auto; }
+.board__history button {
+  border: 1px solid #d7dfeb;
+  background: #f6f8fb;
+  color: #334155;
+  border-radius: 6px;
+  padding: 3px 9px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.history__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.history__item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  text-align: left;
+  padding: 4px 7px;
+  border-radius: 6px;
+  border: 1px solid #d7dfeb;
+  background: #ffffff;
+  color: #1f2937;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.history__item:hover { background: #eef4ff; border-color: var(--bead-primary-soft); }
+.history__item:focus-visible { outline: 2px solid var(--bead-primary-soft); outline-offset: 1px; }
+.history__text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.history__meta { color: #64748b; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.history__empty { margin: 0; color: #64748b; }
 
 /* ========== 卡片区 ========== */
 /* 卡片宽度固定 189px + 间距 10px：面板宽度随卡片数增长（Rust board_width 同步计算），

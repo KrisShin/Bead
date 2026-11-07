@@ -17,14 +17,22 @@ const LANG_NAMES = {
   vi: 'Tiếng Việt', id: 'Bahasa', nl: 'Nederlands', tr: 'Türkçe',
 };
 
+/** 语言代码 → 显示名；未知代码回退原代码。 */
+export function langName(code) {
+  return LANG_NAMES[code] || code;
+}
+
 /** 胶囊组件 */
 export function Capsule() {
   return `<div id="capsule" role="button" aria-label="展开 Bead" title="悬停展开 · 按住可拖动位置"><span>译</span></div>`;
 }
 
-/** 面板头按钮（带图标） */
-export function HeadButton({ action, iconName, label, title }) {
-  return `<button type="button" class="icon-btn" data-action="${action}"${title ? ` title="${title}"` : ''} data-tooltip="${escapeHtml(label)}">
+/** 面板头按钮（带图标）。pressed 传入时按开关型按钮输出 aria-pressed。 */
+export function HeadButton({ action, iconName, label, title, pressed, ariaLabel, className }) {
+  const classes = className ? `icon-btn ${className}` : 'icon-btn';
+  const pressedAttr = pressed === undefined ? '' : ` aria-pressed="${pressed ? 'true' : 'false'}"`;
+  const ariaAttr = ariaLabel ? ` aria-label="${escapeHtml(ariaLabel)}"` : '';
+  return `<button type="button" class="${classes}" data-action="${action}"${title ? ` title="${title}"` : ''}${ariaAttr}${pressedAttr} data-tooltip="${escapeHtml(label)}">
     ${icon(iconName, { size: 16, className: 'icon-btn__svg' })}
   </button>`;
 }

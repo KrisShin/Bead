@@ -44,6 +44,9 @@ let suppressCommit = false;
 let lastBoardHtml = null;
 let lastView = null;
 let languagesOpen = false;
+// 历史列表是设置面板同级的内联面板：打开时卡片区隐藏，不浮在卡片编辑区上。
+let historyOpen = false;
+let historyItems = [];
 let sendSeq = 0;
 let dragging = false;
 let dragGuard = null;
@@ -98,6 +101,39 @@ async function sendSilent(intent, payload = {}) {
     console.warn('[bead]', intent, error);
     return null;
   }
+}
+
+// --- 翻译历史入口 ---
+// 列表只拿片段与元信息；点条目由 Rust 回填译文，前端不保存完整历史。
+
+function redrawFromLastView() {
+  if (!lastView) return;
+  lastBoardHtml = null;
+  draw(lastView);
+}
+
+function closeHistory() {
+  if (!historyOpen) return;
+  historyOpen = false;
+  redrawFromLastView();
+  // 关闭后把焦点还给头部的时钟按钮，键盘用户不会掉到 body 上。
+  boardHost.querySelector('[data-action="history"]')?.focus();
+}
+
+async function toggleHistory() {
+  if (historyOpen) {
+    closeHistory();
+    return;
+  }
+  const items = await sendSilent('list_history');
+  if (historyOpen) return; // 等待期间已被别的操作打开/关闭
+  historyItems = Array.isArray(items) ? items : [];
+  historyOpen = true;
+  languagesOpen = false; // 两个内联面板互斥，避免同时占位
+  redrawFromLastView();
+  requestAnimationFrame(() => {
+    boardHost.querySelector('[data-action="apply-history"]')?.focus();
+  });
 }
 
 function scheduleTick(view) {
@@ -206,7 +242,7 @@ function renderContent(view, wasExpanded) {
     applySpeechUi();
     return;
   }
-  const html = renderBoard({ ...view, languagesOpen });
+  const html = renderBoard({ ...view, languagesOpen, historyOpen, historyItems });
   // html 没变就不碰 DOM
   if (html === lastBoardHtml) {
     applySpeechUi();
@@ -893,14 +929,20 @@ async function saveProvider() {
   });
 }
 
-function saveSettings() {
-  const checked = (name) =>
-    boardHost.querySelector(`[data-setting="${name}"]`)?.checked ?? false;
-  send('set_settings', {
+async function saveSettings() {
+  const checked = (name, fallback = false) =>
+    boardHost.querySelector(`[data-setting="${name}"]`)?.checked ?? fallback;
+  const value = (name) =>
+    Number(boardHost.querySelector(`[data-setting="${name}"]`)?.value);
+  const view = await send('set_settings', {
     auto_read_clipboard: checked('auto_read_clipboard'),
     hover_delay_ms:
       Number(boardHost.querySelector('[data-setting="hover_delay_ms"]')?.value) || 200,
     selection_enabled: checked('selection_enabled'),
+    selection_anchor_enabled: checked('selection_anchor_enabled'),
+    selection_keyboard_fallback: checked('selection_keyboard_fallback'),
+    selection_hotkey:
+      boardHost.querySelector('[data-setting="selection_hotkey"]')?.value ?? '',
     auto_check_updates: checked('auto_check_updates'),
     tts_rate: value('tts_rate') || 1,
     tts_volume: Number.isFinite(value('tts_volume')) ? value('tts_volume') : 80,
@@ -927,11 +969,28 @@ root.addEventListener('click', (event) => {
       send('retry_failed');
       break;
     case 'languages':
+      historyOpen = false;
       languagesOpen = !languagesOpen;
       if (lastView) {
         lastBoardHtml = null;
         draw(lastView);
       }
+      break;
+    case 'history':
+      toggleHistory();
+      break;
+    case 'apply-history': {
+      const id = Number(button.dataset.id);
+      // 先关列表再发请求：条目点击即回填并关闭，不等翻译往返。
+      historyOpen = false;
+      historyItems = [];
+      redrawFromLastView();
+      if (Number.isFinite(id)) send('apply_history', { id });
+      break;
+    }
+    case 'clear-history':
+      historyItems = [];
+      send('clear_history');
       break;
     case 'pin':
       send('pin');
@@ -1296,6 +1355,30 @@ root.addEventListener(
 
 root.addEventListener('keydown', (event) => {
   if (event.isComposing || composing) return; // 组词中的 Enter/Esc 属于选词
+  if (historyOpen) {
+    if (event.key === 'Escape') {
+      // 截住 Esc：否则 document 层会把它当成「收起面板」。
+      event.preventDefault();
+      event.stopPropagation();
+      closeHistory();
+      return;
+    }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      const items = [...boardHost.querySelectorAll('[data-action="apply-history"]')];
+      if (!items.length) return;
+      event.preventDefault();
+      const current = items.indexOf(document.activeElement);
+      const step = event.key === 'ArrowDown' ? 1 : -1;
+      const next =
+        current < 0
+          ? step > 0
+            ? 0
+            : items.length - 1
+          : Math.max(0, Math.min(items.length - 1, current + step));
+      items[next]?.focus();
+      return;
+    }
+  }
   const el = targetOf(event);
   if (!el?.matches('textarea.card__text')) return;
   if (event.key === 'Enter' && !event.shiftKey) {
@@ -1378,6 +1461,10 @@ window.addEventListener('mouseup', () => {
 
 document.addEventListener('keydown', (event) => {
   if (event.isComposing || composing) return;
+  if (event.key === 'Escape' && historyOpen) {
+    closeHistory();
+    return;
+  }
   if (event.key === 'Escape') send('esc');
 });
 document.addEventListener('mousedown', (event) => {

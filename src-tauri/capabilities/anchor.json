@@ -1,0 +1,6 @@
+{
+  "identifier": "bead-anchor",
+  "description": "Allow the selection anchor icon window to invoke anchor_click only; no clipboard permissions.",
+  "windows": ["anchor"],
+  "permissions": ["core:default"]
+}

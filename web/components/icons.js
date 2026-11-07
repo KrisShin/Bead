@@ -15,6 +15,12 @@ export const ICONS = {
     <path d="M8 8.1V14" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
   </svg>`,
 
+  // 翻译历史（时钟）：与其它图标同一套 16×16 描边、currentColor。
+  history: `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="8" cy="8" r="5.6" stroke="currentColor" stroke-width="1.2"/>
+    <path d="M8 4.4V8l2.5 1.7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`,
+
   // 清空（垃圾桶）
   clear: `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M2.5 4h11M6 4V2.5h4V4M4 4l.6 9.2A1 1 0 0 0 5.6 14h4.8a1 1 0 0 0 1-.8L12 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>

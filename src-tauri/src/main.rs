@@ -8,17 +8,35 @@
 //! key 只存在 AppState 内存与用户配置目录里，不写日志、不明文回显。
 //! 设置（自动读剪贴板、悬停延迟、引擎、语言池）持久化到系统配置目录（工单 05）。
 
+mod history;
 mod settings;
+#[cfg(windows)]
+mod speech_local;
+#[cfg(not(windows))]
+mod speech_local;
+// 选区锚点图标三件套目前只在 Windows 实现（UIA 与 Raw Input 均是 Win32 能力）。
+// macOS 走辅助功能 API、Linux 走 PRIMARY 选区，属于后续平台适配，不在本阶段伪造桩。
+#[cfg(windows)]
+mod selection_anchor;
+#[cfg(windows)]
+mod selection_clipboard;
+#[cfg(windows)]
+mod selection_watch;
+#[cfg(windows)]
+mod uia;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bead_core::{
-    check_for_update, ChainConfig, Clock, HeuristicDetector, HoverAction, HoverEvent, HoverState,
-    HoverStateMachine, Lang, LanguagePool, OfflineSpeaker, OnlineTts, ProviderChain, SensitiveFilter, SensitiveVerdict, SlotStatus, SpeechError, SpeechManager,
-    SpeechOutcome, SyncCoordinator, SyncPlan, UpdateStatus,
+    check_for_update, choose_voice, complete_translations, ApplyOutcome, ChainConfig, Clock,
+    CommitOutcome, HeuristicDetector, HoverAction, HoverEvent, HoverState, HoverStateMachine, Lang,
+    LanguagePool, OnlineTts, ProviderChain, SensitiveFilter, SensitiveVerdict, SlotStatus,
+    SpeechError, SpeechManager, SpeechProfile, SyncCoordinator, SyncPlan, UpdateStatus, VoiceInfo,
 };
 use bead_providers::{build_translator, list_models, Engine, GitHubReleaseFetcher, ProviderConfig, UreqTransport};
 use serde::Serialize;
@@ -44,15 +62,23 @@ mod win {
 
     extern "system" {
         pub fn RegisterHotKey(hwnd: isize, id: u32, modifiers: u32, vk: u32) -> i32;
+        pub fn UnregisterHotKey(hwnd: isize, id: u32) -> i32;
         pub fn GetMessageW(msg: *mut Msg, hwnd: isize, min: u32, max: u32) -> i32;
+        pub fn PostThreadMessageW(id_thread: u32, msg: u32, wparam: usize, lparam: isize) -> i32;
+        pub fn GetCurrentThreadId() -> u32;
+        pub fn GetLastError() -> u32;
         pub fn keybd_event(vk: u8, scan: u8, flags: u32, extra: usize);
     }
 
     pub const WM_HOTKEY: u32 = 0x0312;
-    pub const MOD_CONTROL: u32 = 0x0002;
+    pub const WM_QUIT: u32 = 0x0012;
     pub const MOD_ALT: u32 = 0x0001;
-    pub const VK_B: u8 = 0x42;
+    pub const MOD_CONTROL: u32 = 0x0002;
+    pub const MOD_SHIFT: u32 = 0x0004;
+    pub const MOD_WIN: u32 = 0x0008;
     pub const KEYEVENTF_KEYUP: u32 = 0x0002;
+    /// RegisterHotKey 返回失败且 GetLastError 为该值时表示快捷键已被其他程序占用。
+    pub const ERROR_HOTKEY_ALREADY_REGISTERED: u32 = 1409;
 }
 
 /// 模拟 Ctrl+C 让前台程序把选中文本复制进剪贴板。
@@ -67,32 +93,153 @@ fn simulate_copy() {
     }
 }
 
+/// 划词热键句柄：改键/退出时先反注册再结束线程，保证旧键不会占住新键。
 #[cfg(windows)]
-fn spawn_hotkey_thread(app: tauri::AppHandle) {
-    std::thread::spawn(move || unsafe {
-        // 快捷键目前固定 Ctrl+Alt+B（settings.selection_hotkey 为可配置位，改键重启生效并如实标注）。
-        if win::RegisterHotKey(0, 1, win::MOD_CONTROL | win::MOD_ALT, win::VK_B as u32) == 0 {
-            let _state = app.state::<AppState>();
+struct HotkeyHandle {
+    thread_id: u32,
+    join: Option<std::thread::JoinHandle<()>>,
 }
-        let mut msg = win::Msg {
-            hwnd: 0,
-            message: 0,
-            wparam: 0,
-            lparam: 0,
-            time: 0,
-            pt_x: 0,
-            pt_y: 0,
+
+#[cfg(windows)]
+impl HotkeyHandle {
+    fn stop(&mut self) {
+        let Some(join) = self.join.take() else {
+            return;
         };
-        while win::GetMessageW(&mut msg, 0, 0, 0) > 0 {
-            if msg.message == win::WM_HOTKEY && msg.wparam == 1 {
-                let state = app.state::<AppState>();
-                if !state.settings.lock().expect("settings poisoned").selection_enabled {
-                    continue;
-                }
-                capture_and_translate(&app);
-            }
+        unsafe {
+            let _ = win::PostThreadMessageW(self.thread_id, win::WM_QUIT, 0, 0);
         }
-    });
+        let _ = join.join();
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HotkeyHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(windows)]
+const HOTKEY_ID: u32 = 1;
+
+#[cfg(windows)]
+fn hotkey_vk(key: bead_core::HotkeyKey) -> u32 {
+    use bead_core::HotkeyKey;
+    match key {
+        HotkeyKey::Letter(ch) => 0x41 + (ch as u32 - 'A' as u32),
+        HotkeyKey::Digit(digit) => 0x30 + digit as u32,
+        HotkeyKey::Function(index) => 0x70 + (index as u32 - 1),
+    }
+}
+
+#[cfg(windows)]
+fn hotkey_modifiers(hotkey: &bead_core::Hotkey) -> u32 {
+    let mut modifiers = 0;
+    if hotkey.ctrl {
+        modifiers |= win::MOD_CONTROL;
+    }
+    if hotkey.alt {
+        modifiers |= win::MOD_ALT;
+    }
+    if hotkey.shift {
+        modifiers |= win::MOD_SHIFT;
+    }
+    if hotkey.win {
+        modifiers |= win::MOD_WIN;
+    }
+    modifiers
+}
+
+/// 启动热键线程。注册失败时线程立即退出并回报原因，由设置页明确提示，不静默。
+#[cfg(windows)]
+fn start_hotkey(app: tauri::AppHandle, hotkey: bead_core::Hotkey) -> Result<HotkeyHandle, String> {
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
+    let join = std::thread::Builder::new()
+        .name("bead-hotkey".into())
+        .spawn(move || unsafe {
+            let thread_id = win::GetCurrentThreadId();
+            let modifiers = hotkey_modifiers(&hotkey);
+            let vk = hotkey_vk(hotkey.key);
+            if win::RegisterHotKey(0, HOTKEY_ID, modifiers, vk) == 0 {
+                let code = win::GetLastError();
+                let message = if code == win::ERROR_HOTKEY_ALREADY_REGISTERED {
+                    format!("快捷键被其他程序占用（错误 {code}），请改键或改用划词图标")
+                } else {
+                    format!("快捷键注册失败（错误 {code}），请改键或改用划词图标")
+                };
+                let _ = ready_tx.send(Err(message));
+                return;
+            }
+            let _ = ready_tx.send(Ok(thread_id));
+            let mut msg = win::Msg {
+                hwnd: 0,
+                message: 0,
+                wparam: 0,
+                lparam: 0,
+                time: 0,
+                pt_x: 0,
+                pt_y: 0,
+            };
+            while win::GetMessageW(&mut msg, 0, 0, 0) > 0 {
+                if msg.message == win::WM_HOTKEY && msg.wparam == HOTKEY_ID as usize {
+                    let state = app.state::<AppState>();
+                    if !state.settings.lock().expect("settings poisoned").selection_enabled {
+                        continue;
+                    }
+                    // 显式热键优先：选区图标先收起，且按热键路径的剪贴板取词走。
+                    dismiss_anchor(&app);
+                    capture_and_translate(&app);
+                }
+            }
+            win::UnregisterHotKey(0, HOTKEY_ID);
+        });
+    let join = match join {
+        Ok(join) => join,
+        Err(error) => return Err(format!("快捷键线程启动失败：{error}")),
+    };
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(Ok(thread_id)) => Ok(HotkeyHandle {
+            thread_id,
+            join: Some(join),
+        }),
+        Ok(Err(message)) => {
+            let _ = join.join();
+            Err(message)
+        }
+        Err(_) => Err("快捷键注册超时，请改键或改用划词图标".into()),
+    }
+}
+
+/// 应用热键文本：先停旧线程（反注册旧键），再解析并注册新键。
+///
+/// 解析失败时保留当前可用热键，只把错误写进状态供设置页提示；
+/// 注册失败（例如 1409 已被占用）同样如实上报，绝不静默。
+#[cfg(windows)]
+fn apply_hotkey(app: &tauri::AppHandle, spec: &str) -> Option<String> {
+    let state = app.state::<AppState>();
+    let parsed = match bead_core::parse_hotkey(spec) {
+        Ok(hotkey) => hotkey,
+        Err(error) => {
+            let message = format!("快捷键「{spec}」无效：{error}");
+            *state.hotkey_error.lock().expect("hotkey error poisoned") = Some(message.clone());
+            return Some(message);
+        }
+    };
+    if let Some(mut previous) = state.hotkey.lock().expect("hotkey poisoned").take() {
+        previous.stop();
+    }
+    match start_hotkey(app.clone(), parsed) {
+        Ok(handle) => {
+            *state.hotkey.lock().expect("hotkey poisoned") = Some(handle);
+            *state.hotkey_error.lock().expect("hotkey error poisoned") = None;
+            None
+        }
+        Err(message) => {
+            *state.hotkey_error.lock().expect("hotkey error poisoned") = Some(message.clone());
+            Some(message)
+        }
+    }
 }
 
 /// 取选中文本并送入：保存剪贴板 → 模拟 Ctrl+C → 读 → 恢复 → 过滤 → 翻译。
@@ -128,16 +275,204 @@ return;
         .lock()
         .expect("hover state poisoned")
         .transition(HoverEvent::SelectionCaptured);
+    let engine = engine_fingerprint(
+        &state.provider_config.lock().expect("provider config poisoned"),
+    );
+    let outcome = {
+        let mut coordinator = state.coordinator.lock().expect("coordinator poisoned");
+        coordinator.accept_clipboard_with_cache(&text, false, &engine)
+    };
+    match outcome {
+        Some(CommitOutcome::Translate(plan)) => {
+            resolve_translation_with_history(app, state.inner(), plan, engine)
+        }
+        Some(CommitOutcome::Cached { .. }) => {
+            state.translation_epoch.fetch_add(1, Ordering::SeqCst);
+            touch_history_for_current(state.inner(), &engine);
+        }
+        None => {}
+    }
     // 窗口伸缩由前端驱动：先把 expanded 快照推过去，前端在内容全透明的那一帧再自己 resize。
     // 这里若抢先 resize，WebView 上一帧的白底面板会被留在胶囊大小的窗口里。
+    // 快照在提交之后取：缓存命中的译文已经写回，不会先推一份「同步中」的旧状态。
     let view = snapshot(state.inner());
     let _ = app.emit("state", view);
-    let plan = {
-        let mut coordinator = state.coordinator.lock().expect("coordinator poisoned");
-        coordinator.accept_clipboard(&text, false)
+}
+
+/// 选区图标开关当前值：Raw Input 线程松手时用它复核，避免关闭后还有在途事件弹图标。
+fn anchor_enabled(app: &tauri::AppHandle) -> bool {
+    app.state::<AppState>()
+        .settings
+        .lock()
+        .expect("settings poisoned")
+        .selection_anchor_enabled
+}
+
+/// 自动划词连续失败时写一条降级提示，展示在设置页热键输入框下方。
+///
+/// 只写提示文本（含当前热键），不写任何选区内容；不主动 emit，避免打断用户正在编辑的设置表单。
+#[cfg(windows)]
+fn publish_selection_unsupported_hint(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let (hotkey, hotkey_enabled) = {
+        let settings = state.settings.lock().expect("settings poisoned");
+        (
+            settings.selection_hotkey.clone(),
+            settings.selection_enabled,
+        )
     };
-    if let Some(plan) = plan {
-        spawn_translation(app, plan);
+    let Some(mut hint) = state.selection_unsupported_hint.lock().ok() else {
+        return;
+    };
+    // 热键注册与「划词（快捷键触发取词）」开关是两件事：开关没开时热键按了也不会取词。
+    let text = if hotkey_enabled {
+        format!("当前应用不支持自动读取选区，翻译图标无法出现。选中文本后按 {hotkey} 即可翻译。")
+    } else {
+        format!(
+            "当前应用不支持自动读取选区，翻译图标无法出现。勾选「划词（快捷键触发取词）」后，选中文本按 {hotkey} 即可翻译。"
+        )
+    };
+    if hint.as_deref() != Some(text.as_str()) {
+        *hint = Some(text);
+    }
+}
+
+#[cfg(windows)]
+fn clear_selection_unsupported_hint(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let _ = state
+        .selection_unsupported_hint
+        .lock()
+        .map(|mut hint| hint.take());
+}
+
+fn selection_unsupported_hint(state: &AppState) -> Option<String> {
+    #[cfg(windows)]
+    {
+        return state
+            .selection_unsupported_hint
+            .lock()
+            .ok()
+            .and_then(|hint| hint.clone());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        None
+    }
+}
+
+/// 收起图标并丢弃待确认文本。图标超时、切换开关、热键取词、悬停展开都走这里。
+///
+/// `anchor_epoch` 递增让正在 sleep 的超时线程作废：否则旧定时器会把新图标提前隐藏。
+fn dismiss_anchor(app: &tauri::AppHandle) {
+    #[cfg(windows)]
+    selection_anchor::hide(app);
+    let state = app.state::<AppState>();
+    state.anchor_epoch.fetch_add(1, Ordering::SeqCst);
+    if let Ok(mut pending) = state.pending_selection.lock() {
+        pending.take();
+    };
+}
+
+/// 松手后 UIA 确认了选区：把文本暂存并显示图标，2.5s 后自动隐藏。
+///
+/// UIA 路径不写剪贴板；应用不支持 TextPattern 时快照可能来自剪贴板兜底，
+/// 那条路径在到达这里之前已经尽力恢复原剪贴板。图标窗口本身不激活任何窗口。
+#[cfg(windows)]
+fn show_selection_anchor(
+    app: &tauri::AppHandle,
+    snapshot: &uia::SelectionSnapshot,
+    release: bead_core::selection::Point,
+) {
+    let state = app.state::<AppState>();
+    let diag = state.selection_diag.clone();
+    let (class, pid) = unsafe { selection_watch::foreground_identity() };
+    if !state.anchor_ready.load(Ordering::SeqCst) {
+        diag.anchor_failed.fetch_add(1, Ordering::Relaxed);
+        diag.note("anchor", "not_ready", &class, pid);
+        return;
+    }
+    // 锁定/编辑态下图标会遮住正在编辑的卡片，且覆盖当前内容违反交互基线。
+    let busy_reason = match state.hover.lock().expect("hover state poisoned").state() {
+        HoverState::Expanded { locked: true, .. } => Some("panel_locked"),
+        HoverState::Expanded { editing: true, .. } => Some("card_editing"),
+        _ => None,
+    };
+    if let Some(reason) = busy_reason {
+        diag.anchor_failed.fetch_add(1, Ordering::Relaxed);
+        diag.note("anchor", reason, &class, pid);
+        return;
+    }
+    if let Err(failure) = selection_anchor::show_selection(app, snapshot, release) {
+        diag.anchor_failed.fetch_add(1, Ordering::Relaxed);
+        diag.note("anchor", failure.code(), &class, pid);
+        return;
+    }
+    diag.anchor_shown.fetch_add(1, Ordering::Relaxed);
+    *state
+        .pending_selection
+        .lock()
+        .expect("pending selection poisoned") = Some(snapshot.text.clone());
+    let epoch = state.anchor_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(
+            bead_core::selection::ANCHOR_VISIBLE_MS,
+        ));
+        let state = handle.state::<AppState>();
+        if state.anchor_epoch.load(Ordering::SeqCst) == epoch {
+            #[cfg(windows)]
+            selection_anchor::hide(&handle);
+            if let Ok(mut pending) = state.pending_selection.lock() {
+                pending.take();
+            };
+        }
+    });
+}
+
+/// 按开关启停 Raw Input 监听。关闭时停线程并反注册设备，此后不注册任何全局监听。
+///
+/// 监听线程启动失败或图标窗口建不出来时，把内存里的开关与能力位一起落回不可用，
+/// 让设置页如实置灰（规范：能力探测失败不得静默 no-op）。
+fn apply_anchor_watcher(app: &tauri::AppHandle, enabled: bool) {
+    #[cfg(windows)]
+    {
+        let state = app.state::<AppState>();
+        let mut watcher = state
+            .selection_watch
+            .lock()
+            .expect("selection watcher poisoned");
+        if !enabled {
+            if let Some(handle) = watcher.take() {
+                handle.stop();
+            }
+            clear_selection_unsupported_hint(app);
+        } else if !state.anchor_ready.load(Ordering::SeqCst) {
+            // 图标窗口不可用：开关不能在界面上保持「已开启」。
+            state
+                .settings
+                .lock()
+                .expect("settings poisoned")
+                .selection_anchor_enabled = false;
+        } else if watcher.is_none() {
+            match selection_watch::start(app.clone()) {
+                Some(handle) => *watcher = Some(handle),
+                None => {
+                    state.anchor_ready.store(false, Ordering::SeqCst);
+                    state.selection_diag.note("watcher", "start_failed", "unknown", 0);
+                    state
+                        .settings
+                        .lock()
+                        .expect("settings poisoned")
+                        .selection_anchor_enabled = false;
+                }
+            }
+        }
+    }
+    // 关闭、或刚才因能力不可用被落回关闭：都要把图标与待确认文本一起清掉。
+    if !enabled || !anchor_enabled(app) {
+        dismiss_anchor(app);
     }
 }
 
@@ -502,10 +837,35 @@ struct AppState {
     provider_config: Mutex<ProviderConfig>,
     settings: Mutex<settings::AppSettings>,
     settings_dir: Mutex<Option<PathBuf>>,
+    /// 落盘的翻译历史（MRU、最多 10 条）；启动早期为空，setup 拿到配置目录后加载。
+    history: Mutex<history::TranslationHistory>,
     speech: SpeechService,
     update_latest: Mutex<Option<String>>,
     /// 翻译任务代次：只有最新一代可以推送 state，防止慢请求回来覆盖新内容。
     translation_epoch: AtomicU64,
+    /// 选区图标待确认的文本：点击图标才消费；超时/关开关/热键取词即丢弃。
+    pending_selection: Mutex<Option<String>>,
+    /// 图标显示代次：定时隐藏据此放弃旧定时器，避免把新图标提前收掉。
+    anchor_epoch: AtomicU64,
+    /// 图标窗口是否创建成功；失败时设置项如实标为不可用（不静默 no-op）。
+    anchor_ready: AtomicBool,
+    /// 键盘选区兜底开关（默认关闭）：监听线程据此注册/反注册键盘设备与事件钩子。
+    keyboard_fallback: Arc<AtomicBool>,
+    /// 划词热键线程句柄；改键与退出时先反注册旧键再结束线程。
+    #[cfg(windows)]
+    hotkey: Mutex<Option<HotkeyHandle>>,
+    /// 热键注册失败/文本无效的明确提示；设置页据此展示原因（不静默降级）。
+    hotkey_error: Mutex<Option<String>>,
+    /// Raw Input 监听句柄；关闭开关时 take 并 stop，线程内反注册设备。
+    #[cfg(windows)]
+    selection_watch: Mutex<Option<selection_watch::WatcherHandle>>,
+    /// 划词链路结构化诊断：计数 + 最近一次失败 stage/reason。
+    /// 只记录窗口类名/pid，绝不记录选中文本或按键内容。
+    #[cfg(windows)]
+    selection_diag: Arc<selection_watch::SelectionDiagnostics>,
+    /// 自动划词连续失败时给设置页的降级提示（热键兜底）；自动识别成功后清除。
+    #[cfg(windows)]
+    selection_unsupported_hint: Mutex<Option<String>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -536,6 +896,13 @@ struct SettingsView {
     leave_grace_ms: u64,
     selection_enabled: bool,
     selection_hotkey: String,
+    /// 选区锚点图标开关：Windows 才可用，不可用时前端把开关置灰。
+    selection_anchor_enabled: bool,
+    selection_anchor_supported: bool,
+    /// 键盘选区兜底开关（注册键盘设备与文本选区事件，不记录键值）。默认关闭。
+    selection_keyboard_fallback: bool,
+    /// 热键注册失败或文本无效的明确原因；为空表示当前热键可用。
+    selection_hotkey_error: Option<String>,
     autostart_enabled: bool,
     auto_check_updates: bool,
     /// 朗读语速倍率（0.5–2.0）。本地引擎直接生效，在线音频由前端倍速播放。
@@ -613,6 +980,16 @@ fn snapshot(state: &AppState) -> StateView {
             leave_grace_ms: settings.leave_grace_ms,
             selection_enabled: settings.selection_enabled,
             selection_hotkey: settings.selection_hotkey.clone(),
+            selection_anchor_enabled: settings.selection_anchor_enabled,
+            selection_anchor_supported: cfg!(windows)
+                && state.anchor_ready.load(Ordering::SeqCst),
+            selection_keyboard_fallback: settings.selection_keyboard_fallback,
+            selection_hotkey_error: state
+                .hotkey_error
+                .lock()
+                .expect("hotkey error poisoned")
+                .clone()
+                .or_else(|| selection_unsupported_hint(state)),
             autostart_enabled: settings.autostart_enabled,
             auto_check_updates: settings.auto_check_updates,
             tts_rate: settings.tts_rate,
@@ -1520,6 +1897,14 @@ fn persist_position(
     let _ = app;
 }
 
+/// 翻译缓存键里的引擎指纹：引擎 + 模型 + 自定义入口，不含任何密钥。
+///
+/// 三者任一变化都意味着「同一段原文会得到不同译文」，缓存必须落空；密钥轮换不改变引擎
+/// 与模型，翻译结果仍可复用，因此不参与指纹，也避免把凭据带进缓存键。
+fn engine_fingerprint(config: &ProviderConfig) -> String {
+    format!("{}|{}|{}", config.engine.code(), config.model, config.base_url)
+}
+
 /// 锁内过期判定：进入线程时的 epoch 比对只是粗筛，旧批次可能正卡在链锁上排队；
 /// 拿到锁后再看一次最新代次，认输就直接放弃、不发网络。apply 层的 generation 校验不动。
 fn locked_work_is_stale(epoch: u64, latest: u64) -> bool {
@@ -1543,7 +1928,13 @@ fn run_chain(
 /// 翻译链放进后台线程：命令立即返回（卡片已由 coordinator 标成 syncing），
 /// 完成后 emit 一次 state 让 WebView 收结果。慢请求不会占住 IPC 线程，
 /// 用户在这期间仍能打字、拖动、收起面板。
-fn spawn_translation(app: &tauri::AppHandle, plan: SyncPlan) {
+fn spawn_translation(
+    app: &tauri::AppHandle,
+    plan: SyncPlan,
+    engine: String,
+    record_in_cache: bool,
+    merge_history_id: Option<u64>,
+) {
     let handle = app.clone();
     let epoch = {
         let state = handle.state::<AppState>();
@@ -1559,19 +1950,52 @@ fn spawn_translation(app: &tauri::AppHandle, plan: SyncPlan) {
             // 等链锁期间被新请求取代：旧批次直接作废，不发网络、不写文档、不推 state。
             None => return,
         };
-        let latest = state.translation_epoch.load(Ordering::SeqCst);
+        // 整包成功且本次允许写缓存时，才准备历史写入。敏感文本由 `history.record`
+        // 自己拦下；这里只负责把 (语言 → 译文) 整理成落盘格式。
+        let history_write = match (&result, record_in_cache) {
+            (Ok(set), true) => complete_translations(&plan, set).map(|items| {
+                items
+                    .into_iter()
+                    .map(|(lang, text)| (lang.code().to_string(), text))
+                    .collect::<BTreeMap<String, String>>()
+            }),
+            _ => None,
+        };
+        let mut applied = false;
         {
             let mut coordinator = state.coordinator.lock().expect("coordinator poisoned");
             match result {
                 Ok(result) => {
-                    // apply 内部按 generation 丢弃过期结果，这里无需二次判断。
-                    let _ = coordinator.apply(result);
-                    if epoch == latest {
-}
+                    // 只有整包成功才进缓存；部分失败留给用户手动重试走真实请求。
+                    if record_in_cache {
+                        coordinator.record_translation(&plan, &engine, &result);
+                    }
+                    // apply 内部按 generation 丢弃过期结果；只有真正写入才值得进历史。
+                    applied = matches!(coordinator.apply(result), ApplyOutcome::Applied);
                 }
-                Err(_) if epoch == latest => {
-}
                 Err(_) => {}
+            }
+        }
+        if applied {
+            if let Some(translations) = history_write {
+                let target_codes: Vec<String> =
+                    plan.targets.iter().map(|lang| lang.code().to_string()).collect();
+                let mut history = state.history.lock().expect("history poisoned");
+                match merge_history_id {
+                    // 增量补翻：把缺失语言的译文并回原条目并置顶，避免下次点击再补一遍。
+                    Some(id) => {
+                        history.merge(id, &translations, &engine);
+                    }
+                    None => {
+                        history.record(
+                            &plan.source_text,
+                            plan.source_lang.code(),
+                            &target_codes,
+                            &translations,
+                            &engine,
+                        );
+                    }
+                }
             }
         }
         if epoch == state.translation_epoch.load(Ordering::SeqCst) {
@@ -1579,6 +2003,82 @@ fn spawn_translation(app: &tauri::AppHandle, plan: SyncPlan) {
             let _ = handle.emit("state", view);
         }
     });
+}
+
+/// 缓存命中时把对应历史条目置顶：MRU 只调整顺序，不刷新时间戳（本轮没有产生新译文）。
+fn touch_history_for_current(state: &AppState, engine: &str) {
+    let current = {
+        let coordinator = state.coordinator.lock().expect("coordinator poisoned");
+        let Some(source) = coordinator.document().authoritative().cloned() else {
+            return;
+        };
+        let Some(text) = coordinator
+            .document()
+            .slot(&source)
+            .map(|slot| slot.text.clone())
+        else {
+            return;
+        };
+        let targets: Vec<String> = coordinator
+            .pool()
+            .targets_excluding(&source)
+            .iter()
+            .map(|lang| lang.code().to_string())
+            .collect();
+        (text, source.code().to_string(), targets)
+    };
+    state
+        .history
+        .lock()
+        .expect("history poisoned")
+        .touch_matching(&current.0, &current.1, &current.2, engine);
+}
+
+/// 进程内缓存落空后先查持久化历史。
+///
+/// 文本、源语言、引擎都一致，且当前至少一个目标语言能从历史取到译文时：直接回填已有语言，
+/// 只对缺失的目标语言合成一次增量请求；历史条目多出来的目标语言由 `restore_history` 忽略。
+/// 历史与当前引擎不一致时 `find_compatible` 不命中，避免把旧引擎的译文混进新配置。
+fn resolve_translation_with_history(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    plan: SyncPlan,
+    engine: String,
+) {
+    let targets: Vec<String> = plan.targets.iter().map(|lang| lang.code().to_string()).collect();
+    let entry = {
+        let history = state.history.lock().expect("history poisoned");
+        history.find_compatible(
+            &plan.source_text,
+            plan.source_lang.code(),
+            &targets,
+            &engine,
+        )
+    };
+    let Some(entry) = entry else {
+        spawn_translation(app, plan, engine, true, None);
+        return;
+    };
+    {
+        let mut history = state.history.lock().expect("history poisoned");
+        history.touch(entry.id);
+    }
+    let translations: BTreeMap<Lang, String> = entry
+        .translations
+        .iter()
+        .map(|(code, text)| (Lang::new(code.as_str()), text.clone()))
+        .collect();
+    let missing = {
+        let mut coordinator = state.coordinator.lock().expect("coordinator poisoned");
+        coordinator.restore_history(&plan.source_lang, &plan.source_text, &translations)
+    };
+    match missing {
+        Some(plan) => spawn_translation(app, plan, engine, true, Some(entry.id)),
+        None => {
+            // 历史已覆盖全部当前目标：没有网络请求，只推进代次作废在途旧批次。
+            state.translation_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 /// 只有状态机产出的 intent 才能触碰系统能力。force_refresh 对应界面上的显式「读取剪贴板」。
@@ -1595,14 +2095,26 @@ continue;
                         // 敏感内容连 provider 链都不进：过滤发生在读取之后、提交之前，静默跳过。
                         SensitiveVerdict::Skipped(_) => {}
                         SensitiveVerdict::Allowed => {
-                            let plan = state
+                            let engine = engine_fingerprint(
+                                &state.provider_config.lock().expect("provider config poisoned"),
+                            );
+                            let outcome = state
                                 .coordinator
                                 .lock()
                                 .expect("coordinator poisoned")
-                                .accept_clipboard(&text, force_refresh);
-                            if let Some(plan) = plan {
-                                // 翻译链含 10s 超时 + 重试，绝不能让展开/刷新命令等它跑完。
-                                spawn_translation(app, plan);
+                                .accept_clipboard_with_cache(&text, force_refresh, &engine);
+                            match outcome {
+                                Some(CommitOutcome::Translate(plan)) => {
+                                    // 翻译链含 10s 超时 + 重试，绝不能让展开/刷新命令等它跑完。
+                                    resolve_translation_with_history(app, state, plan, engine);
+                                }
+                                Some(CommitOutcome::Cached { .. }) => {
+                                    // 命中缓存：译文已同步写回，没有任何网络请求；
+                                    // 仍推进 epoch，让可能还在途的旧批次在写回/推送前作废。
+                                    state.translation_epoch.fetch_add(1, Ordering::SeqCst);
+                                    touch_history_for_current(state, &engine);
+                                }
+                                None => {}
                             }
                         }
                     },
@@ -1663,6 +2175,8 @@ fn hover_enter(
     if probe_pointer(&window) == PointerProbe::Outside {
         return snapshot(state.inner());
     }
+    // 用户已经转向胶囊：选区图标不再有意义，收起并丢弃待确认文本。
+    dismiss_anchor(&app);
     dispatch(
         HoverEvent::HoverEnter {
             at_ms: SystemClock.now_ms(),
@@ -1758,7 +2272,109 @@ fn clear_document(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> S
         .expect("coordinator poisoned")
         .clear();
     state.translation_epoch.fetch_add(1, Ordering::SeqCst);
-snapshot(state.inner())
+    snapshot(state.inner())
+}
+
+/// 历史列表视图：只回传片段与元信息，不下发全部译文（点击条目时再由 Rust 回填）。
+#[derive(Serialize, Clone)]
+struct HistoryItemView {
+    id: u64,
+    /// 源文本片段（最多 120 字符，超出加省略号）。
+    snippet: String,
+    source_lang: String,
+    targets: Vec<String>,
+    created_at_ms: u64,
+}
+
+fn history_snippet(text: &str, max_chars: usize) -> String {
+    let mut snippet: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        snippet.push('…');
+    }
+    snippet
+}
+
+fn history_items(state: &AppState) -> Vec<HistoryItemView> {
+    let history = state.history.lock().expect("history poisoned");
+    history
+        .entries()
+        .iter()
+        .map(|entry| HistoryItemView {
+            id: entry.id,
+            snippet: history_snippet(&entry.source_text, 120),
+            source_lang: entry.source_lang.clone(),
+            targets: entry.targets.clone(),
+            created_at_ms: entry.created_at_ms,
+        })
+        .collect()
+}
+
+/// 历史入口：按 MRU 顺序返回最多 10 条。
+#[tauri::command]
+fn list_history(state: tauri::State<'_, AppState>) -> Vec<HistoryItemView> {
+    history_items(state.inner())
+}
+
+/// 点击历史条目：用已有译文回填当前卡片并置顶；只对缺失的目标语言补发一次请求。
+///
+/// 这是用户显式选择，即使条目引擎与当前引擎不同也回填它的译文；只有引擎一致时，
+/// 增量补翻的结果才会并回原条目（`history.merge` 自己会拒绝跨引擎合并）。
+#[tauri::command]
+fn apply_history(
+    id: u64,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> StateView {
+    let entry = {
+        let mut history = state.history.lock().expect("history poisoned");
+        let entry = history.get(id);
+        if entry.is_some() {
+            history.touch(id);
+        }
+        entry
+    };
+    let Some(entry) = entry else {
+        return snapshot(state.inner());
+    };
+    // 回填会替换卡片文本，正在朗读的旧内容立即停止。
+    state.speech.stop(&app, "history_applied");
+    let engine = engine_fingerprint(
+        &state.provider_config.lock().expect("provider config poisoned"),
+    );
+    let translations: BTreeMap<Lang, String> = entry
+        .translations
+        .iter()
+        .map(|(code, text)| (Lang::new(code.as_str()), text.clone()))
+        .collect();
+    let missing = state
+        .coordinator
+        .lock()
+        .expect("coordinator poisoned")
+        .restore_history(
+            &Lang::new(entry.source_lang.as_str()),
+            &entry.source_text,
+            &translations,
+        );
+    match missing {
+        Some(plan) => spawn_translation(&app, plan, engine, true, Some(entry.id)),
+        None => {
+            // 条目已覆盖当前全部目标：不请求，只推进代次作废在途旧批次。
+            state.translation_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    snapshot(state.inner())
+}
+
+/// 清空历史：内存与文件一并清空；同时让进程内缓存失效，避免磁盘清了内存还在复用。
+#[tauri::command]
+fn clear_history(state: tauri::State<'_, AppState>) -> StateView {
+    state.history.lock().expect("history poisoned").clear();
+    state
+        .coordinator
+        .lock()
+        .expect("coordinator poisoned")
+        .invalidate_translation_cache();
+    snapshot(state.inner())
 }
 
 #[tauri::command]
@@ -1786,18 +2402,28 @@ fn commit_edit(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> StateView {
-    let plan = state
     if let Some((active_lang, active_text)) = state.speech.active_lang_and_text() {
         if active_lang == lang && active_text != text {
             state.speech.stop(&app, "text_changed");
         }
     }
+    let engine = engine_fingerprint(
+        &state.provider_config.lock().expect("provider config poisoned"),
+    );
+    let outcome = state
         .coordinator
         .lock()
         .expect("coordinator poisoned")
-        .commit(&Lang::new(&lang), text);
-    match plan {
-        Ok(plan) => spawn_translation(&app, plan),
+        .commit_with_cache(&Lang::new(&lang), text, &engine);
+    match outcome {
+        Ok(CommitOutcome::Translate(plan)) => {
+            resolve_translation_with_history(&app, state.inner(), plan, engine)
+        }
+        Ok(CommitOutcome::Cached { .. }) => {
+            // 同文重提：结果已同步写回，卡片不会停在 syncing；推进 epoch 作废在途旧批次。
+            state.translation_epoch.fetch_add(1, Ordering::SeqCst);
+            touch_history_for_current(state.inner(), &engine);
+        }
         Err(_error) => {}
     }
     snapshot(state.inner())
@@ -1815,15 +2441,20 @@ fn edit_end(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> StateVi
 }
 
 /// 只重试 apply 标错的卡：源仍是权威源卡，成功过的卡不发第二次请求。
+///
+/// 这条路径刻意不读翻译缓存：失败结果本来就不入缓存，手动重试必须真的把失败卡再打一次。
 #[tauri::command]
 fn retry_failed(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> StateView {
+    let engine = engine_fingerprint(
+        &state.provider_config.lock().expect("provider config poisoned"),
+    );
     let plan = state
         .coordinator
         .lock()
         .expect("coordinator poisoned")
         .retry_failed();
     if let Some(plan) = plan {
-        spawn_translation(&app, plan);
+        spawn_translation(&app, plan, engine, false, None);
     }
     snapshot(state.inner())
 }
@@ -1836,9 +2467,11 @@ fn set_provider(
     secret: String,
     model: String,
     base_url: String,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> StateView {
     let mut config = state.provider_config.lock().expect("provider config poisoned");
+    let previous_fingerprint = engine_fingerprint(&config);
     match Engine::from_code(&engine) {
         Some(engine) => {
             config.engine = engine;
@@ -1857,11 +2490,31 @@ fn set_provider(
         None => {
 }
     }
+    let next_fingerprint = engine_fingerprint(&config);
     drop(config);
+    if next_fingerprint != previous_fingerprint {
+        // 引擎/模型变了：旧译文不再可信。缓存整体失效，并把当前权威源用新引擎重翻一遍。
+        let plan = {
+            let mut coordinator = state.coordinator.lock().expect("coordinator poisoned");
+            coordinator.invalidate_translation_cache();
+            let current = coordinator.document().authoritative().cloned().and_then(|lang| {
+                let text = coordinator.document().slot(&lang)?.text.clone();
+                Some((lang, text))
+            });
+            match current {
+                Some((lang, text)) if !text.trim().is_empty() => {
+                    coordinator.commit(&lang, text).ok()
+                }
+                _ => None,
+            }
+        };
+        if let Some(plan) = plan {
+            spawn_translation(&app, plan, next_fingerprint, true, None);
+        }
+    }
     persist(state.inner());
     snapshot(state.inner())
 }
-
 /// 手动检查更新：结果写入 update_latest（设置面板按钮），不弹任何提示。
 #[tauri::command]
 fn check_updates(state: tauri::State<'_, AppState>) -> StateView {
@@ -1878,25 +2531,37 @@ fn check_updates(state: tauri::State<'_, AppState>) -> StateView {
     snapshot(state.inner())
 }
 
-/// 保存面板设置（自动读剪贴板、悬停延迟、划词、更新开关）并即时生效。
+/// 保存面板设置（自动读剪贴板、悬停延迟、划词、选区图标、更新开关）并即时生效。
 /// 延迟生效通过重建状态机完成，展开态会复位——该动作本身就来自展开的面板，代价可接受。
 #[tauri::command(rename_all = "snake_case")]
 fn set_settings(
+    app: tauri::AppHandle,
     auto_read_clipboard: bool,
     hover_delay_ms: u64,
     selection_enabled: bool,
+    selection_anchor_enabled: bool,
+    selection_keyboard_fallback: bool,
     auto_check_updates: bool,
     tts_rate: Option<f64>,
     tts_volume: Option<u8>,
     tts_online_fallback: Option<bool>,
+    selection_hotkey: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> StateView {
     let delay = hover_delay_ms.clamp(50, 2000);
+    // 非 Windows 不落地「已开启」的假状态：没有实现就没有开关。
+    let anchor_on = cfg!(windows) && selection_anchor_enabled;
+    let keyboard_on = cfg!(windows) && selection_keyboard_fallback;
+    let hotkey_text = selection_hotkey
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
     {
         let mut settings = state.settings.lock().expect("settings poisoned");
         settings.auto_read_clipboard = auto_read_clipboard;
         settings.hover_delay_ms = delay;
         settings.selection_enabled = selection_enabled;
+        settings.selection_anchor_enabled = anchor_on;
+        settings.selection_keyboard_fallback = keyboard_on;
         settings.auto_check_updates = auto_check_updates;
         if let Some(rate) = tts_rate {
             settings.tts_rate = rate.clamp(0.5, 2.0);
@@ -1911,8 +2576,42 @@ fn set_settings(
         *state.hover.lock().expect("hover state poisoned") =
             HoverStateMachine::new(delay, grace);
     }
+    // 热键文本只在解析成功后落盘：坏配置不写进 settings.json，错误仍明确回传设置页。
+    if let Some(spec) = hotkey_text {
+        if bead_core::parse_hotkey(&spec).is_ok() {
+            state
+                .settings
+                .lock()
+                .expect("settings poisoned")
+                .selection_hotkey = spec.clone();
+            #[cfg(windows)]
+            apply_hotkey(&app, &spec);
+        } else {
+            #[cfg(windows)]
+            apply_hotkey(&app, &spec);
+        }
+    }
     persist(state.inner());
+    apply_anchor_watcher(&app, anchor_on);
+    apply_keyboard_fallback(&app, keyboard_on);
     snapshot(state.inner())
+}
+
+/// 键盘兜底开关：写能力位并通知监听线程注册/反注册键盘设备与事件钩子。
+fn apply_keyboard_fallback(app: &tauri::AppHandle, enabled: bool) {
+    #[cfg(windows)]
+    {
+        let state = app.state::<AppState>();
+        state.keyboard_fallback.store(enabled, Ordering::SeqCst);
+        let watcher = state
+            .selection_watch
+            .lock()
+            .expect("selection watcher poisoned");
+        if let Some(handle) = watcher.as_ref() {
+            handle.refresh_inputs();
+        }
+    }
+    let _ = (app, enabled);
 }
 
 /// 开机自启开关（tauri-plugin-autostart：Win 注册表 Run / macOS LaunchAgent / XDG autostart）。
@@ -2175,19 +2874,54 @@ fn panel_frame(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Pane
 }
 
 fn apply_language_pool(languages: &[String], app: &tauri::AppHandle, state: &AppState) {
+    let mut previous: Vec<String> = state
+        .coordinator
+        .lock()
+        .expect("coordinator poisoned")
+        .pool()
+        .languages()
+        .iter()
+        .map(|language| language.code().to_string())
+        .collect();
+    previous.sort();
+    let mut next: Vec<String> = languages.to_vec();
+    next.sort();
+    let membership_changed = previous != next;
+
     let pool = LanguagePool::new(languages.iter().map(|c| Lang::new(c.as_str())).collect());
     match pool {
         Ok(pool) => {
+            let engine = engine_fingerprint(
+                &state.provider_config.lock().expect("provider config poisoned"),
+            );
             {
                 let mut settings = state.settings.lock().expect("settings poisoned");
                 settings.languages = pool.languages().iter().map(|l| l.code().to_string()).collect();
             }
-            state
-                .coordinator
-                .lock()
-                .expect("coordinator poisoned")
-                .replace_pool(pool);
+            let plan = {
+                let mut coordinator = state.coordinator.lock().expect("coordinator poisoned");
+                coordinator.replace_pool(pool);
+                if membership_changed {
+                    // 目标语言集合变了：旧缓存必须作废，并用当前权威源把新集合翻一遍。
+                    coordinator.invalidate_translation_cache();
+                    let current = coordinator.document().authoritative().cloned().and_then(|lang| {
+                        let text = coordinator.document().slot(&lang)?.text.clone();
+                        Some((lang, text))
+                    });
+                    match current {
+                        Some((lang, text)) if !text.trim().is_empty() => {
+                            coordinator.commit(&lang, text).ok()
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            };
             persist(state);
+            if let Some(plan) = plan {
+                spawn_translation(app, plan, engine, true, None);
+            }
             // 注意：不再在这里直接 sync_panel_width —— 可见期 resize 会被 OS 合成器抓拍到
             // 旧内容 + 新尺寸的中间帧，导致面板视觉上滑一下。现在由前端在内容不可见的
             // 帧里主动调用 sync_panel_width 命令完成尺寸同步。
@@ -2210,6 +2944,220 @@ fn toggle_selection(
 persist(state.inner());
     let _ = app;
     snapshot(state.inner())
+}
+
+/// 选区图标点击：消费待确认文本，走与热键取词相同的展开与翻译链路。
+///
+/// 点击落在 NOACTIVATE 图标窗口上，原应用保持前台焦点、选区高亮不丢；
+/// 文本可能是 UIA 快照，也可能来自 UIA 失败后的剪贴板兜底（兜底已在检测阶段
+/// 恢复剪贴板），**点击本身不读写剪贴板**。
+#[tauri::command]
+fn anchor_click(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Option<StateView> {
+    #[cfg(windows)]
+    let diag = state.selection_diag.clone();
+    #[cfg(windows)]
+    let (class, pid) = unsafe { selection_watch::foreground_identity() };
+    #[cfg(windows)]
+    diag.click_total.fetch_add(1, Ordering::Relaxed);
+
+    // 先判门禁、后取文本：锁定/编辑态被拦下时不能把待确认文本消费掉，
+    // 否则用户解锁后重试会拿到「没有待确认选区」。
+    let enabled = anchor_enabled(&app);
+    let (locked, editing) = match state.hover.lock().expect("hover state poisoned").state() {
+        HoverState::Expanded { locked, editing, .. } => (locked, editing),
+        _ => (false, false),
+    };
+    let pending_present = state
+        .pending_selection
+        .lock()
+        .ok()
+        .map(|pending| pending.is_some())
+        .unwrap_or(false);
+    if let Some(block) =
+        selection_anchor::anchor_click_block(pending_present, enabled, locked, editing)
+    {
+        #[cfg(windows)]
+        {
+            if block == selection_anchor::AnchorClickBlock::NoPending {
+                diag.click_missed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                diag.click_blocked.fetch_add(1, Ordering::Relaxed);
+            }
+            diag.note("click", block.code(), &class, pid);
+        }
+        // 图标被点了但不该翻译：收起，避免留下一个点了没反应的图标。
+        dismiss_anchor(&app);
+        return None;
+    }
+    let Some(text) = state
+        .pending_selection
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take())
+    else {
+        // 通过门禁后仍被超时线程抢先清空：同样按过期处理，并给出可判定计数。
+        #[cfg(windows)]
+        {
+            diag.click_missed.fetch_add(1, Ordering::Relaxed);
+            diag.note("click", "pending_missing", &class, pid);
+        }
+        dismiss_anchor(&app);
+        return None;
+    };
+    dismiss_anchor(&app);
+    if let SensitiveVerdict::Skipped(_) = SensitiveFilter::classify(&text) {
+        #[cfg(windows)]
+        {
+            diag.click_blocked.fetch_add(1, Ordering::Relaxed);
+            diag.note("click", "sensitive", &class, pid);
+        }
+        return None;
+    }
+    #[cfg(windows)]
+    diag.click_consumed.fetch_add(1, Ordering::Relaxed);
+    state
+        .hover
+        .lock()
+        .expect("hover state poisoned")
+        .transition(HoverEvent::SelectionCaptured);
+    let engine = engine_fingerprint(
+        &state.provider_config.lock().expect("provider config poisoned"),
+    );
+    let outcome = {
+        let mut coordinator = state.coordinator.lock().expect("coordinator poisoned");
+        coordinator.accept_clipboard_with_cache(&text, false, &engine)
+    };
+    match outcome {
+        Some(CommitOutcome::Translate(plan)) => {
+            resolve_translation_with_history(&app, state.inner(), plan, engine)
+        }
+        Some(CommitOutcome::Cached { .. }) => {
+            state.translation_epoch.fetch_add(1, Ordering::SeqCst);
+            touch_history_for_current(state.inner(), &engine);
+        }
+        None => {}
+    }
+    // 快照在提交之后取：缓存命中的译文已经写回，界面不会先看到一份「同步中」的旧状态。
+    let view = snapshot(state.inner());
+    let _ = app.emit("state", view.clone());
+    Some(view)
+}
+
+#[derive(Serialize, Default)]
+struct SelectionCountersView {
+    gesture_candidates: u64,
+    uia_ok: u64,
+    uia_failed: u64,
+    gate_rejections: u64,
+    anchor_shown: u64,
+    anchor_failed: u64,
+    click_total: u64,
+    click_consumed: u64,
+    click_missed: u64,
+    click_blocked: u64,
+    fallback_attempts: u64,
+    fallback_ok: u64,
+    fallback_failed: u64,
+}
+
+/// 划词链路只读诊断视图：用于「连续触发 N 次后到底哪一环断了」的判定。
+///
+/// 不含选中文本、不含按键内容；只含计数、状态名与窗口类名/pid。
+#[derive(Serialize)]
+struct SelectionDebugView {
+    watcher_running: bool,
+    anchor_ready: bool,
+    anchor_window: bool,
+    anchor_visible: bool,
+    anchor_enabled: bool,
+    keyboard_fallback: bool,
+    pending: bool,
+    hover_state: &'static str,
+    counters: SelectionCountersView,
+    last_stage: String,
+    last_reason: String,
+    last_class: String,
+    last_pid: u32,
+}
+
+fn hover_code(state: HoverState) -> &'static str {
+    match state {
+        HoverState::Idle => "idle",
+        HoverState::HoverPending { .. } => "hover_pending",
+        HoverState::Collapsing { .. } => "collapsing",
+        HoverState::Expanded { locked: true, .. } => "expanded_locked",
+        HoverState::Expanded { editing: true, .. } => "expanded_editing",
+        HoverState::Expanded { .. } => "expanded",
+    }
+}
+
+/// 排障入口：连续触发划词后调用它，对照计数即可定位断点。
+#[tauri::command]
+fn selection_debug_state(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> SelectionDebugView {
+    let (anchor_enabled, keyboard_fallback) = {
+        let settings = state.settings.lock().expect("settings poisoned");
+        (
+            settings.selection_anchor_enabled,
+            settings.selection_keyboard_fallback,
+        )
+    };
+    let hover_state = hover_code(state.hover.lock().expect("hover state poisoned").state());
+    let pending = state
+        .pending_selection
+        .lock()
+        .map(|pending| pending.is_some())
+        .unwrap_or(false);
+    let (anchor_window, anchor_visible) = selection_anchor::window_state(&app);
+    let mut view = SelectionDebugView {
+        watcher_running: false,
+        anchor_ready: cfg!(windows) && state.anchor_ready.load(Ordering::SeqCst),
+        anchor_window,
+        anchor_visible,
+        anchor_enabled,
+        keyboard_fallback,
+        pending,
+        hover_state,
+        counters: SelectionCountersView::default(),
+        last_stage: "-".into(),
+        last_reason: "-".into(),
+        last_class: "-".into(),
+        last_pid: 0,
+    };
+    #[cfg(windows)]
+    {
+        let diag = state.selection_diag.clone();
+        view.watcher_running = state
+            .selection_watch
+            .lock()
+            .ok()
+            .and_then(|watcher| watcher.as_ref().map(|handle| handle.is_running()))
+            .unwrap_or(false);
+        view.counters = SelectionCountersView {
+            gesture_candidates: diag.gesture_candidates.load(Ordering::Relaxed),
+            uia_ok: diag.uia_ok.load(Ordering::Relaxed),
+            uia_failed: diag.uia_failed.load(Ordering::Relaxed),
+            gate_rejections: diag.gate_rejections.load(Ordering::Relaxed),
+            anchor_shown: diag.anchor_shown.load(Ordering::Relaxed),
+            anchor_failed: diag.anchor_failed.load(Ordering::Relaxed),
+            click_total: diag.click_total.load(Ordering::Relaxed),
+            click_consumed: diag.click_consumed.load(Ordering::Relaxed),
+            click_missed: diag.click_missed.load(Ordering::Relaxed),
+            click_blocked: diag.click_blocked.load(Ordering::Relaxed),
+            fallback_attempts: diag.fallback_attempts.load(Ordering::Relaxed),
+            fallback_ok: diag.fallback_ok.load(Ordering::Relaxed),
+            fallback_failed: diag.fallback_failed.load(Ordering::Relaxed),
+        };
+        if let Some(last) = diag.last() {
+            view.last_stage = last.stage.into();
+            view.last_reason = last.reason.into();
+            view.last_class = last.class;
+            view.last_pid = last.pid;
+        }
+    }
+    view
 }
 
 /// 窗口两种形态的尺寸。
@@ -2271,6 +3219,7 @@ fn main() {
             provider_config: Mutex::new(default_config),
             settings: Mutex::new(settings::AppSettings::default()),
             settings_dir: Mutex::new(None),
+            history: Mutex::new(history::TranslationHistory::empty(history::DEFAULT_CAPACITY)),
             speech: SpeechService::new(SpeechManager::new(
                 GoogleTtsOnline {
                     transport: bead_providers::UreqByteTransport,
@@ -2279,6 +3228,19 @@ fn main() {
             )),
             update_latest: Mutex::new(None),
             translation_epoch: AtomicU64::new(0),
+            pending_selection: Mutex::new(None),
+            anchor_epoch: AtomicU64::new(0),
+            anchor_ready: AtomicBool::new(false),
+            keyboard_fallback: Arc::new(AtomicBool::new(false)),
+            #[cfg(windows)]
+            hotkey: Mutex::new(None),
+            hotkey_error: Mutex::new(None),
+            #[cfg(windows)]
+            selection_watch: Mutex::new(None),
+            #[cfg(windows)]
+            selection_diag: Arc::new(selection_watch::SelectionDiagnostics::default()),
+            #[cfg(windows)]
+            selection_unsupported_hint: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
@@ -2299,6 +3261,9 @@ fn main() {
             set_settings,
             set_autostart,
             check_updates,
+            list_history,
+            apply_history,
+            clear_history,
             open_release_page,
             test_provider,
             list_provider_models,
@@ -2316,6 +3281,9 @@ fn main() {
             change_card_lang,
             reorder_cards,
             toggle_selection,
+            anchor_click,
+            #[cfg(windows)]
+            selection_debug_state,
             sync_panel_width,
             panel_frame
         ])
@@ -2434,6 +3402,9 @@ fn main() {
                 rebuild_chain(&loaded.provider, state.inner());
                 *state.settings.lock().expect("settings poisoned") = loaded;
                 *state.settings_dir.lock().expect("settings dir poisoned") = Some(dir.clone());
+                // 历史与 settings.json 同级：读不出或不认识格式都退化成空历史，不影响启动。
+                *state.history.lock().expect("history poisoned") =
+                    history::TranslationHistory::load(dir, history::DEFAULT_CAPACITY);
                 // 位置记忆：恢复拖拽后的横向锚点；纵坐标一律吸附显示器上边缘。
                 if let Some((x, _y)) = saved_anchor {
                     let top = monitor_top(&window);
@@ -2473,8 +3444,40 @@ fn main() {
             if let Some(anchor) = capsule_anchor(&window) {
                 state.settings.lock().expect("settings poisoned").capsule_anchor = Some(anchor);
             }
-            // 划词热键线程：注册失败静默降级；开关关闭时热键仍在但不动作（默认关闭，规范要求）。
-            spawn_hotkey_thread(app.handle().clone());
+            // 划词热键：按用户配置（默认 Ctrl+Alt+Shift+B）注册；失败原因进设置页提示。
+            let (keyboard_fallback_on, hotkey_spec) = {
+                let settings = state.settings.lock().expect("settings poisoned");
+                (
+                    settings.selection_keyboard_fallback,
+                    settings.selection_hotkey.clone(),
+                )
+            };
+            state
+                .keyboard_fallback
+                .store(cfg!(windows) && keyboard_fallback_on, Ordering::SeqCst);
+            #[cfg(windows)]
+            apply_hotkey(app.handle(), &hotkey_spec);
+            // 选区锚点图标：先建隐藏窗口（建不出来就让设置项如实置灰），
+            // 再按已保存的开关启动 Raw Input 监听；关闭时不注册任何全局监听。
+            #[cfg(windows)]
+            {
+                let ready = selection_anchor::create(app.handle()).is_some();
+                state.anchor_ready.store(ready, Ordering::SeqCst);
+                if !ready {
+                    // 图标窗口建不出来（WebView2 或窗口系统异常）就不能留下「已开启」的假状态。
+                    state
+                        .settings
+                        .lock()
+                        .expect("settings poisoned")
+                        .selection_anchor_enabled = false;
+                }
+            }
+            let anchor_on = state
+                .settings
+                .lock()
+                .expect("settings poisoned")
+                .selection_anchor_enabled;
+            apply_anchor_watcher(app.handle(), anchor_on);
             // 启动时异步检查更新（auto_check_updates 开关控制），绝不阻塞启动。
             {
                 let handle = app.handle().clone();

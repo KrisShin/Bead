@@ -11,7 +11,9 @@
 pub mod chain;
 pub mod detector;
 pub mod document;
+pub mod hotkey;
 pub mod hover;
+pub mod selection;
 pub mod sensitive;
 pub mod speech;
 pub mod sync;
@@ -19,6 +21,7 @@ pub mod update;
 
 pub use chain::{ChainConfig, ProviderChain};
 pub use detector::{HeuristicDetector, LanguageDetector};
+pub use hotkey::{parse_hotkey, Hotkey, HotkeyError, HotkeyKey, DEFAULT_HOTKEY};
 pub use sensitive::{SensitiveFilter, SensitiveVerdict};
 pub use speech::{
     choose_voice, chunk_text, cultures_for, OnlineTts, SpeechError, SpeechManager, SpeechProfile,
@@ -31,6 +34,6 @@ pub use hover::{
     DEFAULT_HOVER_DELAY_MS, DEFAULT_LEAVE_GRACE_MS,
 };
 pub use sync::{
-    content_hash, ApplyOutcome, Clock, ProviderError, SyncCoordinator, SyncPlan, TranslationItem,
-    TranslationSet, Translator,
+    complete_translations, content_hash, ApplyOutcome, Clock, CommitOutcome, ProviderError,
+    SyncCoordinator, SyncPlan, TranslationCache, TranslationItem, TranslationSet, Translator,
 };

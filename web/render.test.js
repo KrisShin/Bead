@@ -147,6 +147,70 @@ describe('board rendering', () => {
     expect(html).toContain('开机自启');
   });
 
+  it('shows the selection anchor switch and greys it out when unsupported', () => {
+    const on = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      settings: { selection_anchor_enabled: true, selection_anchor_supported: true },
+    });
+    expect(on).toContain('data-setting="selection_anchor_enabled" checked');
+    expect(on).not.toContain('data-setting="selection_anchor_enabled" checked disabled');
+
+    const unsupported = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      settings: { selection_anchor_enabled: false, selection_anchor_supported: false },
+    });
+    expect(unsupported).toContain('data-setting="selection_anchor_enabled" disabled');
+  });
+
+  it('renders a hotkey input and surfaces registration failures instead of hiding them', () => {
+    const html = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      settings: { selection_hotkey: 'Ctrl+Alt+Shift+B' },
+    });
+    expect(html).toContain('data-setting="selection_hotkey"');
+    expect(html).toContain('value="Ctrl+Alt+Shift+B"');
+
+    const failed = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      settings: {
+        selection_hotkey: 'Ctrl+Alt+Shift+B',
+        selection_hotkey_error: '快捷键被其他程序占用（错误 1409），请改键或改用划词图标',
+      },
+    });
+    expect(failed).toContain('board__hint');
+    expect(failed).toContain('快捷键被其他程序占用');
+    expect(failed).toContain('请改键或改用划词图标');
+  });
+
+  it('shows the keyboard fallback switch as off by default and disabled when unsupported', () => {
+    const off = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      settings: { selection_keyboard_fallback: false, selection_anchor_supported: true },
+    });
+    expect(off).toContain('data-setting="selection_keyboard_fallback"');
+    expect(off).not.toContain('data-setting="selection_keyboard_fallback" checked');
+    expect(off).toContain('不记录按键内容');
+
+    const on = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      settings: { selection_keyboard_fallback: true, selection_anchor_supported: true },
+    });
+    expect(on).toContain('data-setting="selection_keyboard_fallback" checked');
+
+    const unsupported = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      settings: { selection_keyboard_fallback: false, selection_anchor_supported: false },
+    });
+    expect(unsupported).toContain('data-setting="selection_keyboard_fallback" disabled');
+  });
+
   // --- 新增功能测试 ---
 
   it('shows close buttons only when there are more than 2 cards', () => {
@@ -218,5 +282,72 @@ describe('board rendering', () => {
     const html = renderBoard(expanded);
     expect(html).toContain('lang-select');
     expect(html.match(/data-action="change_lang"/g)).toHaveLength(2);
+  });
+
+  // --- 翻译历史 ---
+
+  it('offers a clock history button that reports its pressed state', () => {
+    const closed = renderBoard(expanded)
+      .match(/<button[^>]*data-action="history"[\s\S]*?<\/button>/)?.[0];
+    expect(closed).toMatch(/^<button type="button"/);
+    expect(closed).toContain('class="icon-btn icon-btn--history"');
+    expect(closed).toContain('aria-pressed="false"');
+    expect(closed).toContain('aria-label="翻译历史"');
+    // 与其它头按钮同一套：16×16 viewBox + currentColor 描边时钟。
+    expect(closed).toContain('viewBox="0 0 16 16"');
+    expect(closed).toContain('stroke="currentColor"');
+    expect(closed).toContain('<circle cx="8" cy="8"');
+
+    const open = renderBoard({ ...expanded, historyOpen: true, historyItems: [] })
+      .match(/<button[^>]*data-action="history"[\s\S]*?<\/button>/)?.[0];
+    expect(open).toContain('aria-pressed="true"');
+    expect(open).toContain('data-tooltip="关闭翻译历史"');
+  });
+
+  it('renders the MRU history list with snippet, target languages and local time', () => {
+    const created = new Date(2026, 10, 7, 9, 30).getTime();
+    const html = renderBoard({
+      ...expanded,
+      historyOpen: true,
+      historyItems: [
+        { id: 7, snippet: '你好世界', source_lang: 'zh', targets: ['en', 'ja'], created_at_ms: created },
+        { id: 4, snippet: 'Good morning', source_lang: 'en', targets: ['zh'], created_at_ms: created },
+      ],
+    });
+
+    expect(html).toContain('board__history');
+    expect(html).not.toContain('board__cards');
+    expect(html.match(/data-action="apply-history"/g)).toHaveLength(2);
+    expect(html).toContain('data-id="7"');
+    expect(html).toContain('你好世界');
+    expect(html).toContain('English、日本語');
+    expect(html).toContain('11-07 09:30');
+    // MRU 顺序由 Rust 保证，渲染层不重排：第一条必须在前。
+    expect(html.indexOf('data-id="7"')).toBeLessThan(html.indexOf('data-id="4"'));
+  });
+
+  it('shows an empty state and a clear entry when history is empty', () => {
+    const html = renderBoard({ ...expanded, historyOpen: true, historyItems: [] });
+    expect(html).toContain('history__empty');
+    expect(html).toContain('还没有翻译历史');
+    expect(html).toContain('data-action="clear-history"');
+    expect(html.match(/data-action="apply-history"/g)).toBeNull();
+  });
+
+  it('escapes history snippets so clipboard text cannot inject markup', () => {
+    const html = renderBoard({
+      ...expanded,
+      historyOpen: true,
+      historyItems: [
+        { id: 1, snippet: '<img src=x onerror=alert(1)>', targets: ['en'], created_at_ms: 0 },
+      ],
+    });
+    expect(html).not.toContain('<img');
+    expect(html).toContain('&lt;img');
+  });
+
+  it('offers a clear-history entry in the settings section', () => {
+    const html = renderBoard({ ...expanded, languagesOpen: true });
+    expect(html).toContain('data-action="clear-history"');
   });
 });

@@ -8,6 +8,7 @@ import {
   HeadButton,
   Card,
   AddCardButton,
+  langName,
 } from './components/index.js';
 
 // 只保留传统机器翻译引擎；大模型翻译（智谱 / 硅基流动 / 自定义 OpenAI）暂不开放。
@@ -31,6 +32,14 @@ const EMPTY_PROVIDER = {
 };
 
 export { escapeHtml };
+
+/** 历史时间戳 → 本地 MM-DD HH:mm；无效时间不显示。 */
+function historyTime(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '';
+  const date = new Date(ms);
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
 
 export function renderBoard(view) {
   if (view.view !== 'expanded') return '';
@@ -64,7 +73,11 @@ export function renderBoard(view) {
       ? `<div class="board__settings">
     <label><input type="checkbox" data-setting="auto_read_clipboard"${view.settings.auto_read_clipboard ? ' checked' : ''} />自动读剪贴板</label>
     <label>悬停 <input type="number" data-setting="hover_delay_ms" value="${view.settings.hover_delay_ms}" min="50" max="2000" step="50" /> ms 后展开</label>
-    <label><input type="checkbox" data-setting="selection_enabled"${view.settings.selection_enabled ? ' checked' : ''} />划词（${view.settings.selection_hotkey}，改键重启生效）</label>
+    <label><input type="checkbox" data-setting="selection_enabled"${view.settings.selection_enabled ? ' checked' : ''} />划词（快捷键触发取词）</label>
+    <label>快捷键 <input type="text" data-setting="selection_hotkey" value="${escapeHtml(view.settings.selection_hotkey ?? '')}" spellcheck="false" autocomplete="off" /></label>
+    ${view.settings.selection_hotkey_error ? `<span class="board__hint">${escapeHtml(view.settings.selection_hotkey_error)}</span>` : ''}
+    <label><input type="checkbox" data-setting="selection_anchor_enabled"${view.settings.selection_anchor_enabled ? ' checked' : ''}${view.settings.selection_anchor_supported === false ? ' disabled' : ''} />划词后显示翻译图标</label>
+    <label><input type="checkbox" data-setting="selection_keyboard_fallback"${view.settings.selection_keyboard_fallback ? ' checked' : ''}${view.settings.selection_anchor_supported === false ? ' disabled' : ''} />键盘选区兜底（监听键盘活动与文本选区变化，不记录按键内容）</label>
     <label><input type="checkbox" data-setting="autostart" ${view.settings.autostart_enabled ? 'checked' : ''} />开机自启</label>
     <label><input type="checkbox" data-setting="auto_check_updates" ${view.settings.auto_check_updates ? 'checked' : ''} />启动时检查更新</label>
     <label>朗读语速 <input type="number" data-setting="tts_rate" value="${Number(view.settings.tts_rate ?? 1)}" min="0.5" max="2" step="0.1" /> ×</label>
@@ -75,6 +88,32 @@ export function renderBoard(view) {
     <button type="button" data-action="check-updates">检查更新</button>
   </div>`
       : '';
+
+  // 历史列表：与设置面板同一层的内联面板，打开时卡片区隐藏，不浮在卡片上。
+  const historyItems = view.historyItems ?? [];
+  const historyPanel = view.historyOpen
+    ? `<div class="board__history" role="region" aria-label="翻译历史">
+    <div class="history__head">
+      <span class="history__title">翻译历史 · 最近 10 条</span>
+      <button type="button" data-action="clear-history">清空历史</button>
+    </div>
+    ${
+      historyItems.length
+        ? `<ul class="history__list">${historyItems
+            .map((item) => {
+              const langs = (item.targets ?? []).map((code) => langName(code)).join('、');
+              const time = historyTime(item.created_at_ms);
+              const meta = [langs, time].filter(Boolean).join(' · ');
+              return `<li><button type="button" class="history__item" data-action="apply-history" data-id="${item.id}">
+        <span class="history__text">${escapeHtml(item.snippet ?? '')}</span>
+        <span class="history__meta">${escapeHtml(meta)}</span>
+      </button></li>`;
+            })
+            .join('')}</ul>`
+        : '<p class="history__empty">还没有翻译历史；成功翻译后会自动记在这里。</p>'
+    }
+  </div>`
+    : '';
 
   // 面板头：标题 + icon 按钮组 + 可选添加按钮
   const addBtn = canAdd ? AddCardButton() : '';
@@ -95,6 +134,7 @@ export function renderBoard(view) {
   </header>
   ${providerPanel}
   ${settingsSection}
-  ${view.languagesOpen ? '' : `<div class="board__cards">${cards}</div>`}
+  ${historyPanel}
+  ${view.languagesOpen || view.historyOpen ? '' : `<div class="board__cards">${cards}</div>`}
 </section>`;
 }

@@ -27,6 +27,12 @@ pub struct AppSettings {
     pub selection_enabled: bool,
     #[serde(default = "default_hotkey")]
     pub selection_hotkey: String,
+    /// 选区锚点图标：鼠标划词松手后弹出小图标。默认关闭，关闭时不注册任何全局监听。
+    #[serde(default)]
+    pub selection_anchor_enabled: bool,
+    /// 键盘选区兜底：注册键盘 Raw Input 与文本选区事件钩子（不记录键值）。默认关闭。
+    #[serde(default)]
+    pub selection_keyboard_fallback: bool,
     /// 开机自启（用户显式开启；便携包移动后启动时自动重写路径并提示）。
     #[serde(default)]
     pub autostart_enabled: bool,
@@ -52,7 +58,7 @@ pub struct AppSettings {
 }
 
 fn default_hotkey() -> String {
-    "Ctrl+Alt+B".into()
+    bead_core::DEFAULT_HOTKEY.into()
 }
 
 fn default_true() -> bool {
@@ -89,6 +95,8 @@ impl Default for AppSettings {
             languages: default_languages(),
             selection_enabled: false,
             selection_hotkey: default_hotkey(),
+            selection_anchor_enabled: false,
+            selection_keyboard_fallback: false,
             autostart_enabled: false,
             window_position: None,
             capsule_anchor: None,
@@ -147,6 +155,8 @@ mod tests {
             leave_grace_ms: 900,
             selection_enabled: true,
             selection_hotkey: "Ctrl+Alt+B".into(),
+            selection_anchor_enabled: true,
+            selection_keyboard_fallback: true,
             autostart_enabled: false,
             window_position: Some((100, 100)),
             capsule_anchor: Some((100, 100)),
@@ -168,6 +178,7 @@ mod tests {
         assert_eq!(loaded.auto_read_clipboard, false);
         assert_eq!(loaded.hover_delay_ms, 350);
         assert_eq!(loaded.provider.engine, bead_providers::Engine::Zhipu);
+        assert!(loaded.selection_keyboard_fallback);
         assert_eq!(loaded.provider.api_key, "key-1");
         assert_eq!(loaded.languages, vec!["zh".to_string(), "de".to_string()]);
         assert_eq!(loaded.capsule_anchor, Some((100, 100)));

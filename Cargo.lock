@@ -279,6 +279,7 @@ dependencies = [
  "tauri-plugin-autostart",
  "tauri-plugin-clipboard-manager",
  "tauri-plugin-single-instance",
+ "windows",
 ]
 
 [[package]]
