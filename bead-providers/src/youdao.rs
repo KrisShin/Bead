@@ -115,9 +115,6 @@ impl Translator for YoudaoProvider {
 mod tests {
     use super::*;
     use crate::signing::utc_parts;
-    use crate::transport::HttpResponse;
-    use bead_core::{Lang, SyncPlan};
-    use std::sync::{Arc, Mutex};
 
     #[test]
     fn the_input_is_truncated_per_the_v3_rule() {

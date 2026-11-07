@@ -226,12 +226,7 @@ mod tests {
 
     #[test]
     fn http_errors_surface_the_provider_body_as_the_error() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let transport = Box::new(FakeTransport {
-            captured: Arc::clone(&captured),
-            response: r#"{"error":"401 无效密钥"}"#.into(),
-        });
-        // 上面的 FakeTransport 恒返回 200；这里改用带状态码的变体
+        // FakeTransport 恒返回 200；这里用带状态码的变体校验错误正文。
         struct StatusTransport;
         impl Transport for StatusTransport {
             fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, ProviderError> {

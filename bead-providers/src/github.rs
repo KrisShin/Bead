@@ -49,9 +49,7 @@ impl bead_core::ReleaseFetcher for GitHubReleaseFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::HttpResponse;
     use bead_core::ReleaseFetcher;
-    use std::cell::RefCell;
     use std::sync::{Arc, Mutex};
 
     struct FakeTransport {
