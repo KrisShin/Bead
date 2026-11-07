@@ -405,19 +405,24 @@ fn resize_window(
         (app.get_webview_window("main"), capsule_shape_anchor(&app))
     {
         if expanded {
-            // 面板以胶囊为锚点向两侧张开：胶囊左缘在面板里固定 272px（整数），
-            // 因此胶囊在屏幕上的矩形在整个开合过程中都不动。
+            // 面板默认以胶囊为锚点向两侧张开：胶囊左缘在面板里固定 272px（整数）。
+            // 贴边时整块面板平移到可用区内，收起仍按锚点还原（胶囊态 left:0）。
             let width = {
                 let coordinator = state.coordinator.lock().expect("coordinator poisoned");
                 board_width(coordinator.pool().languages().len())
             };
-            set_window_geometry(
-                &window,
-                anchor.0 as f64 - CAPSULE_LEFT_IN_PANEL,
-                anchor.1 as f64,
-                width,
-                BOARD_WINDOW_HEIGHT,
-            );
+            // 边缘 clamp：胶囊贴近屏幕左右边缘时面板整体平移进可用区。胶囊在面板态
+            // 不可见（opacity:0 且被 board 盖住），收起仍按锚点还原，用户看不到它动。
+            let (left, top) = match monitor_work_area(&window) {
+                Some(area) => place_panel(
+                    (anchor.0 as f64, anchor.1 as f64),
+                    width,
+                    BOARD_WINDOW_HEIGHT,
+                    area,
+                ),
+                None => (anchor.0 as f64 - CAPSULE_LEFT_IN_PANEL, anchor.1 as f64),
+            };
+            set_window_geometry(&window, left, top, width, BOARD_WINDOW_HEIGHT);
         } else {
             // 这一帧内容 opacity 已是 0，但窗口还盖着桌面：先关掉命中测试，
             // 别让它在缩小的几毫秒里吃掉面板区域的点击。
@@ -598,6 +603,154 @@ fn monitor_top(window: &WebviewWindow) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// 显示器可用区（已扣除任务栏/停靠栏），逻辑坐标；与 `monitor_top` 同一套换算。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WorkArea {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+impl WorkArea {
+    /// 物理像素换算成逻辑坐标：与 `set_position` / `set_window_geometry` 用的是
+    /// 同一套「除以当前显示器 scale_factor」约定，DPI 150% 下也按逻辑像素比较。
+    fn from_physical(area: PhysicalArea, scale: f64) -> Self {
+        let scale = if scale > 0.0 { scale } else { 1.0 };
+        Self {
+            left: area.left as f64 / scale,
+            top: area.top as f64 / scale,
+            right: area.right as f64 / scale,
+            bottom: area.bottom as f64 / scale,
+        }
+    }
+}
+
+/// 物理像素矩形，只用于把 Monitor 的 work_area 转成纯数据，方便单测断言。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PhysicalArea {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+/// 单台显示器的可用区（按它自己的 scale_factor 折算成逻辑坐标）。
+fn monitor_area(monitor: &tauri::window::Monitor) -> WorkArea {
+    let area = monitor.work_area();
+    WorkArea::from_physical(
+        PhysicalArea {
+            left: area.position.x,
+            top: area.position.y,
+            right: area.position.x + area.size.width as i32,
+            bottom: area.position.y + area.size.height as i32,
+        },
+        monitor.scale_factor(),
+    )
+}
+
+/// 当前窗口所在显示器的可用区（面板只允许落在单台显示器内，用它）。
+fn monitor_work_area(window: &WebviewWindow) -> Option<WorkArea> {
+    window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| monitor_area(&monitor))
+}
+
+/// 虚拟桌面所有显示器可用区的横向并集（逻辑坐标）。
+///
+/// 拖动胶囊用它而不是「当前显示器」：否则胶囊会被本屏左右缘夹死，永远拖不到副屏。
+/// 单显示器时它就等于该显示器的可用区；多显示器时允许在屏间连续移动。
+/// DPI 混合时各屏按自己的 scale_factor 折算，与窗口坐标的现有换算约定一致。
+fn virtual_work_span(window: &WebviewWindow) -> Option<(f64, f64)> {
+    let monitors = window.available_monitors().ok()?;
+    let areas: Vec<WorkArea> = monitors.iter().map(monitor_area).collect();
+    union_span(&areas)
+}
+
+/// 多块显示器可用区的横向并集；单块时就是它自己。
+fn union_span(areas: &[WorkArea]) -> Option<(f64, f64)> {
+    areas.iter().fold(None, |span, area| {
+        Some(match span {
+            Some((left, right)) => (left.min(area.left), right.max(area.right)),
+            None => (area.left, area.right),
+        })
+    })
+}
+
+/// 胶囊拖动时的横向夹取：胶囊必须完整落在可用区横向范围内；范围比胶囊还窄时贴左缘。
+fn clamp_capsule_left(desired_left: f64, capsule_width: f64, span: (f64, f64)) -> f64 {
+    let (left, right) = span;
+    let max_left = (right - capsule_width).max(left);
+    desired_left.clamp(left, max_left)
+}
+
+/// 面板纵向夹取：面板完整落在可用区内；可用区比面板还矮时贴上缘。
+fn clamp_panel_top(desired_top: f64, panel_height: f64, area: WorkArea) -> f64 {
+    desired_top.clamp(area.top, (area.bottom - panel_height).max(area.top))
+}
+
+/// 面板窗口左上角：默认让胶囊落在面板的 272px 槽位（窗口左缘 = 锚点 - 272），
+/// 放不下时把整块面板平移到可用区内。
+///
+/// 胶囊在面板态是 `opacity: 0` 且被 board 完全盖住，平移面板不会让用户看到胶囊移动；
+/// 收起时窗口仍按锚点还原，胶囊出现在展开前的位置。因此「胶囊不动」与「面板完整可见」
+/// 在本实现里不冲突；唯一取舍是面板比可用区还宽时贴左缘、允许向右溢出。
+fn place_panel(
+    anchor: (f64, f64),
+    panel_width: f64,
+    panel_height: f64,
+    area: WorkArea,
+) -> (f64, f64) {
+    let left = (anchor.0 - CAPSULE_LEFT_IN_PANEL)
+        .clamp(area.left, (area.right - panel_width).max(area.left));
+    let top = clamp_panel_top(anchor.1, panel_height, area);
+    (left, top)
+}
+
+/// 面板窗口的目标矩形（逻辑坐标）。
+///
+/// 纯计算，不移动窗口：前端做卡片增删补间时，需要先知道「窗口最后落在哪」，
+/// 才能把内容的起点摆回旧屏幕矩形、并把补间终点对齐新窗口。真正的几何提交
+/// 仍然只发生在 `resize_window(true)` 与 `sync_panel_width` 里，保证每帧只有一次
+/// `SetWindowPos`；这里只是把同一套 `place_panel` 换算以只读形式暴露出去。
+#[derive(Serialize, Clone, Debug, PartialEq)]
+struct PanelFrame {
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+}
+
+fn panel_frame_at(anchor: (f64, f64), width: f64, area: Option<WorkArea>) -> PanelFrame {
+    let (left, top) = match area {
+        Some(area) => place_panel(anchor, width, BOARD_WINDOW_HEIGHT, area),
+        None => (anchor.0 - CAPSULE_LEFT_IN_PANEL, anchor.1),
+    };
+    PanelFrame {
+        left,
+        top,
+        width,
+        height: BOARD_WINDOW_HEIGHT,
+    }
+}
+
+/// 当前窗口矩形（逻辑坐标）。只用于 `panel_frame` 拿不到锚点时的退化返回，
+/// 让前端看到「宽度未变」而跳过补间 —— 与 `sync_panel_width` 在同一条件下
+/// 直接 no-op 的行为保持一致。
+fn current_window_frame(window: &WebviewWindow) -> Option<PanelFrame> {
+    let scale = window_scale(window);
+    let position = window.outer_position().ok()?;
+    let size = window.inner_size().ok()?;
+    Some(PanelFrame {
+        left: position.x as f64 / scale,
+        top: position.y as f64 / scale,
+        width: size.width as f64 / scale,
+        height: size.height as f64 / scale,
+    })
+}
+
 /// 去掉窗口的非客户区边框。
 ///
 /// Tauri 的无边框窗口在 Windows 上仍可能带 WS_BORDER/WS_DLGFRAME/WS_THICKFRAME
@@ -694,31 +847,14 @@ fn capsule_anchor(window: &WebviewWindow) -> Option<(i32, i32)> {
     Some((x.round() as i32, (outer.y as f64 / scale).round() as i32))
 }
 
-/// 拖动悬浮窗（无边框窗口没有系统标题栏）。start_dragging 会接管鼠标直到松开，
-/// 因此放在命令线程里执行，不占 UI 线程；松开后立刻记住新位置。
+/// 拖动悬浮窗（无边框窗口没有系统标题栏）。
 ///
-/// 胶囊自动吸附屏幕（显示器）上边缘：拖动只改变横向位置，纵坐标始终回到
-/// monitor_top()；setup 里的 WindowEvent::Moved 监听在拖动过程中就实时吸附。
+/// tao 的 `start_dragging` 只是 `PostMessageW(WM_NCLBUTTONDOWN, HTCAPTION)` 后立即返回，
+/// **不会**阻塞到松开，因此这里不能「拖完再记位置」：位置与锚点缓存全部由 setup 里的
+/// `WindowEvent::Moved` 监听维护（胶囊态夹 x 到可用区、贴显示器上缘并回写锚点）。
 #[tauri::command]
-fn start_drag(app: tauri::AppHandle, window: WebviewWindow) {
+fn start_drag(window: WebviewWindow) {
     let _ = window.start_dragging();
-    let scale = window_scale(&window);
-    let top = monitor_top(&window);
-    if let Ok(outer) = window.outer_position() {
-        let y = outer.y as f64 / scale;
-        if (y - top).abs() > 0.5 {
-            let _ = window.set_position(LogicalPosition::new(outer.x as f64 / scale, top));
-        }
-    }
-    if let Some(anchor) = capsule_anchor(&window) {
-        let state = app.state::<AppState>();
-        {
-            let mut settings = state.settings.lock().expect("settings poisoned");
-            settings.capsule_anchor = Some(anchor);
-            settings.window_position = Some(anchor);
-        }
-        persist(state.inner());
-    }
 }
 
 /// 前端自实现拖拽结束后保存窗口位置。
@@ -1285,7 +1421,9 @@ fn board_width(card_count: usize) -> f64 {
     BOARD_CHROME_WIDTH + CARD_WIDTH_IN_PANEL * count + CARD_GAP_IN_PANEL * (count - 1.0)
 }
 
-/// 面板开着时卡片数变了：前端在内容不可见的帧里调用此命令完成窗口尺寸同步。
+/// 面板开着时卡片数变了：前端在「窗口 / 内容」时序里调用此命令完成窗口尺寸同步。
+/// 加卡时内容已钉在旧宽、删卡时内容已收到新宽，因此这一次 `SetWindowPos`
+/// 的可见画面要么是等宽内容，要么只差一条透明边，不会露出中间帧。
 /// 窗口位置始终以胶囊为锚点（胶囊屏幕位置不动）。
 #[tauri::command]
 fn sync_panel_width(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> StateView {
@@ -1302,14 +1440,47 @@ fn sync_panel_width(app: tauri::AppHandle, state: tauri::State<'_, AppState>) ->
         let coordinator = state.coordinator.lock().expect("coordinator poisoned");
         board_width(coordinator.pool().languages().len())
     };
-    set_window_geometry(
-        &window,
-        anchor.0 as f64 - CAPSULE_LEFT_IN_PANEL,
-        anchor.1 as f64,
-        width,
-        BOARD_WINDOW_HEIGHT,
-    );
+    let (left, top) = match monitor_work_area(&window) {
+        Some(area) => place_panel(
+            (anchor.0 as f64, anchor.1 as f64),
+            width,
+            BOARD_WINDOW_HEIGHT,
+            area,
+        ),
+        None => (anchor.0 as f64 - CAPSULE_LEFT_IN_PANEL, anchor.1 as f64),
+    };
+    set_window_geometry(&window, left, top, width, BOARD_WINDOW_HEIGHT);
     snapshot(state.inner())
+}
+
+/// 只读查询面板窗口的目标矩形：不移动窗口、不改变任何状态。
+///
+/// 前端在卡片增删的那一帧用它拿到「新窗口最后落在哪」（left 是否因贴边 clamp
+/// 而平移），从而决定内容补间的起点与终点。几何契约与 `resize_window(true)` /
+/// `sync_panel_width` 完全一致：同一套锚点、同一套 `place_panel`、同一个
+/// `board_width(语言池计数)`。
+#[tauri::command]
+fn panel_frame(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> PanelFrame {
+    let width = {
+        let coordinator = state.coordinator.lock().expect("coordinator poisoned");
+        board_width(coordinator.pool().languages().len())
+    };
+    let Some(anchor) = capsule_shape_anchor(&app) else {
+        // 没有锚点（异常路径）：回当前窗口矩形，前端会判定「宽度未变」而跳过补间。
+        return app
+            .get_webview_window("main")
+            .and_then(|window| current_window_frame(&window))
+            .unwrap_or(PanelFrame {
+                left: 0.0,
+                top: 0.0,
+                width: 0.0,
+                height: 0.0,
+            });
+    };
+    let area = app
+        .get_webview_window("main")
+        .and_then(|window| monitor_work_area(&window));
+    panel_frame_at((anchor.0 as f64, anchor.1 as f64), width, area)
 }
 
 fn apply_language_pool(languages: &[String], app: &tauri::AppHandle, state: &AppState) {
@@ -1449,7 +1620,8 @@ fn main() {
             change_card_lang,
             reorder_cards,
             toggle_selection,
-            sync_panel_width
+            sync_panel_width,
+            panel_frame
         ])
         .setup(move |app| {
             // 初始就是胶囊大小：先剥掉 Windows 非客户区边框，再定尺寸与位置并显示，
@@ -1485,19 +1657,50 @@ fn main() {
                 });
             }
 
-            // 自动吸附显示器上边缘：拖动过程中一旦纵向偏移就立即拉回，
-            // 胶囊因此只能水平移动，始终紧贴屏幕顶部。
+            // 拖动全过程都走这里：胶囊态夹 x 进可用区、贴显示器上缘，并实时回写
+            // 锚点缓存；面板态只做纵向夹取。`start_dragging` 是 PostMessage 立即返回，
+            // 拖动结束没有单独回调，所以实时回写是锚点唯一的刷新路径。
+            let app_for_snap = app.handle().clone();
             let window_for_snap = window.clone();
             window.on_window_event(move |event| {
-                if let tauri::WindowEvent::Moved(pos) = event {
-                    let scale = window_scale(&window_for_snap);
-                    let top = monitor_top(&window_for_snap);
-                    let y = pos.y as f64 / scale;
-                    if (y - top).abs() > 0.5 {
-                        let x = pos.x as f64 / scale;
-                        let _ = window_for_snap.set_position(LogicalPosition::new(x, top));
+                let tauri::WindowEvent::Moved(pos) = event else {
+                    return;
+                };
+                let scale = window_scale(&window_for_snap);
+                let top = monitor_top(&window_for_snap);
+                let x = pos.x as f64 / scale;
+                let y = pos.y as f64 / scale;
+                let width = window_for_snap
+                    .inner_size()
+                    .map(|size| size.width as f64 / scale)
+                    .unwrap_or(CAPSULE_WINDOW_WIDTH);
+                if width > CAPSULE_WINDOW_WIDTH + 1.0 {
+                    // 面板态：只保证纵向落在当前显示器可用区。横向不能按「左缘 + 272」
+                    // 反推锚点——贴边 clamp 后面板 left 不再等于锚点 - 272，反推会带偏胶囊。
+                    let Some(area) = monitor_work_area(&window_for_snap) else {
+                        return;
+                    };
+                    let target_top = clamp_panel_top(y, BOARD_WINDOW_HEIGHT, area);
+                    if (target_top - y).abs() > 0.5 {
+                        let _ = window_for_snap.set_position(LogicalPosition::new(x, target_top));
                     }
+                    return;
                 }
+                // 胶囊态：夹回可用区（跨屏用并集，允许拖到副屏）并贴显示器上缘；
+                // 锚点跟随真实位置。
+                let Some(span) = virtual_work_span(&window_for_snap) else {
+                    return;
+                };
+                let target_left = clamp_capsule_left(x, CAPSULE_WINDOW_WIDTH, span);
+                if (target_left - x).abs() > 0.5 || (y - top).abs() > 0.5 {
+                    let _ = window_for_snap.set_position(LogicalPosition::new(target_left, top));
+                }
+                app_for_snap
+                    .state::<AppState>()
+                    .settings
+                    .lock()
+                    .expect("settings poisoned")
+                    .capsule_anchor = Some((target_left.round() as i32, top.round() as i32));
             });
 
             // 加载用户设置并应用：语言池、悬停延迟、引擎链（工单 05 持久化）。
@@ -1518,8 +1721,9 @@ fn main() {
                         .lock()
                         .expect("coordinator poisoned")
                         .replace_pool(pool);
-                    // 语言数不再影响窗口宽度（面板固定 613×300），这里不动窗口，
-                    // 否则会把用户拖过的锚点与当前形态冲掉。
+                    // 面板宽度跟随语言池计数，但这里不动窗口：展开时 resize_window
+                    // 会按当前计数提交，收起态改动等下次展开一起生效。
+                    // 现在直接改窗口会把用户拖过的锚点与当前形态冲掉。
                 }
                 *state.hover.lock().expect("hover state poisoned") =
                     HoverStateMachine::new(loaded.hover_delay_ms, loaded.leave_grace_ms);
@@ -1590,19 +1794,22 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("failed to build Bead")
         .run(|app_handle, event| {
-            // 位置记忆：退出时把胶囊锚点写进设置（与展开/收起形态无关）。
+            // 位置记忆：锚点由 Moved 监听维护，退出只需要落盘。
+            // 胶囊态再从窗口几何补一次兜底；展开态禁止反推——贴边 clamp 后
+            // 面板 left ≠ 锚点 - 272，反推会把记忆位置写歪。
             if matches!(event, tauri::RunEvent::Exit) {
+                let state = app_handle.state::<AppState>();
                 if let Some(window) = app_handle.get_webview_window("main") {
-                    let state = app_handle.state::<AppState>();
-                    if let Some(anchor) = capsule_anchor(&window) {
-                        {
-                            let mut settings = state.settings.lock().expect("settings poisoned");
+                    if !window_is_oversized(&window) {
+                        if let Some(anchor) = capsule_anchor(&window) {
+                            let mut settings =
+                                state.settings.lock().expect("settings poisoned");
                             settings.capsule_anchor = Some(anchor);
-                            settings.window_position = Some(anchor); // 旧字段保持同步，供旧构建回退
+                            settings.window_position = Some(anchor); // 旧字段保持同步
                         }
-                        persist(state.inner());
                     }
                 }
+                persist(state.inner());
             }
         });
 }
@@ -1649,4 +1856,194 @@ fn build_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> 
     })
     .build(app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    fn primary_1080p() -> WorkArea {
+        WorkArea {
+            left: 0.0,
+            top: 0.0,
+            right: 1920.0,
+            bottom: 1040.0,
+        }
+    }
+
+    fn primary_span() -> (f64, f64) {
+        (0.0, 1920.0)
+    }
+
+    #[test]
+    fn a_capsule_dragged_past_the_left_edge_stops_fully_visible() {
+        assert_eq!(clamp_capsule_left(-120.0, CAPSULE_WINDOW_WIDTH, primary_span()), 0.0);
+        assert_eq!(clamp_capsule_left(-1.0, CAPSULE_WINDOW_WIDTH, primary_span()), 0.0);
+    }
+
+    #[test]
+    fn a_capsule_dragged_past_the_right_edge_stops_fully_visible() {
+        assert_eq!(
+            clamp_capsule_left(1930.0, CAPSULE_WINDOW_WIDTH, primary_span()),
+            1920.0 - CAPSULE_WINDOW_WIDTH
+        );
+    }
+
+    #[test]
+    fn a_capsule_inside_the_work_area_is_not_nudged() {
+        assert_eq!(clamp_capsule_left(1000.0, CAPSULE_WINDOW_WIDTH, primary_span()), 1000.0);
+    }
+
+    #[test]
+    fn a_capsule_wider_than_the_work_area_pins_to_its_left_edge() {
+        assert_eq!(clamp_capsule_left(25.0, CAPSULE_WINDOW_WIDTH, (0.0, 40.0)), 0.0);
+    }
+
+    #[test]
+    fn a_capsule_near_the_left_edge_opens_a_panel_fully_inside_the_work_area() {
+        let (left, top) = place_panel((40.0, 0.0), 613.0, 300.0, primary_1080p());
+        assert_eq!(left, 0.0);
+        assert!(left + 613.0 <= primary_1080p().right);
+        assert_eq!(top, 0.0);
+    }
+
+    #[test]
+    fn a_capsule_near_the_right_edge_opens_a_panel_fully_inside_the_work_area() {
+        let (left, _) = place_panel((1900.0, 0.0), 613.0, 300.0, primary_1080p());
+        assert_eq!(left, 1920.0 - 613.0);
+        assert!(left + 613.0 <= primary_1080p().right);
+    }
+
+    #[test]
+    fn a_panel_that_fits_keeps_the_capsule_slot_centered() {
+        let (left, top) = place_panel((1000.0, 0.0), 613.0, 300.0, primary_1080p());
+        assert_eq!(left, 1000.0 - CAPSULE_LEFT_IN_PANEL);
+        assert_eq!(top, 0.0);
+    }
+
+    #[test]
+    fn a_panel_wider_than_the_work_area_pins_to_its_left_edge() {
+        let small = WorkArea {
+            left: 0.0,
+            top: 0.0,
+            right: 800.0,
+            bottom: 600.0,
+        };
+        let (left, _) = place_panel((500.0, 0.0), 1011.0, 300.0, small);
+        assert_eq!(left, 0.0);
+    }
+
+    #[test]
+    fn a_panel_frame_for_three_cards_matches_the_geometry_the_expand_commits() {
+        let frame = panel_frame_at((1000.0, 0.0), board_width(3), Some(primary_1080p()));
+        assert_eq!(frame.left, 1000.0 - CAPSULE_LEFT_IN_PANEL);
+        assert_eq!(frame.width, 613.0);
+        assert_eq!(frame.top, 0.0);
+        assert_eq!(frame.height, BOARD_WINDOW_HEIGHT);
+    }
+
+    #[test]
+    fn adding_a_fourth_card_keeps_the_right_edge_when_the_panel_is_docked_right() {
+        let before = panel_frame_at((1900.0, 0.0), board_width(3), Some(primary_1080p()));
+        let after = panel_frame_at((1900.0, 0.0), board_width(4), Some(primary_1080p()));
+        assert_eq!(before.left + before.width, 1920.0);
+        assert_eq!(after.left + after.width, 1920.0);
+        assert!(
+            after.left < before.left,
+            "a wider panel docked right must grow leftwards"
+        );
+    }
+
+    #[test]
+    fn panel_frames_follow_the_fixed_card_pitch_from_two_to_five_cards() {
+        let widths: Vec<f64> = (2..=5)
+            .map(|count| panel_frame_at((500.0, 0.0), board_width(count), Some(primary_1080p())).width)
+            .collect();
+        assert_eq!(widths, vec![414.0, 613.0, 812.0, 1011.0]);
+    }
+
+    #[test]
+    fn a_top_docked_taskbar_pushes_the_panel_below_it() {
+        let with_taskbar = WorkArea {
+            top: 48.0,
+            ..primary_1080p()
+        };
+        let (_, top) = place_panel((1000.0, 0.0), 613.0, 300.0, with_taskbar);
+        assert_eq!(top, 48.0);
+    }
+
+    #[test]
+    fn a_short_work_area_pins_the_panel_to_its_top() {
+        let short = WorkArea {
+            left: 0.0,
+            top: 0.0,
+            right: 1920.0,
+            bottom: 240.0,
+        };
+        assert_eq!(clamp_panel_top(0.0, BOARD_WINDOW_HEIGHT, short), 0.0);
+    }
+
+    #[test]
+    fn a_capsule_can_cross_into_the_second_monitor_and_stops_at_its_right_edge() {
+        // 双屏并排：可用区并集 [0, 3840]，1920 处不夹取（能拖过去），只在最右缘停住。
+        let span = union_span(&[primary_1080p(), WorkArea {
+            left: 1920.0,
+            top: 0.0,
+            right: 3840.0,
+            bottom: 1040.0,
+        }])
+        .expect("two monitors");
+        assert_eq!(span, (0.0, 3840.0));
+        assert_eq!(clamp_capsule_left(1900.0, CAPSULE_WINDOW_WIDTH, span), 1900.0);
+        assert_eq!(
+            clamp_capsule_left(3900.0, CAPSULE_WINDOW_WIDTH, span),
+            3840.0 - CAPSULE_WINDOW_WIDTH
+        );
+    }
+
+    #[test]
+    fn the_drag_span_unions_monitors_on_both_sides() {
+        let left_monitor = WorkArea {
+            left: -1920.0,
+            top: 0.0,
+            right: 0.0,
+            bottom: 1040.0,
+        };
+        assert_eq!(union_span(&[left_monitor, primary_1080p()]), Some((-1920.0, 1920.0)));
+        assert_eq!(clamp_capsule_left(-1900.0, CAPSULE_WINDOW_WIDTH, (-1920.0, 1920.0)), -1900.0);
+        assert_eq!(clamp_capsule_left(-1990.0, CAPSULE_WINDOW_WIDTH, (-1920.0, 1920.0)), -1920.0);
+    }
+
+    #[test]
+    fn a_panel_stays_on_the_monitor_under_the_capsule() {
+        // 副屏在右侧：面板不会横跨两块屏，贴副屏右缘收进 [1920, 3840] 内。
+        let secondary = WorkArea {
+            left: 1920.0,
+            top: 0.0,
+            right: 3840.0,
+            bottom: 1040.0,
+        };
+        let (left, _) = place_panel((3760.0, 0.0), 613.0, 300.0, secondary);
+        assert_eq!(left, 3840.0 - 613.0);
+        assert!(left >= secondary.left);
+    }
+
+    #[test]
+    fn a_scaled_work_area_is_compared_in_logical_pixels() {
+        // 2560×1440 物理、底部任务栏 60px、150% 缩放 → 逻辑可用区 1706.67×920。
+        let area = WorkArea::from_physical(
+            PhysicalArea {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1380,
+            },
+            1.5,
+        );
+        assert!((area.right - 1706.6667).abs() < 0.01);
+        assert!((area.bottom - 920.0).abs() < 0.01);
+        let span = union_span(&[area]).expect("single monitor");
+        let clamped = clamp_capsule_left(5000.0, CAPSULE_WINDOW_WIDTH, span);
+        assert!((clamped - (1706.6667 - CAPSULE_WINDOW_WIDTH)).abs() < 0.01);
+    }
 }
