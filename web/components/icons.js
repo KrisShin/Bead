@@ -75,10 +75,17 @@ export const ICONS = {
     <path d="M4.5 6l3.5 3.5L11.5 6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
   </svg>`,
 
-  // 划词翻译开关（AB 文字图标）
+  // 划词翻译开启：完整的 AB 字形。
   selection: `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M2.5 12V4M2.5 8h3.5a2 2 0 1 1 0 4H2.5M2.5 8h3.5a2 2 0 1 0 0-4H2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
     <path d="M9.5 12V5.5M9.5 5.5h3M9.5 9.5h2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`,
+
+  // 划词翻译关闭：同字形被一条对角斜线划断，形状本身即可区分两态。
+  selection_off: `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M2.5 12V4M2.5 8h3.5a2 2 0 1 1 0 4H2.5M2.5 8h3.5a2 2 0 1 0 0-4H2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+    <path d="M9.5 12V5.5M9.5 5.5h3M9.5 9.5h2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M12.9 3.1 3.1 12.9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
   </svg>`,
 };
 

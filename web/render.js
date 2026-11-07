@@ -125,7 +125,23 @@ export function renderBoard(view) {
     <span class="board__title">Bead</span>
     ${addBtn}
     <div class="board__actions">
-      ${HeadButton({ action: 'selection-toggle', iconName: 'selection', title: '划词翻译开关（功能待实现）', label: selectionOn ? '划词开' : '划词关' })}
+      ${HeadButton({
+        action: 'selection-toggle',
+        iconName: selectionOn ? 'selection' : 'selection_off',
+        label: selectionOn ? '划词翻译已开启（点击关闭）' : '划词翻译已关闭（点击开启）',
+        ariaLabel: '划词翻译',
+        pressed: Boolean(selectionOn),
+        className: 'icon-btn--selection',
+      })}
+      ${HeadButton({
+        action: 'history',
+        iconName: 'history',
+        title: '翻译历史',
+        ariaLabel: '翻译历史',
+        label: view.historyOpen ? '关闭翻译历史' : '翻译历史',
+        pressed: Boolean(view.historyOpen),
+        className: 'icon-btn--history',
+      })}
       ${view.update_latest ? `<button type="button" class="icon-btn" data-action="open-release" title="下载新版 ${escapeHtml(view.update_latest)}">${escapeHtml(view.update_latest)}</button>` : ''}
       ${HeadButton({ action: 'languages', iconName: 'settings', title: '设置', label: '设置' })}
       ${HeadButton({

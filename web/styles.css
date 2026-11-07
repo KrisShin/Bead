@@ -280,6 +280,35 @@ html, body {
   outline-offset: 2px;
 }
 
+/* 划词翻译开关：与锁定按钮共用一套状态语言——关闭 = 中性描边 + 带斜线的 AB；
+   开启 = 实底强调 + 完整 AB。底色差是扫一眼判断状态的主通道，图标形状是第二通道。 */
+.icon-btn--selection {
+  border: 1px solid transparent;
+  background: transparent;
+  color: #5a6778;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease,
+              transform 0.15s ease;
+}
+.icon-btn--selection:hover {
+  background: #eef1f6;
+  border-color: #dbe3ef;
+  color: var(--bead-primary);
+}
+.icon-btn--selection[aria-pressed='true'] {
+  background: var(--bead-primary);
+  border-color: var(--bead-primary);
+  color: #ffffff;
+}
+.icon-btn--selection[aria-pressed='true']:hover {
+  background: var(--bead-primary-soft);
+  border-color: var(--bead-primary-soft);
+  color: #ffffff;
+}
+.icon-btn--selection:focus-visible {
+  outline: 2px solid var(--bead-primary-soft);
+  outline-offset: 2px;
+}
+
 /* 翻译历史入口：与锁定 / 划词开关共用状态语言——关闭 = 中性描边；
    打开 = 实底强调（底色是第一通道，时钟图标形状是第二通道）。 */
 .icon-btn--history {
@@ -309,6 +338,12 @@ html, body {
   outline-offset: 2px;
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .icon-btn--selection {
+    transition-duration: 0.01ms;
+    animation-duration: 0.01ms;
+  }
+}
 
 /* 朗读中 / 在线兜底：在线角标必须可见，不能只靠 title 暗示。 */
 .icon-btn.is-speaking { color: var(--bead-primary); background: #e8eefc; }

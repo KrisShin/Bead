@@ -88,6 +88,31 @@ describe('board rendering', () => {
     expect(pin).not.toContain('4.8 0v2');
   });
 
+  it('shows a slashed AB icon and reports unpressed when selection is off', () => {
+    const toggle = renderBoard(expanded)
+      .match(/<button[^>]*data-action="selection-toggle"[\s\S]*?<\/button>/)?.[0];
+
+    // 原生 button + type=button：键盘可聚焦、可回车/空格触发。
+    expect(toggle).toMatch(/^<button type="button"/);
+    expect(toggle).toContain('class="icon-btn icon-btn--selection"');
+    expect(toggle).toContain('aria-pressed="false"');
+    expect(toggle).toContain('aria-label="划词翻译"');
+    expect(toggle).toContain('data-tooltip="划词翻译已关闭（点击开启）"');
+    // 关闭态：AB 字形被对角斜线划断，和开启态的完整 AB 形状不同。
+    expect(toggle).toContain('M12.9 3.1 3.1 12.9');
+  });
+
+  it('shows the full AB icon and reports pressed when selection is on', () => {
+    const toggle = renderBoard({ ...expanded, settings: { selection_enabled: true } })
+      .match(/<button[^>]*data-action="selection-toggle"[\s\S]*?<\/button>/)?.[0];
+
+    expect(toggle).toContain('class="icon-btn icon-btn--selection"');
+    expect(toggle).toContain('aria-pressed="true"');
+    expect(toggle).toContain('aria-label="划词翻译"');
+    expect(toggle).toContain('data-tooltip="划词翻译已开启（点击关闭）"');
+    expect(toggle).not.toContain('M12.9 3.1 3.1 12.9');
+  });
+
   it('offers a retry icon only on the errored card', () => {
     const html = renderBoard({
       ...expanded,
