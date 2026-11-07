@@ -10,6 +10,13 @@
 
 import { renderBoard } from './render.js';
 import { createPanelWidthTracker, flipOffsets, planPanelResize } from './panel-sync.js';
+import {
+  canStartCardDrag,
+  cardReorderDuration,
+  insertionSide,
+  orderChanged,
+  planCardReorder,
+} from './card-drag.js';
 import { createEditDebouncer, planEditingRefresh } from './edit-sync.js';
 import { Card, LangAutocomplete } from './components/index.js';
 
@@ -575,6 +582,17 @@ function draw(view) {
     // 收起优先：中断补间，直接走「内容先出、窗口后缩」。
     abortPanelResize();
   }
+  if (dragLang) {
+    if (view.view === 'expanded') {
+      // 拖动期间不整板重绘：节点顺序正被用户拖拽，替换 DOM 会打断 drag 并把顺序推回旧值。
+      lastView = view;
+      pendingDragView = view;
+      scheduleTick(view);
+      return;
+    }
+    // 面板要收起：放弃这次排序，继续走收起流程。
+    abortCardDrag();
+  }
   lastView = view;
   const expanded = view.view === 'expanded';
   const wasExpanded = root.dataset.view === 'expanded';
@@ -644,7 +662,7 @@ function onCapsuleTopEdge(event) {
 }
 
 function requestLeave() {
-  if (dragging) return;
+  if (dragging || dragLang) return; // 卡片拖拽中指针可能移出窗口，不按悬停离开处理
   window.clearTimeout(leaveTimer);
   leaveTimer = window.setTimeout(() => {
     leaveTimer = null;
@@ -829,61 +847,228 @@ root.addEventListener('change', async (event) => {
   patchCardsAfterLanguageChange(index, view, oldLang);
 });
 
-// --- 卡片拖拽排序：拖到目标卡片的左/右半区即插入对应位置，松手后顺序写回语言池 ---
+// --- 卡片拖拽排序 ---
+//
+// 只用 HTML5 拖拽重排，不碰窗口：start_drag 只由胶囊 / .board__head 的 mousedown 触发，
+// 卡片上的拖拽不会走进那条链路，Moved 与收起锚点逻辑都不参与。
+// 拖动中每次跨越目标卡只做「重排 DOM + FLIP」，松手才写回 Rust 的 reorder_cards；
+// 拖回原位不产生 IPC。源卡留在落位槽里当占位（虚线 + 半透明），拖影由系统跟随。
 let dragLang = null;
+let dragOriginOrder = [];
+let dragDropped = false;
+let pendingDragView = null;
+let dragStyleTimer = null;
+
+function cardElements() {
+  return [...boardHost.querySelectorAll('.card')];
+}
+
+function isEditingCard() {
+  return composing || document.activeElement?.matches?.('textarea.card__text') === true;
+}
+
+function setDropTarget(card, side) {
+  for (const el of cardElements()) {
+    el.classList.toggle('is-drop-before', el === card && side === 'before');
+    el.classList.toggle('is-drop-after', el === card && side === 'after');
+  }
+}
+
+function clearDropTargets() {
+  for (const el of cardElements()) el.classList.remove('is-drop-before', 'is-drop-after');
+}
+
+// 落点在卡片之间的空隙时，取水平距离最近的那张当落点。
+function nearestCard(clientX) {
+  let best = null;
+  let bestDistance = Infinity;
+  for (const card of cardElements()) {
+    const rect = card.getBoundingClientRect();
+    const distance =
+      clientX < rect.left ? rect.left - clientX : clientX > rect.right ? clientX - rect.right : 0;
+    if (distance < bestDistance) {
+      best = card;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
+// 按目标顺序重排现有节点（appendChild 只移动、不重建）：正在拖的卡与拖影都不会断。
+// 被拖的那张不参与 FLIP —— 它的视觉由系统拖影负责，源卡本身留在落位槽里当占位。
+function reorderDom(order, duration, excludeLang) {
+  const container = boardHost.querySelector('.board__cards');
+  if (!container) return;
+  const before = measureCards().filter((rect) => rect.lang !== excludeLang);
+  for (const lang of order) {
+    const el = container.querySelector(`.card[data-lang="${lang}"]`);
+    if (el) container.appendChild(el);
+  }
+  if (duration === 0) return; // reduced-motion：直接落位
+  const after = measureCards().filter((rect) => rect.lang !== excludeLang);
+  applyReorderFlip(before, after, duration);
+}
+
+function applyReorderFlip(beforeRects, afterRects, duration) {
+  const offsets = flipOffsets(beforeRects, afterRects);
+  const moved = [];
+  for (const { lang, dx, dy } of offsets) {
+    const card = boardHost.querySelector(`.card[data-lang="${lang}"]`);
+    if (!card) continue;
+    card.style.transition = 'none';
+    card.style.transform = `translate(${dx}px, ${dy}px)`;
+    moved.push(card);
+  }
+  if (!moved.length) return;
+  void moved[0].getBoundingClientRect(); // 提交反向位移
+  for (const card of moved) {
+    card.style.willChange = 'transform';
+    card.style.transition = `transform ${duration}ms ${PANEL_RESIZE_EASE}`;
+    card.style.transform = 'none';
+  }
+}
+
+function clearReorderStyles() {
+  if (dragStyleTimer) {
+    window.clearTimeout(dragStyleTimer);
+    dragStyleTimer = null;
+  }
+  clearDropTargets();
+  for (const card of cardElements()) {
+    card.classList.remove('is-dragging');
+    card.style.removeProperty('transition');
+    card.style.removeProperty('transform');
+    card.style.removeProperty('will-change');
+  }
+}
+
+function scheduleReorderStyleCleanup(duration) {
+  if (dragStyleTimer) window.clearTimeout(dragStyleTimer);
+  dragStyleTimer = window.setTimeout(() => {
+    dragStyleTimer = null;
+    clearReorderStyles();
+  }, duration + 40);
+}
+
+// 收起或状态被强制打断：放弃这次排序（DOM 会被下一次整板刷新覆盖），不发 IPC。
+function abortCardDrag() {
+  dragLang = null;
+  dragOriginOrder = [];
+  dragDropped = false;
+  pendingDragView = null;
+  clearReorderStyles();
+}
 
 root.addEventListener('dragstart', (event) => {
-  const card = targetOf(event)?.closest('.card');
-  if (root.dataset.view !== 'expanded' || !card) {
-    event.preventDefault();
-    return;
-  }
-  // 从文本、下拉或按钮上起拖属于控件操作，不算排序。
-  if (targetOf(event)?.closest('textarea, select, button, input, .card__close')) {
+  const target = targetOf(event);
+  const grip = target?.closest('.card__grip');
+  const card = target?.closest('.card');
+  const allowed =
+    !!card &&
+    !!grip &&
+    canStartCardDrag({
+      expanded: root.dataset.view === 'expanded',
+      editing: isEditingCard(),
+      onGrip: true,
+      // 展开 / 增删补间期间卡片自带 keyframes，FLIP 的 transform 会被覆盖。
+      busy:
+        phase !== 'shown' || panelAnimating || boardHost.dataset.cards !== 'settled',
+    });
+  if (!allowed) {
     event.preventDefault();
     return;
   }
   dragLang = card.dataset.lang;
-  event.dataTransfer.effectAllowed = 'move';
-  event.dataTransfer.setData('text/plain', dragLang);
-  card.style.opacity = '0.45';
+  dragOriginOrder = cardElements().map((el) => el.dataset.lang);
+  dragDropped = false;
+  pendingDragView = null;
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', dragLang);
+    // 从把手起拖，但拖影用整张卡；锚点按按下处相对卡片的偏移换算。
+    const rect = card.getBoundingClientRect();
+    event.dataTransfer.setDragImage(
+      card,
+      Math.round(event.clientX - rect.left),
+      Math.round(event.clientY - rect.top),
+    );
+  }
+  card.classList.add('is-dragging');
+  // 拖拽期间不按悬停离开收起：指针可能移出窗口，但这次操作归用户拖拽。
+  window.clearTimeout(leaveTimer);
+  leaveTimer = null;
 });
 
 root.addEventListener('dragover', (event) => {
   if (!dragLang) return;
-  const over = targetOf(event)?.closest('.card');
-  if (!over) return;
+  const target = targetOf(event);
+  let over = target?.closest('.card') ?? null;
+  if (!over) {
+    // 落在卡片之间的空隙：仍允许放置，按最近的一张算落点。
+    if (!target?.closest('.board__cards')) return;
+    over = nearestCard(event.clientX);
+    if (!over) return;
+  }
   event.preventDefault();
-  event.dataTransfer.dropEffect = 'move';
-  if (over.dataset.lang === dragLang) return;
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
   const moving = boardHost.querySelector(`.card[data-lang="${dragLang}"]`);
-  const container = over.parentElement;
-  if (!moving || !container) return;
-  // 卡片横向排列：落在目标卡左半边插到它前面，右半边插到它后面。
-  const rect = over.getBoundingClientRect();
-  const before = event.clientX < rect.left + rect.width / 2;
-  container.insertBefore(moving, before ? over : over.nextSibling);
+  if (!moving) return;
+  if (over === moving) {
+    clearDropTargets();
+    return;
+  }
+  const side = insertionSide(event.clientX, over.getBoundingClientRect());
+  setDropTarget(over, side);
+  const current = cardElements().map((el) => el.dataset.lang);
+  const next = planCardReorder(current, dragLang, over.dataset.lang, side);
+  if (!orderChanged(current, next)) return;
+  reorderDom(next, cardReorderDuration(prefersReducedMotion()), dragLang);
 });
 
 root.addEventListener('drop', (event) => {
   if (!dragLang) return;
-  event.preventDefault();
-  const order = [...boardHost.querySelectorAll('.card')].map((el) => el.dataset.lang);
-  const previous = lastView?.cards?.map((card) => card.lang) ?? [];
-  if (order.join('|') !== previous.join('|')) {
-    sendSilent('reorder_cards', { order }).then((view) => {
-      if (view) lastView = view;
-    });
-  }
+  event.preventDefault(); // 标记「在面板内松手」，真正的提交放在 dragend
+  dragDropped = true;
 });
 
 root.addEventListener('dragend', () => {
   if (!dragLang) return;
-  const el = boardHost.querySelector(`.card[data-lang="${dragLang}"]`);
-  if (el) el.style.removeProperty('opacity');
-  dragLang = null;
-  // 顺序已在 DOM 里落定；缓存作废，后续状态推送会按新顺序整板刷新。
-  lastBoardHtml = null;
+  const lang = dragLang;
+  const order = cardElements().map((el) => el.dataset.lang);
+  const dropped = dragDropped;
+  dragDropped = false;
+  dragLang = null; // 先解锁，下面 draw 才会真正应用快照
+  const duration = cardReorderDuration(prefersReducedMotion());
+  clearDropTargets();
+
+  if (!dropped) {
+    // 拖到面板外松手 = 取消：剩余卡按 FLIP 回到起拖时的顺序。
+    if (orderChanged(dragOriginOrder, order)) reorderDom(dragOriginOrder, duration, lang);
+    dragOriginOrder = [];
+    if (pendingDragView) {
+      const latest = pendingDragView;
+      pendingDragView = null;
+      draw(latest);
+    }
+    scheduleReorderStyleCleanup(duration);
+    return;
+  }
+
+  const changed = orderChanged(dragOriginOrder, order);
+  dragOriginOrder = [];
+  if (changed) {
+    sendSilent('reorder_cards', { order }).then((view) => {
+      if (!view) return;
+      lastView = view;
+      // 整板对齐 Rust 的新顺序；重绘顺带清掉 FLIP 的内联样式。
+      draw(view);
+    });
+  } else if (pendingDragView) {
+    const latest = pendingDragView;
+    pendingDragView = null;
+    draw(latest);
+  }
+  scheduleReorderStyleCleanup(duration);
 });
 
 async function closeCard(lang) {

@@ -151,6 +151,27 @@ html, body {
 #board-host .card.is-removing {
   animation: card-pop-out 0.28s cubic-bezier(0.55, 0, 0.68, 0.2) forwards;
 }
+/* 拖拽排序：源卡留在落位槽里当占位（虚线 + 半透明），拖影由系统跟随；
+   目标卡一侧画出插入线。沿用主色，不新增依赖。 */
+#board-host .card.is-dragging {
+  opacity: 0.45;
+  border-style: dashed;
+  border-color: #b9c6da;
+  background: #f6f9fe;
+}
+#board-host .card.is-drop-before::before,
+#board-host .card.is-drop-after::before {
+  content: '';
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--bead-primary-soft);
+  z-index: 4;
+}
+#board-host .card.is-drop-before::before { left: -6px; }
+#board-host .card.is-drop-after::before { right: -6px; }
 @keyframes bead-card-enter {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: none; }
