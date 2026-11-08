@@ -1,11 +1,10 @@
 name: test
 
 # 工单 01 只交付测试 job：不构建产物、不打包、不发版、不签名。
-# 只在推送 v* tag 时跑（普通分支 push 不跑），需要时用 workflow_dispatch 手动触发。
 on:
   push:
-    tags: ["v*"]
-  workflow_dispatch:
+    branches: [main, dev]
+  pull_request:
 
 jobs:
   rust-core:
