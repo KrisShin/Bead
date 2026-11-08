@@ -1,20 +1,17 @@
 name: release-windows
 
-# Windows 安装包发布流水线：Release 发布后构建 NSIS 安装器，并把产物挂到同一个 Release。
+# Windows 安装包发布流水线（本仓库现在只发 Windows）：Release 发布后构建 NSIS 安装器，
+# 连同 SHA256SUMS 一起挂到同一个 Release。
 #
 # 触发：
-#   - release: published —— 主路径。本仓库当前的习惯是打 tag（push tags: v*）后由 release.yml
-#     的 tauri-action 创建 Release（releaseDraft: false，创建即发布），所以「发布 Release」这一事件
-#     会被同样触发；若改成在网页上手动建 Release、tag 已存在，也能正常触发。
+#   - release: published —— 主路径。`gh release create <tag>` 或网页上建 Release 都会触发
+#     （workflow 文件必须存在于默认分支 main 上，否则该事件不生效）。
 #   - workflow_dispatch —— 手动试跑，必须填一个已存在的 Release tag，产物挂到该 Release。
-#
-# 与 release.yml 的关系：release.yml 在 tag push 时已构建四平台，并给同一个 Release 挂上 Windows
-# NSIS 安装器；本流程若重复构建同名产物，用 `gh release upload --clobber` 覆盖，不会失败。
-# 想省掉这次重复构建，从 release.yml 的 matrix 里删掉 `windows-latest` 一行即可（本次不改它）。
 #
 # 产物：只上传 tauri.conf.json `bundle.targets` 里 Windows 可用的 `nsis`
 # （Bead_<version>_x64-setup.exe）。dmg/app/deb/appimage 是 macOS/Linux 目标，Windows runner 不产出；
 # 配置里没有 zip bundle，因此不凭空生成便携 zip。
+# 校验和：原 release.yml 的 checksums job 随多平台流水线一起删除，这里就地生成同名 SHA256SUMS。
 # 红线：无签名步骤、无签名 secrets 分支、不做单文件 exe、不用 UPX。
 on:
   release:
@@ -76,7 +73,7 @@ jobs:
       - name: Build (tauri build)
         run: npx tauri build
 
-      - name: Upload installer to release
+      - name: Upload installer and checksums to release
         shell: pwsh
         env:
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
@@ -88,4 +85,12 @@ jobs:
           $assets | ForEach-Object {
             Write-Host ($_.Name + " (" + [math]::Round($_.Length / 1MB, 1) + " MB)")
           }
-          gh release upload $env:TAG $assets.FullName --clobber --repo $env:GITHUB_REPOSITORY
+
+          # sha256sum 兼容格式：小写哈希 + 两个空格 + 文件名；ASCII 编码避免 BOM。
+          $lines = $assets | ForEach-Object {
+            (Get-FileHash -Algorithm SHA256 -Path $_.FullName).Hash.ToLower() + "  " + $_.Name
+          }
+          $lines | Out-File -FilePath "SHA256SUMS" -Encoding ascii
+          Get-Content -Path "SHA256SUMS" | Write-Host
+
+          gh release upload $env:TAG $assets.FullName SHA256SUMS --clobber --repo $env:GITHUB_REPOSITORY
