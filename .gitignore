@@ -43,3 +43,5 @@ src-tauri/gen/schemas/
 # --- 工具产物（HTML 分享包等本地导出物）---
 .trae-html-share-packages/
 .screenshots/
+.trae/
+demo/translatewell.exe
