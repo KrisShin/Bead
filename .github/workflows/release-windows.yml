@@ -59,10 +59,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       # Windows runner 自带 WebView2 Runtime；构建不需要它，运行安装后的应用才需要。
-      # 缓存 cargo registry、git 依赖与 src-tauri/target，NSIS 工具链由 tauri-bundler 自行下载。
+      # 仓库根就是 workspace 根，默认缓存 . 下的 Cargo.lock 与 target/，NSIS 工具链由 tauri-bundler 自行下载。
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri -> target
           key: windows-nsis
 
       - name: Install frontend deps
@@ -79,7 +78,9 @@ jobs:
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $bundleDir = "src-tauri/target/release/bundle/nsis"
+          # 仓库根是 cargo workspace（members 含 src-tauri），产物落在 <根>/target，不是 src-tauri/target。
+          $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
+          $bundleDir = Join-Path $targetDir "release/bundle/nsis"
           $assets = @(Get-ChildItem -Path $bundleDir -Filter *.exe -File)
           if ($assets.Count -eq 0) { throw "未找到 NSIS 安装器：$bundleDir" }
           $assets | ForEach-Object {
