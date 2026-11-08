@@ -68,6 +68,10 @@ mod win {
         pub fn GetCurrentThreadId() -> u32;
         pub fn GetLastError() -> u32;
         pub fn keybd_event(vk: u8, scan: u8, flags: u32, extra: usize);
+        // 划词图标点开面板时把真实窗口焦点交给主窗口，并在收起时还回原应用。
+        pub fn GetForegroundWindow() -> isize;
+        pub fn SetForegroundWindow(hwnd: isize) -> i32;
+        pub fn IsWindow(hwnd: isize) -> i32;
     }
 
     pub const WM_HOTKEY: u32 = 0x0312;
@@ -242,7 +246,10 @@ fn apply_hotkey(app: &tauri::AppHandle, spec: &str) -> Option<String> {
     }
 }
 
-/// 取选中文本并送入：保存剪贴板 → 模拟 Ctrl+C → 读 → 恢复 → 过滤 → 翻译。
+/// 取选中文本并送入：保存剪贴板 → 模拟 Ctrl+C → 读 → 恢复 → 过滤 → 展开并移交焦点 → 翻译。
+///
+/// 焦点在剪贴板读取与恢复之后、面板确定展开时才移交：提前抢焦点会让源应用丢掉选区，
+/// 注入的 Ctrl+C 就复制不到东西。
 #[cfg(windows)]
 fn capture_and_translate(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
@@ -275,6 +282,11 @@ return;
         .lock()
         .expect("hover state poisoned")
         .transition(HoverEvent::SelectionCaptured);
+    // 取词与剪贴板恢复都已完成、面板确定要展开，这时才移交真实窗口焦点：
+    // 面板有焦点就不会在 leave_grace_ms 后按「失焦」收起，与图标点击路径一致。
+    // 记录必须在切焦点之前做，否则读到的会是本应用自己；收起时再还回源应用。
+    record_focus_return(app, state.inner());
+    focus_main_panel(app);
     let engine = engine_fingerprint(
         &state.provider_config.lock().expect("provider config poisoned"),
     );
@@ -866,6 +878,10 @@ struct AppState {
     /// 自动划词连续失败时给设置页的降级提示（热键兜底）；自动识别成功后清除。
     #[cfg(windows)]
     selection_unsupported_hint: Mutex<Option<String>>,
+    /// 点开划词面板前的原前台窗口句柄：面板收起时若焦点仍在本应用，还给这个窗口。
+    /// 用户如果已经点了别的应用，前台不再是本窗口，收起时不会抢回焦点（见 restore_focus）。
+    #[cfg(windows)]
+    focus_return: Mutex<Option<isize>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -2147,6 +2163,11 @@ fn dispatch(
         .transition(event);
     consume(actions, app, state, force_refresh);
     let view = snapshot(state);
+    // 真正回到胶囊的那一次：把焦点还给点开面板前的应用（仅当焦点仍由本应用持有、
+    // 且目标窗口还在；用户已点了别的应用则保持现状，不抢焦点）。
+    if view.view == "capsule" {
+        restore_focus(app, state);
+    }
     // 面板不可见（收起/ESC/点外部/锁定解除）时停止朗读；锁定与拖卡不会走到这里。
     if view.view != "expanded" && view.view != "hover_pending" {
         state.speech.stop(app, "panel_hidden");
@@ -2946,9 +2967,91 @@ persist(state.inner());
     snapshot(state.inner())
 }
 
+/// 划词图标点击之后，把真实窗口焦点交给主面板。
+///
+/// 点击落在 `WS_EX_NOACTIVATE` 的图标窗口上，原应用仍持有前台焦点；面板若一直没焦点，
+/// 用户切走或点外部后前端就只能靠失焦收起。这里主动激活主窗口，面板即处于「有焦点」态，
+/// 不需要为图标窗口另立例外规则，卡片输入框也能直接接收键盘。
+///
+/// 调用点在图标 WebView 的点击已经派发、待确认文本已经消费之后，避免抢走那一下点击；
+/// 激活失败时退回 Tauri 的 `set_focus` 结果即可，图标窗口已隐藏，不会产生可见抖动。
+fn focus_main_panel(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let _ = window.set_focus();
+    #[cfg(windows)]
+    {
+        // `set_focus` 在 Windows 上最终就是 SetForegroundWindow；若被前台规则拒绝，
+        // 用窗口句柄补一次（点击输入发生在本进程的顶层窗口上，允许切前台）。
+        if let Ok(hwnd) = window.hwnd() {
+            let raw = hwnd.0 as isize;
+            unsafe {
+                if win::GetForegroundWindow() != raw {
+                    win::SetForegroundWindow(raw);
+                }
+            }
+        }
+    }
+}
+
+/// 收起时要还原的目标窗口：只记「别的应用」。前台已是本应用自己的窗口时没有可还原的目标。
+#[cfg(windows)]
+fn focus_return_target(foreground: isize, main: isize) -> Option<isize> {
+    (foreground != 0 && foreground != main).then_some(foreground)
+}
+
+/// 在切换焦点之前记下当前前台窗口（通常是源应用），供收起时还原。
+///
+/// 必须在 `focus_main_panel` 之前调用：焦点一旦切走，这里读到的就是本应用自己。
+#[cfg(windows)]
+fn record_focus_return(app: &tauri::AppHandle, state: &AppState) {
+    let main = app
+        .get_webview_window("main")
+        .and_then(|window| window.hwnd().ok())
+        .map(|hwnd| hwnd.0 as isize)
+        .unwrap_or(0);
+    let foreground = unsafe { win::GetForegroundWindow() };
+    *state.focus_return.lock().expect("focus return poisoned") =
+        focus_return_target(foreground, main);
+}
+
+/// 面板收起时把焦点还给点开面板前的应用。
+///
+/// 只在「焦点仍在主面板」时还原：用户若是点了别的应用才触发收起，前台已经是那个应用，
+/// 这里直接放弃，绝不把焦点从用户正在用的窗口抢回来。目标窗口已关闭同样不再还原。
+#[cfg(windows)]
+fn restore_focus(app: &tauri::AppHandle, state: &AppState) {
+    let target = state
+        .focus_return
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    let Some(target) = target else {
+        return;
+    };
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let main = hwnd.0 as isize;
+    unsafe {
+        if win::GetForegroundWindow() != main || win::IsWindow(target) == 0 {
+            return;
+        }
+        win::SetForegroundWindow(target);
+    }
+}
+
+#[cfg(not(windows))]
+fn restore_focus(_app: &tauri::AppHandle, _state: &AppState) {}
+
 /// 选区图标点击：消费待确认文本，走与热键取词相同的展开与翻译链路。
 ///
-/// 点击落在 NOACTIVATE 图标窗口上，原应用保持前台焦点、选区高亮不丢；
+/// 图标本身是 `WS_EX_NOACTIVATE`，点击时原应用短暂保持前台；文本消费成功后由
+/// `focus_main_panel` 把焦点交给主面板，之后面板不再受「窗口失焦」收起逻辑影响。
 /// 文本可能是 UIA 快照，也可能来自 UIA 失败后的剪贴板兜底（兜底已在检测阶段
 /// 恢复剪贴板），**点击本身不读写剪贴板**。
 #[tauri::command]
@@ -3015,6 +3118,11 @@ fn anchor_click(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Opt
     }
     #[cfg(windows)]
     diag.click_consumed.fetch_add(1, Ordering::Relaxed);
+    // 文本已消费、图标已隐藏，此时再切前台：不会吞掉那一下点击，也不会让图标抖动。
+    // 同时记下此刻的前台窗口，收起时若焦点仍在本应用就还给它。
+    #[cfg(windows)]
+    record_focus_return(&app, state.inner());
+    focus_main_panel(&app);
     state
         .hover
         .lock()
@@ -3241,6 +3349,8 @@ fn main() {
             selection_diag: Arc::new(selection_watch::SelectionDiagnostics::default()),
             #[cfg(windows)]
             selection_unsupported_hint: Mutex::new(None),
+            #[cfg(windows)]
+            focus_return: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
@@ -3766,5 +3876,17 @@ mod chain_epoch_tests {
     fn the_latest_batch_proceeds_even_if_it_waited_on_the_chain_lock() {
         assert!(!locked_work_is_stale(3, 3));
         assert!(!locked_work_is_stale(0, 0));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod focus_return_tests {
+    use super::*;
+
+    #[test]
+    fn a_focus_return_target_is_only_remembered_when_another_window_owns_the_foreground() {
+        assert_eq!(focus_return_target(0x11, 0x22), Some(0x11));
+        assert_eq!(focus_return_target(0, 0x22), None);
+        assert_eq!(focus_return_target(0x22, 0x22), None);
     }
 }
