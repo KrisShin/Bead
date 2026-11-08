@@ -517,6 +517,51 @@ impl<C: Clock> SyncCoordinator<C> {
             created_at_ms: self.clock.now_ms(),
         })
     }
+
+    /// 面板打开且没有新内容时，仅用于展示的历史回填。
+    ///
+    /// 与 `restore_history` 的区别：这里不产出 `SyncPlan`，缺失的目标语言保持空卡（Idle），
+    /// 不会因为「打开面板」就静默发起网络请求；已有旧内容整块丢弃，避免展示上一次的残留。
+    /// 返回是否真的写入了面板：空文本或空译文不写，让调用方保留空态。
+    pub fn preview_history(
+        &mut self,
+        source_lang: &Lang,
+        source_text: &str,
+        translations: &BTreeMap<Lang, String>,
+    ) -> bool {
+        if source_text.is_empty() || translations.is_empty() {
+            return false;
+        }
+        self.document.clear();
+        self.last_clipboard_hash = None;
+        self.generation += 1;
+
+        let source_in_pool = self.pool.contains(source_lang);
+        if source_in_pool {
+            let _ = self.document.set_text(source_lang, source_text.to_string());
+            let _ = self.document.set_status(source_lang, SlotStatus::Idle);
+            let _ = self.document.set_authoritative(source_lang);
+        }
+        let candidates: Vec<Lang> = if source_in_pool {
+            self.pool
+                .languages()
+                .iter()
+                .filter(|lang| lang != &source_lang)
+                .cloned()
+                .collect()
+        } else {
+            self.pool.languages().to_vec()
+        };
+        let mut wrote = source_in_pool;
+        for lang in candidates {
+            if let Some(text) = translations.get(&lang) {
+                let _ = self.document.set_text(&lang, text.clone());
+                let _ = self.document.set_status(&lang, SlotStatus::Idle);
+                wrote = true;
+            }
+        }
+        wrote
+    }
 }
 
 #[cfg(test)]
@@ -1081,6 +1126,59 @@ mod tests {
         assert_eq!(
             coordinator.document().slot(&Lang::new("ja")).unwrap().status,
             SlotStatus::Idle
+        );
+    }
+
+    #[test]
+    fn history_preview_shows_available_targets_without_requesting_the_missing_ones() {
+        let mut coordinator = coordinator(&["zh", "en", "ja"]);
+        let translations: BTreeMap<Lang, String> =
+            [(Lang::new("en"), "[en] 你好".to_string())].into_iter().collect();
+
+        assert!(coordinator.preview_history(&Lang::new("zh"), "你好", &translations));
+
+        assert_eq!(
+            coordinator.document().slot(&Lang::new("zh")).unwrap().text,
+            "你好"
+        );
+        assert_eq!(
+            coordinator.document().slot(&Lang::new("en")).unwrap().text,
+            "[en] 你好"
+        );
+        let ja = coordinator.document().slot(&Lang::new("ja")).unwrap();
+        assert_eq!(ja.text, "");
+        // 打开面板只是展示，缺语言的卡保持 Idle，不静默发起补翻。
+        assert_eq!(ja.status, SlotStatus::Idle);
+    }
+
+    #[test]
+    fn history_preview_discards_the_previous_document_instead_of_keeping_stale_cards() {
+        let mut coordinator = coordinator(&["zh", "en", "ja"]);
+        coordinator.commit(&Lang::new("zh"), "旧内容").unwrap();
+        let translations: BTreeMap<Lang, String> = [
+            (Lang::new("en"), "[en] 历史".to_string()),
+            (Lang::new("ja"), "[ja] 历史".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(coordinator.preview_history(&Lang::new("zh"), "历史", &translations));
+
+        assert_eq!(
+            coordinator.document().slot(&Lang::new("zh")).unwrap().text,
+            "历史"
+        );
+        assert_eq!(
+            coordinator.document().slot(&Lang::new("en")).unwrap().text,
+            "[en] 历史"
+        );
+        assert_eq!(
+            coordinator.document().slot(&Lang::new("ja")).unwrap().text,
+            "[ja] 历史"
+        );
+        assert_eq!(
+            coordinator.document().authoritative(),
+            Some(&Lang::new("zh"))
         );
     }
 }

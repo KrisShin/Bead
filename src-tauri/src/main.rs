@@ -950,7 +950,7 @@ fn status_name(status: SlotStatus) -> &'static str {
 
 fn snapshot(state: &AppState) -> StateView {
     let hover = state.hover.lock().expect("hover state poisoned");
-    let coordinator = state.coordinator.lock().expect("coordinator poisoned");
+    let mut coordinator = state.coordinator.lock().expect("coordinator poisoned");
     let hover_state = hover.state();
     let (view, locked) = match hover_state {
         HoverState::Idle => ("capsule", false),
@@ -958,6 +958,10 @@ fn snapshot(state: &AppState) -> StateView {
         HoverState::Expanded { locked, .. } => ("expanded", locked),
         HoverState::Collapsing { .. } => ("collapsing", false),
     };
+    // 面板展开但还没有新识别结果时，用最近一条历史填充；有在途翻译或已有新结果时不动。
+    if view == "expanded" {
+        preview_latest_history(&mut coordinator, state);
+    }
     let authoritative = coordinator.document().authoritative();
     // 卡片顺序跟着语言池的槽位顺序走，而不是按语言 code 排序：
     // 改某张卡的语言只替换该槽位，卡片不会因为字母顺序变化而换位置。
@@ -1014,6 +1018,41 @@ fn snapshot(state: &AppState) -> StateView {
         },
         update_latest: state.update_latest.lock().expect("update poisoned").clone(),
     }
+}
+
+/// 面板打开且既没有新识别结果、也没有在途请求时，用最近一条历史填充面板。
+///
+/// 只在 `snapshot` 内同步执行：不读剪贴板、不发网络请求、不碰 hover 计时；
+/// 新内容一旦提交（`authoritative` 出现）或进入翻译（`Syncing`），这里就不再介入。
+fn preview_latest_history(coordinator: &mut SyncCoordinator<SystemClock>, state: &AppState) {
+    let has_new_content = coordinator.document().authoritative().is_some()
+        || coordinator
+            .document()
+            .slots()
+            .any(|(_, slot)| !slot.text.is_empty() || slot.status == SlotStatus::Syncing);
+    if has_new_content {
+        return;
+    }
+    let Some(entry) = state
+        .history
+        .lock()
+        .expect("history poisoned")
+        .entries()
+        .first()
+        .cloned()
+    else {
+        return;
+    };
+    let translations: BTreeMap<Lang, String> = entry
+        .translations
+        .iter()
+        .map(|(code, text)| (Lang::new(code.as_str()), text.clone()))
+        .collect();
+    coordinator.preview_history(
+        &Lang::new(entry.source_lang.as_str()),
+        &entry.source_text,
+        &translations,
+    );
 }
 
 /// 启动时异步检查（不阻塞启动）；手动检查同步返回结果。失败一律静默。
