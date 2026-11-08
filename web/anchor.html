@@ -10,9 +10,7 @@
   <!-- 独立小窗：只做一件事——点击后把 Rust 暂存的选区文本送进翻译链。
        窗口本身是 NOACTIVATE + 置顶 + 无边框，点击不会抢走原应用焦点。 -->
   <button id="anchor" type="button" aria-label="翻译选中的文本" title="翻译选中文本">
-    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-      <path d="M12.87 15.07l-2.54-2.51.03-.03A17.52 17.52 0 0 0 14.07 6H17V4h-7v2h1.89c-.33 1.22-1.09 2.35-2.16 3.24C8.16 6.88 6.28 5.72 5.6 5.72H3.75v2c1.04 0 2.7 1.28 4.57 2.41-1.54 1.2-3.35 2.2-4.52 2.7l.76 1.8c1.3-.56 3.33-1.63 5.02-3.06l2.12 2.1 1.17-1.2zM18.5 10.73h-2l-4.45 10h2l.92-2.25h4.6l.92 2.25h2l-4.5-10zm-2.62 5.98l1.62-4.42 1.62 4.42h-3.24z" />
-    </svg>
+    <img src="./assets/tray-icon.png" alt="" draggable="false" />
   </button>
   <script>
     const invoke = window.__TAURI__?.core?.invoke;

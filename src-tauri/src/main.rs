@@ -3635,7 +3635,7 @@ fn main() {
                     run_update_check(state.inner());
                 });
             }
-            // 托盘：设置 / 显隐胶囊 / 退出（工单 08）。
+            // 托盘：显隐胶囊 / 退出（工单 08）。
             build_tray(app.handle())?;
             // Wayland 能力提示：定位/置顶受限是协议限制（立项调研已记录），明确告知不静默。
             #[cfg(target_os = "linux")]
@@ -3668,15 +3668,14 @@ fn main() {
         });
 }
 
-/// 托盘菜单：设置（显示并展开面板开关）、显隐胶囊、退出。
+/// 托盘菜单：显隐胶囊、退出。
 fn build_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     use tauri::menu::{Menu, MenuItem};
     use tauri::tray::TrayIconBuilder;
 
     let toggle = MenuItem::with_id(app, "toggle", "显示 / 隐藏胶囊", true, None::<&str>)?;
-    let settings_item = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&toggle, &settings_item, &quit])?;
+    let menu = Menu::with_items(app, &[&toggle, &quit])?;
 
     let mut tray = TrayIconBuilder::with_id("bead-tray")
         .menu(&menu)
@@ -3696,12 +3695,6 @@ fn build_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> 
                         let _ = window.show();
                         let _ = window.set_focus();
                     }
-                }
-            }
-            "settings" => {
-                if let Some(window) = &window {
-                    let _ = window.show();
-                    let _ = window.set_focus();
                 }
             }
             "quit" => app.exit(0),

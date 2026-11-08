@@ -712,9 +712,9 @@ function requestEnter() {
 }
 
 // 展开不再由「鼠标进入窗口」触发：必须同时满足
-//   1) 悬停在胶囊上；2) 光标纵坐标贴近胶囊顶端 2px 以内。
+//   1) 悬停在胶囊上；2) 光标纵坐标贴近胶囊顶端 10px 以内。
 // 这样鼠标只是路过胶囊中下部（或贴边滑过）不会弹出面板。
-const CAPSULE_TRIGGER_Y = 2;
+const CAPSULE_TRIGGER_Y = 10;
 let edgeArmed = false;
 
 function onCapsuleTopEdge(event) {
@@ -1486,7 +1486,7 @@ root.addEventListener('mousemove', (event) => {
     return;
   }
   if (!onCapsuleTopEdge(event)) {
-    // 还没长开就离开顶端 2px：撤销这次待展开（force 跳过 Rust 的光标复核）
+    // 还没长开就离开顶端 10px：撤销这次待展开（force 跳过 Rust 的光标复核）
     if (edgeArmed) {
       edgeArmed = false;
       if (root.dataset.view === 'hover_pending') {
