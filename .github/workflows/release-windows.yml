@@ -1,0 +1,91 @@
+name: release-windows
+
+# Windows 安装包发布流水线：Release 发布后构建 NSIS 安装器，并把产物挂到同一个 Release。
+#
+# 触发：
+#   - release: published —— 主路径。本仓库当前的习惯是打 tag（push tags: v*）后由 release.yml
+#     的 tauri-action 创建 Release（releaseDraft: false，创建即发布），所以「发布 Release」这一事件
+#     会被同样触发；若改成在网页上手动建 Release、tag 已存在，也能正常触发。
+#   - workflow_dispatch —— 手动试跑，必须填一个已存在的 Release tag，产物挂到该 Release。
+#
+# 与 release.yml 的关系：release.yml 在 tag push 时已构建四平台，并给同一个 Release 挂上 Windows
+# NSIS 安装器；本流程若重复构建同名产物，用 `gh release upload --clobber` 覆盖，不会失败。
+# 想省掉这次重复构建，从 release.yml 的 matrix 里删掉 `windows-latest` 一行即可（本次不改它）。
+#
+# 产物：只上传 tauri.conf.json `bundle.targets` 里 Windows 可用的 `nsis`
+# （Bead_<version>_x64-setup.exe）。dmg/app/deb/appimage 是 macOS/Linux 目标，Windows runner 不产出；
+# 配置里没有 zip bundle，因此不凭空生成便携 zip。
+# 红线：无签名步骤、无签名 secrets 分支、不做单文件 exe、不用 UPX。
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要上传产物的 Release tag（必须已存在，例如 v0.1.0）"
+        required: true
+
+# 上传 Release 资产需要写权限；GITHUB_TOKEN 由本 workflow 声明后再使用。
+permissions:
+  contents: write
+
+# 同一 tag 的发布构建串行执行；手动重跑时不取消已开始的构建，避免半截上传。
+concurrency:
+  group: release-windows-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: windows nsis
+    runs-on: windows-latest
+    steps:
+      # release 事件默认 checkout 触发它的 tag；手动触发时显式 checkout 填写的 tag。
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      # 先确认 Release 真实存在，避免后续把产物传到一个不存在的 tag（也避免误建新 Release）。
+      - name: Verify release exists
+        shell: pwsh
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release view $env:TAG --repo $env:GITHUB_REPOSITORY | Out-Null
+
+      # 前端是原生 JS（frontendDist 直接指向 ../web），没有打包步骤；装依赖只为拿到 @tauri-apps/cli。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Windows runner 自带 WebView2 Runtime；构建不需要它，运行安装后的应用才需要。
+      # 缓存 cargo registry、git 依赖与 src-tauri/target，NSIS 工具链由 tauri-bundler 自行下载。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: windows-nsis
+
+      - name: Install frontend deps
+        run: npm ci --no-audit --no-fund
+
+      # 不指定 --bundles：由 tauri.conf.json 的 bundle.targets 决定，Windows 上只会产出 nsis 安装器
+      # 与裸 exe（target/release/bead.exe，目录形态便携可用）。
+      - name: Build (tauri build)
+        run: npx tauri build
+
+      - name: Upload installer to release
+        shell: pwsh
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $bundleDir = "src-tauri/target/release/bundle/nsis"
+          $assets = @(Get-ChildItem -Path $bundleDir -Filter *.exe -File)
+          if ($assets.Count -eq 0) { throw "未找到 NSIS 安装器：$bundleDir" }
+          $assets | ForEach-Object {
+            Write-Host ($_.Name + " (" + [math]::Round($_.Length / 1MB, 1) + " MB)")
+          }
+          gh release upload $env:TAG $assets.FullName --clobber --repo $env:GITHUB_REPOSITORY

@@ -1,6 +1,7 @@
 name: release
 
-# 工单 10：tag 触发四平台构建并上传 Release。
+# 工单 10：tag 触发 macOS / Linux / Arch 构建并上传 Release。
+# Windows 安装包由 release-windows.yml 在 Release 发布后构建，避免同一 Release 重复构建同一产物。
 # 红线：无签名步骤、无签名 secrets、无公证脚本；不做单文件 exe、不用 UPX；
 # 便携包为目录形态。SHA256SUMS 由 checksums job 生成并附加。
 on:
@@ -16,7 +17,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: windows-latest # NSIS 安装器 + zip 目录形态
           - platform: macos-latest # dmg + .app zip（aarch64）
           - platform: ubuntu-latest # deb + AppImage + tar.gz
     runs-on: ${{ matrix.platform }}
