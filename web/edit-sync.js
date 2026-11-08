@@ -49,6 +49,10 @@ export function createEditDebouncer({
       for (const handle of timers.values()) clearTimer(handle);
       timers.clear();
     },
+    // 是否有任何语言还有未到期的提交：失焦收起要在这段时间内保持面板打开。
+    hasPending() {
+      return timers.size > 0;
+    },
   };
 }
 

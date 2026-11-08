@@ -39,6 +39,14 @@ let pendingTick = null;
 let pendingTickKind = null;
 let leaveTimer = null;
 let composing = false;
+// 失焦收起：窗口是否仍有焦点、指针是否在面板（=展开后的整个窗口）内。
+// 只有「未锁定 + 失焦 + 指针在外」才在 leave_grace_ms 后复用 hover_leave 收起。
+let windowFocused = true;
+let pointerInsideWindow = false;
+let focusCollapseTimer = null;
+// 每段失焦只主动发一次 hover_leave：万一 Rust 因编辑态忽略这次离开，
+// 不能每 800ms 重发一次 IPC（等 focusout / compositionend / 重新失焦再放行）。
+let focusCollapseSent = false;
 // 点「清空」会先让正在编辑的卡片失焦；这个窗口内的 blur 不得把旧文本再提交回去。
 let suppressCommit = false;
 let lastBoardHtml = null;
@@ -510,6 +518,8 @@ async function beginExpand(view) {
   boardHost.dataset.cards = 'enter'; // 这一帧同时让 board transition 和 card animation 起跑
   boardHost.dataset.visible = 'true';
   setPhase('shown');
+  // 展开动画落定后再评估：进入过程中不参与失焦收起。
+  evaluateFocusCollapse();
   // 展开这一次 resize_window 已按语言池实时计数提交了宽度：把当前卡片数写成基线，
   // 否则展开后的第一次增删会被 observe 当成基线记录吞掉，窗口不跟随。
   panelWidthTracker.prime(view.cards?.length ?? 0);
@@ -606,6 +616,7 @@ function reverseExpansion() {
     if (token !== phaseSeq || phase !== 'reversing') return;
     setPhase('shown');
     boardHost.removeAttribute('data-motion');
+    evaluateFocusCollapse(); // 反向补间落定后，按当前焦点/指针再评估一次
     if (pendingView) {
       const latest = pendingView;
       pendingView = null;
@@ -688,6 +699,8 @@ function draw(view) {
     beginCollapse();
   }
   scheduleTick(view);
+  // 视图变化会改变收起条件（翻译结束、锁定切换、面板已收起）：重新评估失焦收起。
+  evaluateFocusCollapse();
 }
 
 function requestEnter() {
@@ -719,6 +732,37 @@ function requestLeave() {
     leaveTimer = null;
     if (!dragging) send('hover_leave'); // Rust 会复核光标是否真的在窗口外
   }, LEAVE_DEBOUNCE_MS);
+}
+
+// --- 失焦收起 ---
+// 用户实测缺口：卡片编辑中指针先离开（hover_leave 被编辑态拦下），随后点击别的
+// 窗口，edit_end 之后没有任何计时再挂上，面板就一直开着。
+// 这里只负责「什么时候发 hover_leave」，收起动作仍走 HoverStateMachine 的
+// Collapsing → grace → Collapse 与既有对称补间，不新增第二条收起实现。
+function focusCollapseEligible() {
+  if (!invoke || dragging || dragLang) return false;
+  if (windowFocused || pointerInsideWindow || composing) return false;
+  const view = lastView;
+  if (!view || view.view !== 'expanded' || view.locked) return false;
+  if (phase !== 'shown') return false; // 展开动画未落定不参与，避免打断进入
+  if (editDebouncer.hasPending()) return false;
+  if ((view.cards ?? []).some((card) => card.status === 'syncing')) return false;
+  return true;
+}
+
+function evaluateFocusCollapse() {
+  window.clearTimeout(focusCollapseTimer);
+  focusCollapseTimer = null;
+  if (focusCollapseSent || !focusCollapseEligible()) return;
+  const delay = lastView.settings?.leave_grace_ms ?? DEFAULT_LEAVE_GRACE_MS;
+  focusCollapseTimer = window.setTimeout(() => {
+    focusCollapseTimer = null;
+    // 宽限期内状态可能又变了（重新组字 / 开始翻译 / 指针回来）：
+    // 下一次 draw 或对应事件会重新评估，这里不硬收。
+    if (focusCollapseSent || !focusCollapseEligible()) return;
+    focusCollapseSent = true;
+    send('hover_leave');
+  }, delay);
 }
 
 // 朗读：本地引擎自己发声；在线产物走 asset 协议。失败必须可见，不再静默吞掉。
@@ -1332,6 +1376,9 @@ root.addEventListener('focusout', (event) => {
   commitEdit(el.dataset.lang, el);
   send('edit_end');
   send('get_state'); // 补上编辑期间被跳过的重绘
+  // 编辑态会拦下 hover_leave；失焦后重新评估，让「先移出、后切走窗口」也能收起。
+  focusCollapseSent = false;
+  evaluateFocusCollapse();
 });
 
 root.addEventListener(
@@ -1349,6 +1396,9 @@ root.addEventListener(
     // 组字期间到期的那次提交被 composing 挡下，这里必须补排一次，
     // 否则用户选完词就停手时，文本永远等不到同步。
     if (el?.matches('textarea.card__text')) editDebouncer.schedule(el.dataset.lang);
+    // 组字期间禁止的收起，结束之后按当前焦点/指针状态重新评估。
+    focusCollapseSent = false;
+    evaluateFocusCollapse();
   },
   true,
 );
@@ -1451,7 +1501,29 @@ root.addEventListener('mousemove', (event) => {
   edgeArmed = true;
   requestEnter();
 });
-root.addEventListener('pointerleave', requestLeave);
+root.addEventListener('pointerenter', () => {
+  // 指针回到面板：取消待收起的失焦收起。
+  pointerInsideWindow = true;
+  focusCollapseSent = false;
+  evaluateFocusCollapse();
+});
+root.addEventListener('pointerleave', () => {
+  pointerInsideWindow = false;
+  // 鼠标离开仍走原有 200ms 防抖；失焦收起只在 window blur / 编辑结束 / 视图变化时评估。
+  requestLeave();
+});
+
+// 失焦收起：窗口失去焦点时启动；重新获得焦点时取消。
+window.addEventListener('blur', () => {
+  windowFocused = false;
+  focusCollapseSent = false; // 新的一段失焦，允许再次尝试
+  evaluateFocusCollapse();
+});
+window.addEventListener('focus', () => {
+  windowFocused = true;
+  focusCollapseSent = false;
+  evaluateFocusCollapse();
+});
 
 window.addEventListener('mouseup', () => {
   dragging = false;

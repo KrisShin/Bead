@@ -63,6 +63,20 @@ describe('editing a language card', () => {
     expect(commits).toEqual([]);
   });
 
+  it('reports a pending pause until it commits or is cancelled', () => {
+    const debouncer = createEditDebouncer({ onCommit: () => {} });
+
+    expect(debouncer.hasPending()).toBe(false);
+    debouncer.schedule('zh');
+    expect(debouncer.hasPending()).toBe(true);
+    debouncer.cancel('zh');
+    expect(debouncer.hasPending()).toBe(false);
+
+    debouncer.schedule('zh');
+    vi.advanceTimersByTime(EDIT_DEBOUNCE_MS);
+    expect(debouncer.hasPending()).toBe(false);
+  });
+
   it('re-arms the pause after a composition ends so the chosen text still syncs', () => {
     const commits = [];
     const debouncer = createEditDebouncer({ onCommit: (lang) => commits.push(lang) });
