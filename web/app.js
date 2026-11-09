@@ -188,12 +188,25 @@ function clearBoard() {
 //
 // 位置只按胶囊屏幕矩形换算：展开态窗口 x = 胶囊左缘 - 272（整数），
 // 因此胶囊在整个开合过程中一个像素都不动（CSS 里 data-shape='panel' 把胶囊放在 272px）。
-const ENTER_MOVE_MS = 160;   // 展开：transform 归零（与 closing 对称）
-const EXIT_TIMEOUT_MS = 180; // 收起：淡出 140ms + 位移 160ms，180ms 兜底后必须已经缩回
-const REVERSE_MS = 200;      // 收起途中回来：从当前值回正
-const CARD_STAGGER_MS = 30;
+// 定稿动效「种子生长」：基准 700ms ÷ 0.875 = 实际展开 800ms（实机复看后提速）。
+// 基准毫秒 ÷ MOTION_SPEED = 实际毫秒，必须与 styles.css 的 --motion-speed 一致，
+// 否则收起会被定时器提前截断。
+// reduced-motion 下把速度拉到近似瞬时：CSS 动画已压到 0.01ms，这里不能再等完整时长。
+const MOTION_REDUCED = typeof window !== 'undefined'
+  && Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches);
+const MOTION_SPEED = MOTION_REDUCED ? 60 : 0.875;
+const motionMs = (base) => Math.round(base / MOTION_SPEED);
+
+const ENTER_MOVE_MS = motionMs(700);   // 展开：基准 700ms
+const EXIT_TIMEOUT_MS = motionMs(560); // 收起：基准 560ms，与 CSS opacity 的 delay+duration 对齐
+const REVERSE_MS = motionMs(400);      // 收起途中回来：裁剪区补回满板，基准 400ms
+// 下面两个只服务卡片增删补间，不随展开动效放大，否则加一张卡要等近一秒。
 const CARD_STAGGER_MAX_MS = 120;
 const CARD_ANIM_MS = 200;
+// 展开入场：中卡先出，离中心每远一级晚 50ms 基准；收起反序、外围先走。
+const CARD_BLOOM_BASE_MS = motionMs(240);
+const CARD_BLOOM_STEP_MS = motionMs(50);
+const CARD_FOLD_STEP_MS = motionMs(60);
 // 卡片增删时的面板扩展/收缩：内容与窗口共用同一条 160ms 曲线，先对齐再提交。
 const PANEL_RESIZE_MS = 160;
 const PANEL_RESIZE_EASE = 'cubic-bezier(0.16, 1, 0.3, 1)';
@@ -315,10 +328,19 @@ function refreshOtherCards(view, editingLang) {
 // 卡片错峰：第 n 张 delay = min(n*30ms, 120ms)。只写内联延迟，
 // 动画名仍是卡片自己的 card-pop-in（卡片模块的增删动画不受影响）。
 function applyCardStagger() {
-  const cards = boardHost.querySelectorAll('.card');
+  const cards = Array.from(boardHost.querySelectorAll('.card'));
+  const center = (cards.length - 1) / 2;
+  const maxLevel = Math.max(center, 0);
   cards.forEach((card, index) => {
-    const delay = Math.min(index * CARD_STAGGER_MS, CARD_STAGGER_MAX_MS);
-    card.style.setProperty('--card-delay', `${delay}ms`);
+    // 胶囊在面板水平中点：展开时中卡先出、两侧同步扩散，不再从左到右排队。
+    const level = Math.abs(index - center);
+    const bloom = CARD_BLOOM_BASE_MS + Math.round(level * CARD_BLOOM_STEP_MS);
+    // 收起反序：外围先消失、越靠中心越晚，视觉上朝胶囊聚拢。
+    // 这个变量故意不在 enterDoneTimer 里清掉——整板重绘会重建卡片 DOM，
+    // 真丢了也只是退回 0ms（同时收起），不会报错。
+    const fold = Math.round((maxLevel - level) * CARD_FOLD_STEP_MS);
+    card.style.setProperty('--card-delay', `${bloom}ms`);
+    card.style.setProperty('--card-fold-delay', `${fold}ms`);
   });
 }
 
@@ -523,10 +545,13 @@ async function beginExpand(view) {
   clearEnterTimer();
   pendingView = null;
 
-  // 1) 同步写入进入态：内容全透明、宿主隐藏；此时窗口还是 68×28，胶囊仍在屏幕原位
+  // 1) 同步写入进入态：内容全透明、宿主隐藏。
+  //    同一帧就把胶囊藏起来：下一步 Rust 会左移窗口 272px，而 WebView 可能滞后一帧
+  //    仍按旧坐标（left:0）绘制胶囊，会在新窗口左端闪出一个错位胶囊再消失。
   setPhase('entering');
   boardHost.dataset.visible = 'false';
   boardHost.dataset.motion = 'on';
+  root.dataset.capsuleGone = '1';
   // 注意：data-cards='enter' 不能在这里设 —— CSS animation 在 visibility:hidden 上也会跑，
   // 等内容变可见时卡片动画已经跑了 ~50ms，直接从中间"蹦"出来而不是从头进场。
   // 必须延迟到 visible=true 的同一帧再触发（见下面第 3 步末尾）。
@@ -585,7 +610,11 @@ function beginCollapse() {
   const token = ++phaseSeq;
   boardHost.dataset.motion = 'on';
   setPhase('closing');
-  // transitionend 为主，180ms 兜底（过渡被打断或元素不参与过渡时也能收回）
+  // 展开期间若发生过整板重绘，卡片 DOM 会被重建，inline 的错峰变量就丢了。
+  // 在切到 closing 的同一帧重新贴一次，反序收起才不会退化成所有卡同时消失。
+  applyCardStagger();
+  // transitionend 为主（.board 的 opacity 走完 EXIT_TIMEOUT_MS 才结束），兜底同值：
+  // 过渡被打断或元素不参与过渡时也能收回。两者必须与 CSS 里的 delay+duration 对齐。
   closeTimer = window.setTimeout(() => finishCollapse(token), EXIT_TIMEOUT_MS);
 }
 
@@ -608,6 +637,7 @@ async function finishCollapse(token) {
   // 再走 220ms 的 hover 过渡淡入（实测缩窗帧取样 19 → 54 → 96 → 104），
   // 与「160ms 后画面上只剩胶囊」的验收不符，视觉上也像闪了一下。
   root.dataset.capsuleInstant = '1';
+  delete root.dataset.capsuleGone; // 与 instant 同一帧：胶囊立刻回到原位，且不走 220ms 淡入
   setShape('capsule');
   await nextFrame();
   await nextFrame();
