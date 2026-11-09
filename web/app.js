@@ -68,6 +68,11 @@ let speechCapabilities = null;
 let speechHintTimer = null;
 // 每张卡最后一次进入 Rust 的文本：失焦/回车对未变更内容不重复发起同步。
 const lastCommitted = new Map();
+// 卡片内粘贴的图片缩略图：只在前端本次运行内保留，不进 StateView、不写 settings。
+// lang -> { url: objectURL, message: 内联状态文案 }
+const pasteMedia = new Map();
+// 只有中英文卡片接受图片粘贴；其他语言保持浏览器的默认粘贴行为。
+const IMAGE_PASTE_LANGS = new Set(['zh', 'en']);
 // 输入防抖只记语言，到期时再按语言找回当前输入框（见 edit-sync.js 的说明）。
 const editDebouncer = createEditDebouncer({
   onCommit: (lang) => commitPendingEdit(lang),
@@ -247,19 +252,47 @@ function renderContent(view, wasExpanded) {
     : null;
   if (focusedEditor && wasExpanded) {
     refreshOtherCards(view, focusedEditor.dataset.lang);
+    applyPasteThumbs();
     applySpeechUi();
     return;
   }
   const html = renderBoard({ ...view, languagesOpen, historyOpen, historyItems });
   // html 没变就不碰 DOM
   if (html === lastBoardHtml) {
+    applyPasteThumbs();
     applySpeechUi();
     return;
   }
   lastBoardHtml = html;
   boardHost.innerHTML = html;
   for (const card of view.cards ?? []) lastCommitted.set(card.lang, card.text);
+  applyPasteThumbs();
   applySpeechUi();
+}
+
+/** 整板重绘会重建卡片 DOM：缩略图与内联状态每次从内存 Map 重新贴回。 */
+function applyPasteThumbs() {
+  for (const box of boardHost.querySelectorAll('.card__media')) {
+    const entry = pasteMedia.get(box.dataset.lang);
+    const image = box.querySelector('.card__media-thumb');
+    const status = box.querySelector('.card__media-status');
+    if (!entry) {
+      box.hidden = true;
+      if (image) image.style.backgroundImage = '';
+      if (status) {
+        status.textContent = '';
+        status.hidden = true;
+      }
+      continue;
+    }
+    box.hidden = false;
+    // 缩略图用 background 而不是 <img>：卡片文本的 XSS 断言保持不变。
+    if (image && entry.url) image.style.backgroundImage = `url("${entry.url}")`;
+    if (status) {
+      status.textContent = entry.message ?? '';
+      status.hidden = !entry.message;
+    }
+  }
 }
 
 // 编辑期局部刷新：其余卡整卡替换（焦点在编辑卡上，不会丢光标），
@@ -944,6 +977,39 @@ async function commitEdit(lang, textarea) {
   await send('commit_edit', { lang, text });
 }
 
+// 卡片内粘贴图片：OCR 只按这张卡的语言建引擎，结果直接提交为这张卡的权威源。
+// 失败/无文字只写缩略图区域的内联状态（项目已无 notice，不弹全局提示）。
+async function ocrPasteIntoCard(lang, entry) {
+  if (!invoke) return;
+  let text;
+  try {
+    text = await invoke('ocr_clipboard_image_for_lang', { lang });
+  } catch (error) {
+    console.warn('[bead] paste-ocr', error);
+    if (pasteMedia.get(lang) === entry) {
+      entry.message = '识别失败';
+      applyPasteThumbs();
+    }
+    return;
+  }
+  if (pasteMedia.get(lang) !== entry) return; // 期间又粘了新图，旧结果作废
+  if (typeof text !== 'string' || !text.trim()) {
+    entry.message = '未识别到文字';
+    applyPasteThumbs();
+    return;
+  }
+  entry.message = '';
+  applyPasteThumbs();
+  // 该卡成为权威源；其余卡由 Rust 的 commit 流程负责翻译，不再 auto-detect 换卡。
+  lastCommitted.set(lang, text);
+  const textarea = [...boardHost.querySelectorAll('textarea.card__text')].find(
+    (element) => element.dataset.lang === lang,
+  );
+  if (textarea) textarea.value = text;
+  await send('commit_edit', { lang, text });
+  applyPasteThumbs();
+}
+
 // 输入停顿到期：按语言找回「当前」输入框再提交。排程时捕获的节点可能已被
 // 重渲染替换，contains 检查会让这次提交静默消失（表现就是停多久都不同步）。
 function commitPendingEdit(lang) {
@@ -1003,6 +1069,17 @@ root.addEventListener('click', (event) => {
   if (!button) return;
   const { action, lang } = button.dataset;
   switch (action) {
+    case 'dismiss-paste': {
+      // 只关缩略图，不动已识别/已输入的文字，也不发任何请求。
+      const mediaLang = button.closest('.card__media')?.dataset.lang;
+      if (mediaLang) {
+        const entry = pasteMedia.get(mediaLang);
+        if (entry?.url) URL.revokeObjectURL(entry.url);
+        pasteMedia.delete(mediaLang);
+      }
+      applyPasteThumbs();
+      break;
+    }
     case 'speak':
       speakCard(lang);
       break;
@@ -1363,6 +1440,28 @@ async function addCard() {
 root.addEventListener('input', (event) => {
   const el = targetOf(event);
   if (el?.matches('textarea.card__text')) editDebouncer.schedule(el.dataset.lang);
+});
+
+// 卡片内粘贴图片：只在中英文卡片上接管，且仅在剪贴板确实带图片时接管。
+// 有文字 + 图片时以图片为准；多张只取最先命中的一张；其他语言完全不拦默认粘贴。
+root.addEventListener('paste', (event) => {
+  const el = targetOf(event);
+  if (!el?.matches('textarea.card__text')) return;
+  const lang = el.dataset.lang;
+  if (!IMAGE_PASTE_LANGS.has(lang)) return;
+  const imageItem = [...(event.clipboardData?.items ?? [])].find(
+    (item) => item.kind === 'file' && item.type.startsWith('image/'),
+  );
+  if (!imageItem) return;
+  event.preventDefault();
+  const file = imageItem.getAsFile();
+  if (!file) return;
+  const previous = pasteMedia.get(lang);
+  if (previous?.url) URL.revokeObjectURL(previous.url);
+  const entry = { url: URL.createObjectURL(file), message: '识别中…' };
+  pasteMedia.set(lang, entry);
+  applyPasteThumbs();
+  ocrPasteIntoCard(lang, entry).catch(() => {});
 });
 
 root.addEventListener('focusin', (event) => {

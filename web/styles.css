@@ -711,6 +711,62 @@ html, body {
 }
 .card__text:focus { outline: none; }
 
+/* 卡片内粘贴图片：缩略图只占输入框下方一条固定高度（56px），
+   textarea 仍是 flex:1，面板窗口高度保持不变；文本可视区按需缩小，内容不会被裁。 */
+.card__media {
+  position: relative;
+  flex: none;
+  height: 56px;
+  border: 1px solid #dbe3ee;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #eef2f8;
+}
+.card__media[hidden] { display: none; }
+.card__media-thumb {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background-position: center;
+  background-size: cover;
+  background-repeat: no-repeat;
+}
+/* OCR 失败/无文字的内联状态：贴在缩略图底部，不弹出任何全局提示。 */
+.card__media-status {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 2px 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #4b5a6d;
+  background: rgba(255, 255, 255, 0.88);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.card__media-status[hidden] { display: none; }
+/* × 只压在缩略图右上角，不进入上方文本区，不遮挡识别结果。 */
+.card__media-close {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  z-index: 1;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.92);
+  color: #4b5a6d;
+  font-size: 13px;
+  line-height: 18px;
+  text-align: center;
+  cursor: pointer;
+}
+.card__media-close:hover { color: #1f2a37; background: #fff; }
+
 .card__actions { display: flex; flex-shrink: 0; justify-content: flex-end; gap: 4px; }
 
 /* 旧按钮样式保留（provider / settings 里还在用） */
