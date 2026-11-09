@@ -8,6 +8,7 @@
 //! key 只存在 AppState 内存与用户配置目录里，不写日志、不明文回显。
 //! 设置（自动读剪贴板、悬停延迟、引擎、语言池）持久化到系统配置目录（工单 05）。
 
+mod clipboard_ocr;
 mod history;
 mod settings;
 #[cfg(windows)]
@@ -188,12 +189,27 @@ fn start_hotkey(app: tauri::AppHandle, hotkey: bead_core::Hotkey) -> Result<Hotk
             while win::GetMessageW(&mut msg, 0, 0, 0) > 0 {
                 if msg.message == win::WM_HOTKEY && msg.wparam == HOTKEY_ID as usize {
                     let state = app.state::<AppState>();
-                    if !state.settings.lock().expect("settings poisoned").selection_enabled {
-                        continue;
-                    }
-                    // 显式热键优先：选区图标先收起，且按热键路径的剪贴板取词走。
+                    let selection_enabled = state
+                        .settings
+                        .lock()
+                        .expect("settings poisoned")
+                        .selection_enabled;
+                    // 显式热键优先：选区图标先收起。
                     dismiss_anchor(&app);
-                    capture_and_translate(&app);
+                    // 热键是 OCR 的两个入口之一：剪贴板里有截图就先 OCR，没有图才走原有取词路径。
+                    // 有图时不回落到划词：划词会模拟 Ctrl+C 覆盖掉用户刚截的图。
+                    // OCR 本身耗时，丢到工作线程，不堵热键消息循环。
+                    if clipboard_ocr::clipboard_has_image() {
+                        let app_for_hotkey = app.clone();
+                        std::thread::spawn(move || {
+                            let Some(text) = clipboard_ocr::recognize_clipboard_text() else {
+                                return;
+                            };
+                            apply_ocr_text(&app_for_hotkey, &text, true);
+                        });
+                    } else if selection_enabled {
+                        capture_and_translate(&app);
+                    }
                 }
             }
             win::UnregisterHotKey(0, HOTKEY_ID);
@@ -309,6 +325,73 @@ return;
     // 快照在提交之后取：缓存命中的译文已经写回，不会先推一份「同步中」的旧状态。
     let view = snapshot(state.inner());
     let _ = app.emit("state", view);
+}
+
+/// 剪贴板截图 OCR 的落卡入口：识别出的文本直接复用 `accept_clipboard_with_cache`
+/// 的语种检测与落卡规则（识别到池外语言同样不粘贴），不另写一套判断。
+///
+/// `from_hotkey` 为真时沿用划词路径的「自动展开 + 移交焦点」；
+/// 面板主动打开路径要求仍处于展开态才落卡——OCR 完成前用户若已收起面板，
+/// 结果直接丢弃，不把面板重新弹出来。
+#[cfg(windows)]
+fn apply_ocr_text(app: &tauri::AppHandle, text: &str, from_hotkey: bool) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let state = app.state::<AppState>();
+    let hover_state = state.hover.lock().expect("hover state poisoned").state();
+    if matches!(
+        hover_state,
+        HoverState::Expanded { locked: true, .. } | HoverState::Expanded { editing: true, .. }
+    ) {
+        return;
+    }
+    if !from_hotkey && !matches!(hover_state, HoverState::Expanded { .. }) {
+        return;
+    }
+    if let SensitiveVerdict::Skipped(_reason) = SensitiveFilter::classify(text) {
+        return;
+    }
+    if from_hotkey {
+        state
+            .hover
+            .lock()
+            .expect("hover state poisoned")
+            .transition(HoverEvent::SelectionCaptured);
+        record_focus_return(app, state.inner());
+        focus_main_panel(app);
+    }
+    let engine = engine_fingerprint(
+        &state.provider_config.lock().expect("provider config poisoned"),
+    );
+    let outcome = {
+        let mut coordinator = state.coordinator.lock().expect("coordinator poisoned");
+        coordinator.accept_clipboard_with_cache(text, false, &engine)
+    };
+    match outcome {
+        Some(CommitOutcome::Translate(plan)) => {
+            resolve_translation_with_history(app, state.inner(), plan, engine)
+        }
+        Some(CommitOutcome::Cached { .. }) => {
+            state.translation_epoch.fetch_add(1, Ordering::SeqCst);
+            touch_history_for_current(state.inner(), &engine);
+        }
+        None => {}
+    }
+    let view = snapshot(state.inner());
+    let _ = app.emit("state", view);
+}
+
+/// 面板主动打开时读不到文本：转到剪贴板截图 OCR。独立线程执行，
+/// 展开动画与 UI 不被识别耗时拖住；任何失败都静默结束。
+#[cfg(windows)]
+fn spawn_panel_ocr(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let Some(text) = clipboard_ocr::recognize_clipboard_text() else {
+            return;
+        };
+        apply_ocr_text(&app, &text, false);
+    });
 }
 
 /// 选区图标开关当前值：Raw Input 线程松手时用它复核，避免关闭后还有在途事件弹图标。
@@ -2143,38 +2226,46 @@ fn consume(actions: Vec<HoverAction>, app: &tauri::AppHandle, state: &AppState, 
             HoverAction::ReadClipboardOnce => {
                 // 关闭自动读取后：除手动粘贴/输入外无任何读取（重读按钮也拦下，规范从严）。
                 if !state.settings.lock().expect("settings poisoned").auto_read_clipboard {
-continue;
+                    continue;
                 }
-                match app.clipboard().read_text() {
-                    Ok(text) => match SensitiveFilter::classify(&text) {
-                        // 敏感内容连 provider 链都不进：过滤发生在读取之后、提交之前，静默跳过。
-                        SensitiveVerdict::Skipped(_) => {}
-                        SensitiveVerdict::Allowed => {
-                            let engine = engine_fingerprint(
-                                &state.provider_config.lock().expect("provider config poisoned"),
-                            );
-                            let outcome = state
-                                .coordinator
-                                .lock()
-                                .expect("coordinator poisoned")
-                                .accept_clipboard_with_cache(&text, force_refresh, &engine);
-                            match outcome {
-                                Some(CommitOutcome::Translate(plan)) => {
-                                    // 翻译链含 10s 超时 + 重试，绝不能让展开/刷新命令等它跑完。
-                                    resolve_translation_with_history(app, state, plan, engine);
-                                }
-                                Some(CommitOutcome::Cached { .. }) => {
-                                    // 命中缓存：译文已同步写回，没有任何网络请求；
-                                    // 仍推进 epoch，让可能还在途的旧批次在写回/推送前作废。
-                                    state.translation_epoch.fetch_add(1, Ordering::SeqCst);
-                                    touch_history_for_current(state, &engine);
-                                }
-                                None => {}
+                let text = app
+                    .clipboard()
+                    .read_text()
+                    .ok()
+                    .filter(|text| !text.trim().is_empty());
+                let Some(text) = text else {
+                    // 剪贴板没有文本时不静默结束：用户可能刚用截图工具把图放进了剪贴板，
+                    // 转到系统 OCR 再试一次（只读剪贴板，不截图）。
+                    #[cfg(windows)]
+                    spawn_panel_ocr(app.clone());
+                    continue;
+                };
+                match SensitiveFilter::classify(&text) {
+                    // 敏感内容连 provider 链都不进：过滤发生在读取之后、提交之前，静默跳过。
+                    SensitiveVerdict::Skipped(_) => {}
+                    SensitiveVerdict::Allowed => {
+                        let engine = engine_fingerprint(
+                            &state.provider_config.lock().expect("provider config poisoned"),
+                        );
+                        let outcome = state
+                            .coordinator
+                            .lock()
+                            .expect("coordinator poisoned")
+                            .accept_clipboard_with_cache(&text, force_refresh, &engine);
+                        match outcome {
+                            Some(CommitOutcome::Translate(plan)) => {
+                                // 翻译链含 10s 超时 + 重试，绝不能让展开/刷新命令等它跑完。
+                                resolve_translation_with_history(app, state, plan, engine);
                             }
+                            Some(CommitOutcome::Cached { .. }) => {
+                                // 命中缓存：译文已同步写回，没有任何网络请求；
+                                // 仍推进 epoch，让可能还在途的旧批次在写回/推送前作废。
+                                state.translation_epoch.fetch_add(1, Ordering::SeqCst);
+                                touch_history_for_current(state, &engine);
+                            }
+                            None => {}
                         }
-                    },
-                    // 读不到文本（空剪贴板/非文本）是常态，静默返回。
-                    Err(_) => {}
+                    }
                 }
             }
             HoverAction::ClearDocument => {
@@ -2487,6 +2578,24 @@ fn commit_edit(
         Err(_error) => {}
     }
     snapshot(state.inner())
+}
+
+/// 卡片内粘贴图片的 OCR：只按卡片语言建引擎（中文 → zh-Hans，英文 → en-US），
+/// 不遍历可用语言、不碰文档；文本回前端后由前端走 `commit_edit` 落成该卡权威源。
+/// 独立线程执行，避免 OCR 耗时堵住 IPC 线程。
+#[tauri::command(rename_all = "snake_case")]
+async fn ocr_clipboard_image_for_lang(lang: String) -> Option<String> {
+    let language_tag = match lang.as_str() {
+        "zh" => "zh-Hans",
+        "en" => "en-US",
+        _ => return None,
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        clipboard_ocr::recognize_clipboard_text_for_language(language_tag)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// 编辑态进入/退出：状态机在 editing 下不产出读取 intent，hover 不覆盖正在输入的内容。
@@ -3403,6 +3512,7 @@ fn main() {
             clear_document,
             copy_card,
             commit_edit,
+            ocr_clipboard_image_for_lang,
             edit_start,
             edit_end,
             retry_failed,
