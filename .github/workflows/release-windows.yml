@@ -34,6 +34,9 @@ concurrency:
 jobs:
   windows:
     name: windows nsis
+    # 只对软件版本 Release（tag 形如 v*）构建；ocr-v* 等资源发布不触发，
+    # 避免给模型资产白跑一次安装包构建。手动触发不受此限制。
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'v')
     runs-on: windows-latest
     steps:
       # release 事件默认 checkout 触发它的 tag；手动触发时显式 checkout 填写的 tag。
