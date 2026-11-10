@@ -586,6 +586,24 @@ html, body {
   cursor: pointer;
 }
 
+/* OCR 引擎区块：整行标签 + 细进度条，与设置面板其余项保持同一套边框和字号。 */
+.board__label { flex-basis: 100%; font-size: 11px; color: var(--bead-muted); }
+.board__actions { display: inline-flex; gap: 6px; }
+.board__hint--error { color: #b4453a; }
+.board__settings .board__progress {
+  flex-basis: 100%;
+  width: 100%;
+  height: 5px;
+  border: none;
+  border-radius: 3px;
+  overflow: hidden;
+  appearance: none;
+  background: var(--bead-border);
+}
+.board__settings .board__progress[hidden] { display: none; }
+.board__settings .board__progress::-webkit-progress-bar { background: var(--bead-border); border-radius: 3px; }
+.board__settings .board__progress::-webkit-progress-value { background: var(--bead-primary-soft); border-radius: 3px; }
+
 /* ========== 翻译历史 ==========
    与设置面板同层的内联面板：占满剩余高度、内部滚动，不浮在卡片编辑区上方。 */
 .board__history {

@@ -1,8 +1,9 @@
-//! 剪贴板截图 OCR：只从剪贴板取图，用系统 WinRT `Windows.Media.Ocr` 识别。
+//! 剪贴板截图 OCR：只从剪贴板取图，默认用系统 WinRT `Windows.Media.Ocr` 识别。
 //!
 //! 为什么这样而不那样：
 //! - 不截图、不抓屏、不做选区遮罩：截图交给用户已有的截图工具，本模块只做「读一次剪贴板」。
-//! - 不用云 OCR / PaddleOCR / 大模型：系统自带引擎零依赖、离线可用，隐私上也不出本机。
+//! - 默认引擎是系统自带 OCR：零依赖、离线可用、隐私上不出本机；设置页显式安装的
+//!   PP-OCRv4 只在用户选择「内置」时参与，失败静默回退这里。
 //! - 取图同时覆盖 `CF_DIB` / `CF_DIBV5` / `CF_BITMAP` 与注册格式 `PNG`（截图工具常见组合）；
 //!   `CF_DIB` 的调色板/位域交给 GDI 的 `SetDIBitsToDevice` 转成 32bpp BGRA，
 //!   不为每种 bpp 手写解码器。
@@ -13,13 +14,19 @@
 //! - 识别器优先用户配置语言，失败再退到任一可用识别语言；两者都没有就整次放弃。
 
 #[cfg(not(windows))]
-pub fn recognize_clipboard_text() -> Option<String> {
+pub struct Bitmap {
+    pub bgra: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[cfg(not(windows))]
+pub fn clipboard_bitmap() -> Option<Bitmap> {
     None
 }
 
-/// 卡片内粘贴图片：只按指定 BCP-47 语言建引擎，不遍历可用语言。
 #[cfg(not(windows))]
-pub fn recognize_clipboard_text_for_language(_language_tag: &str) -> Option<String> {
+pub fn recognize_bitmap_system(_bitmap: &Bitmap, _language_tag: Option<&str>) -> Option<String> {
     None
 }
 
@@ -31,18 +38,21 @@ pub fn clipboard_has_image() -> bool {
 }
 
 #[cfg(windows)]
+pub use imp::Bitmap;
+
+#[cfg(windows)]
+pub fn clipboard_bitmap() -> Option<Bitmap> {
+    imp::clipboard_bitmap()
+}
+
+#[cfg(windows)]
+pub fn recognize_bitmap_system(bitmap: &Bitmap, language_tag: Option<&str>) -> Option<String> {
+    imp::recognize_bitmap_system(bitmap, language_tag)
+}
+
+#[cfg(windows)]
 pub fn clipboard_has_image() -> bool {
     imp::clipboard_has_image()
-}
-
-#[cfg(windows)]
-pub fn recognize_clipboard_text() -> Option<String> {
-    imp::recognize_clipboard_text()
-}
-
-#[cfg(windows)]
-pub fn recognize_clipboard_text_for_language(language_tag: &str) -> Option<String> {
-    imp::recognize_clipboard_text_for_language(language_tag)
 }
 
 #[cfg(windows)]
@@ -57,7 +67,7 @@ mod imp {
     };
     use windows::Media::Ocr::OcrEngine;
     use windows::Storage::Streams::{
-        DataWriter, IOutputStream, IRandomAccessStream, InMemoryRandomAccessStream,
+        Buffer, DataReader, DataWriter, IOutputStream, IRandomAccessStream, InMemoryRandomAccessStream,
     };
     use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::Graphics::Gdi::{
@@ -90,36 +100,65 @@ mod imp {
         Bgra(Vec<u8>, i32, i32),
     }
 
-    /// 一次剪贴板读图的完整流程；任何一步失败都静默返回 `None`。
-    pub fn recognize_clipboard_text() -> Option<String> {
-        recognize_with(create_engine)
+    /// 剪贴板图像（BGRA8，顶朝下）：内置 OCR 与系统 OCR 共用的最小表示。
+    pub struct Bitmap {
+        pub bgra: Vec<u8>,
+        pub width: u32,
+        pub height: u32,
     }
 
-    /// 卡片内粘贴图片的入口：只按调用方给的 BCP-47 语言建引擎（zh-Hans / en-US），
-    /// 不遍历 `AvailableRecognizerLanguages`。该语言包不存在时返回 `None`，由前端内联提示。
-    pub fn recognize_clipboard_text_for_language(language_tag: &str) -> Option<String> {
-        recognize_with(|| create_engine_for_language(language_tag))
-    }
-
-    fn recognize_with(engine: impl FnOnce() -> Option<OcrEngine>) -> Option<String> {
-        // WinRT 激活需要线程已初始化 COM。这里跑在独立工作线程上，先自己初始化。
-        let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
-        let result = (|| {
-            let engine = engine()?;
-            let image = read_clipboard_image()?;
-            let bitmap = match image {
-                Image::Encoded(bytes) => encoded_to_software_bitmap(&bytes)?,
-                Image::Bgra(bytes, width, height) => {
-                    let (bytes, width, height) = scaled_bgra(&bytes, width, height)?;
-                    bgra_to_software_bitmap(&bytes, width, height)?
+    /// 读剪贴板并解码为 BGRA。不做小图放大：系统 OCR 自己在 `recognize_bitmap_system` 里放大，
+    /// 内置引擎的检测网络也会把长边缩放到 960。
+    pub fn clipboard_bitmap() -> Option<Bitmap> {
+        let _com = ComGuard::new();
+        match read_clipboard_image()? {
+            Image::Bgra(bytes, width, height) => {
+                let expected = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+                if width <= 0 || height <= 0 || bytes.len() < expected {
+                    None
+                } else {
+                    Some(Bitmap {
+                        bgra: bytes[..expected].to_vec(),
+                        width: width as u32,
+                        height: height as u32,
+                    })
                 }
-            };
-            recognize_bitmap(&bitmap, &engine)
-        })();
-        if initialized {
-            unsafe { CoUninitialize() };
+            }
+            Image::Encoded(bytes) => {
+                let bitmap = decode_encoded(&bytes, 1)?;
+                software_bitmap_to_bgra(&bitmap)
+            }
         }
-        result
+    }
+
+    /// 系统 OCR：`language_tag` 为 `None` 时用用户配置语言 / 任一可用语言。
+    pub fn recognize_bitmap_system(bitmap: &Bitmap, language_tag: Option<&str>) -> Option<String> {
+        let _com = ComGuard::new();
+        let (pixels, width, height) =
+            scaled_bgra(&bitmap.bgra, bitmap.width as i32, bitmap.height as i32)?;
+        let software = bgra_to_software_bitmap(&pixels, width, height)?;
+        let engine = match language_tag {
+            Some(tag) => create_engine_for_language(tag)?,
+            None => create_engine()?,
+        };
+        recognize_bitmap(&software, &engine)
+    }
+
+    /// WinRT 调用需要线程已初始化 COM；嵌套调用各自配对，不会多减一次。
+    struct ComGuard(bool);
+
+    impl ComGuard {
+        fn new() -> Self {
+            Self(unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() })
+        }
+    }
+
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
     }
 
     pub fn clipboard_has_image() -> bool {
@@ -535,7 +574,8 @@ mod imp {
         Some(bitmap)
     }
 
-    fn encoded_to_software_bitmap(bytes: &[u8]) -> Option<SoftwareBitmap> {
+    /// 编码图统一解码成 BGRA8；放大倍数由调用方给（系统 OCR 需要小图放大，内置引擎给 1）。
+    fn decode_encoded(bytes: &[u8], scale: i32) -> Option<SoftwareBitmap> {
         let stream = InMemoryRandomAccessStream::new().ok()?;
         let output: IOutputStream = stream.cast().ok()?;
         let writer = DataWriter::CreateDataWriter(&output).ok()?;
@@ -545,20 +585,13 @@ mod imp {
         let _ = stream.Seek(0);
         let random_access: IRandomAccessStream = stream.cast().ok()?;
         let decoder = BitmapDecoder::CreateAsync(&random_access).ok()?.join().ok()?;
-        let width = decoder.PixelWidth().ok()? as i32;
-        let height = decoder.PixelHeight().ok()? as i32;
-        let scale = ocr_scale(width, height);
-        if scale <= 1 {
-            return decoder.GetSoftwareBitmapAsync().ok()?.join().ok();
-        }
+        let width = decoder.PixelWidth().ok()?.max(1);
+        let height = decoder.PixelHeight().ok()?.max(1);
+        let scale = scale.max(1);
         // 编码图不自己解像素：交给 WinRT 在解码阶段按目标尺寸缩放。
         let transform = BitmapTransform::new().ok()?;
-        transform
-            .SetScaledWidth((width * scale) as u32)
-            .ok()?;
-        transform
-            .SetScaledHeight((height * scale) as u32)
-            .ok()?;
+        transform.SetScaledWidth(width * scale as u32).ok()?;
+        transform.SetScaledHeight(height * scale as u32).ok()?;
         transform
             .SetInterpolationMode(BitmapInterpolationMode::Cubic)
             .ok()?;
@@ -573,6 +606,23 @@ mod imp {
             .ok()?
             .join()
             .ok()
+    }
+
+    /// Bgra8 `SoftwareBitmap` → 连续 BGRA 字节。
+    fn software_bitmap_to_bgra(bitmap: &SoftwareBitmap) -> Option<Bitmap> {
+        let width = bitmap.PixelWidth().ok()?;
+        let height = bitmap.PixelHeight().ok()?;
+        let length = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+        let buffer = Buffer::Create(u32::try_from(length).ok()?).ok()?;
+        bitmap.CopyToBuffer(&buffer).ok()?;
+        let reader = DataReader::FromBuffer(&buffer).ok()?;
+        let mut pixels = vec![0u8; length];
+        reader.ReadBytes(&mut pixels).ok()?;
+        Some(Bitmap {
+            bgra: pixels,
+            width: width as u32,
+            height: height as u32,
+        })
     }
 
     fn recognize_bitmap(bitmap: &SoftwareBitmap, engine: &OcrEngine) -> Option<String> {

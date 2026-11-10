@@ -1156,6 +1156,12 @@ root.addEventListener('click', (event) => {
     case 'check-updates':
       send('check_updates');
       break;
+    case 'ocr-install':
+      send('ocr_install');
+      break;
+    case 'ocr-remove':
+      send('ocr_remove');
+      break;
     case 'open-release':
       send('open_release_page');
       break;
@@ -1570,6 +1576,10 @@ root.addEventListener('keydown', (event) => {
 
 root.addEventListener('change', (event) => {
   const input = targetOf(event);
+  if (input?.matches('[data-ocr-engine]')) {
+    send('set_ocr_engine', { engine: input.dataset.ocrEngine });
+    return;
+  }
   if (input?.matches('[data-setting="autostart"]')) {
     send('set_autostart', { enabled: input.checked });
     return;
@@ -1677,9 +1687,22 @@ if (listen) {
   listen('state', (event) => {
     if (event.payload) draw(event.payload);
   }).catch(() => {});
-  // 朗读状态单独走事件：不参与 draw()，翻译刷新/面板动画都不会打断它。
-  listen('speech', (event) => {
-    applySpeechEvent(event.payload);
+  // 下载进度单独走事件：只更新进度条与状态文案，不重绘面板，避免打断滚动与焦点。
+  listen('ocr-progress', (event) => {
+    const payload = event.payload;
+    if (!payload) return;
+    const bar = boardHost.querySelector('[data-ocr-progress]');
+    if (bar) {
+      bar.hidden = false;
+      bar.max = payload.total || 1;
+      bar.value = payload.overall || 0;
+    }
+    if (payload.phase === 'done') return;
+    const status = boardHost.querySelector('[data-ocr-status]');
+    if (!status) return;
+    const percent = payload.total ? Math.floor((payload.overall / payload.total) * 100) : 0;
+    const phase = payload.phase === 'verifying' ? '校验' : '下载';
+    status.textContent = `${phase} ${payload.file} · ${percent}%`;
   }).catch(() => {});
 }
 

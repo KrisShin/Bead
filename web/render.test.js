@@ -158,6 +158,46 @@ describe('board rendering', () => {
     expect(html).not.toContain('data-action="save-provider"');
   });
 
+  it('shows the OCR download size and keeps the bundled engine disabled until installed', () => {
+    const html = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      settings: {
+        ocr_engine: 'system',
+        ocr_bundled_supported: true,
+        ocr_installed: false,
+        ocr_total_size: 35477895,
+        ocr_busy: false,
+      },
+    });
+    expect(html).toContain('data-ocr-engine="system"');
+    expect(html).toMatch(/data-ocr-engine="bundled"[^>]*disabled/);
+    expect(html).toContain('33.8 MB');
+    expect(html).toContain('data-action="ocr-install"');
+    expect(html).toMatch(/data-action="ocr-remove"[^>]*disabled/);
+  });
+
+  it('shows the effective OCR engine and inline failures after installing', () => {
+    const html = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      settings: {
+        ocr_engine: 'bundled',
+        ocr_effective_engine: 'system',
+        ocr_bundled_supported: true,
+        ocr_installed: true,
+        ocr_version: '1.0.0',
+        ocr_total_size: 35477895,
+        ocr_busy: false,
+        ocr_error: 'SHA256 校验失败',
+      },
+    });
+    expect(html).toMatch(/data-ocr-engine="bundled"[^>]*checked/);
+    expect(html).toContain('当前使用系统 OCR');
+    expect(html).toContain('SHA256 校验失败');
+    expect(html).not.toMatch(/data-action="ocr-remove"[^>]*disabled/);
+  });
+
   it('reflects the auto-read switch and hover delay in the settings section', () => {
     const html = renderBoard({
       ...expanded,
