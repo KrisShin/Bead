@@ -48,6 +48,10 @@ pub struct AppSettings {
     /// 该语言没有本地音色时是否允许在线兜底。默认开启；仅在缺音色时触发。
     #[serde(default = "default_true")]
     pub tts_online_fallback: bool,
+    /// OCR 引擎：`system`（系统 WinRT，默认）或 `bundled`（内置 PP-OCRv4）。
+    /// `bundled` 未安装或加载失败时运行时静默回退系统 OCR，不改写用户选择。
+    #[serde(default = "default_ocr_engine")]
+    pub ocr_engine: String,
     /// 窗口位置（旧字段，逻辑坐标；保留写入以兼容旧构建）。
     #[serde(default)]
     pub window_position: Option<(i32, i32)>,
@@ -81,6 +85,10 @@ fn default_tts_volume() -> u8 {
     80
 }
 
+fn default_ocr_engine() -> String {
+    crate::ocr::ENGINE_SYSTEM.into()
+}
+
 fn default_languages() -> Vec<String> {
     vec!["zh".into(), "en".into(), "ja".into()]
 }
@@ -104,6 +112,7 @@ impl Default for AppSettings {
             tts_rate: default_tts_rate(),
             tts_volume: default_tts_volume(),
             tts_online_fallback: true,
+            ocr_engine: default_ocr_engine(),
         }
     }
 }
@@ -164,6 +173,7 @@ mod tests {
             tts_rate: 1.2,
             tts_volume: 55,
             tts_online_fallback: false,
+            ocr_engine: "bundled".into(),
             provider: ProviderConfig {
                 engine: bead_providers::Engine::Zhipu,
                 api_key: "key-1".into(),

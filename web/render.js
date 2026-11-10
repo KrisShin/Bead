@@ -41,6 +41,44 @@ function historyTime(ms) {
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+/** 字节数 → 人类可读体积，用于设置页展示需要下载的大小。 */
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * OCR 能力区块：引擎选择、需要下载的体积、内联进度与安装/删除。
+ * 失败只在这里显示，不弹提示条；进度条由 app.js 订阅 `ocr-progress` 原地更新。
+ */
+function renderOcrSettings(settings) {
+  const supported = settings.ocr_bundled_supported !== false;
+  const installed = !!settings.ocr_installed;
+  const busy = !!settings.ocr_busy;
+  const selected = settings.ocr_engine === 'bundled' ? 'bundled' : 'system';
+  const size = formatBytes(settings.ocr_total_size ?? 0);
+  let status = `未安装，需要下载 ${size}。安装后仍需选择「内置」才会启用。`;
+  if (!supported) {
+    status = '当前平台仅支持系统 OCR。';
+  } else if (installed) {
+    const effective =
+      settings.ocr_effective_engine === 'bundled' ? '内置 PP-OCRv4' : '系统 OCR';
+    status = `已安装 v${escapeHtml(settings.ocr_version ?? '')}（${size}），当前使用${effective}。`;
+  }
+  return `<span class="board__label">OCR 引擎</span>
+    <label><input type="radio" name="ocr-engine" data-ocr-engine="system"${selected === 'system' ? ' checked' : ''} />系统 OCR</label>
+    <label><input type="radio" name="ocr-engine" data-ocr-engine="bundled"${selected === 'bundled' ? ' checked' : ''}${supported && installed ? '' : ' disabled'} />内置 PP-OCRv4</label>
+    <span class="board__hint" data-ocr-status>${status}</span>
+    ${settings.ocr_error ? `<span class="board__hint board__hint--error">${escapeHtml(settings.ocr_error)}</span>` : ''}
+    <progress class="board__progress" data-ocr-progress max="${Math.max(settings.ocr_total_size ?? 0, 1)}" value="0"${busy ? '' : ' hidden'}></progress>
+    <span class="board__actions">
+      <button type="button" data-action="ocr-install"${!supported || busy ? ' disabled' : ''}>${installed ? '重新安装' : `下载 ${size}`}</button>
+      <button type="button" data-action="ocr-remove"${installed && !busy ? '' : ' disabled'}>删除</button>
+    </span>`;
+}
+
 export function renderBoard(view) {
   if (view.view !== 'expanded') return '';
 
@@ -84,6 +122,7 @@ export function renderBoard(view) {
     <label>朗读音量 <input type="number" data-setting="tts_volume" value="${Number(view.settings.tts_volume ?? 80)}" min="0" max="100" step="5" /></label>
     <label><input type="checkbox" data-setting="tts_online_fallback"${view.settings.tts_online_fallback !== false ? ' checked' : ''} />缺音色时使用在线朗读</label>
     <span class="board__hint">有本地音色时不联网；仅在该语言缺少音色时才把卡片文本发送给在线朗读服务。</span>
+    ${renderOcrSettings(view.settings)}
     <button type="button" data-action="clear-history">清空历史</button>
     <button type="button" data-action="check-updates">检查更新</button>
   </div>`

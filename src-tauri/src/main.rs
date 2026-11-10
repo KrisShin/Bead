@@ -8,7 +8,9 @@
 //! key 只存在 AppState 内存与用户配置目录里，不写日志、不明文回显。
 //! 设置（自动读剪贴板、悬停延迟、引擎、语言池）持久化到系统配置目录（工单 05）。
 
+mod clipboard_ocr;
 mod history;
+mod ocr;
 mod settings;
 #[cfg(windows)]
 mod speech_local;
@@ -188,12 +190,27 @@ fn start_hotkey(app: tauri::AppHandle, hotkey: bead_core::Hotkey) -> Result<Hotk
             while win::GetMessageW(&mut msg, 0, 0, 0) > 0 {
                 if msg.message == win::WM_HOTKEY && msg.wparam == HOTKEY_ID as usize {
                     let state = app.state::<AppState>();
-                    if !state.settings.lock().expect("settings poisoned").selection_enabled {
-                        continue;
-                    }
-                    // 显式热键优先：选区图标先收起，且按热键路径的剪贴板取词走。
+                    let selection_enabled = state
+                        .settings
+                        .lock()
+                        .expect("settings poisoned")
+                        .selection_enabled;
+                    // 显式热键优先：选区图标先收起。
                     dismiss_anchor(&app);
-                    capture_and_translate(&app);
+                    // 热键是 OCR 的两个入口之一：剪贴板里有截图就先 OCR，没有图才走原有取词路径。
+                    // 有图时不回落到划词：划词会模拟 Ctrl+C 覆盖掉用户刚截的图。
+                    // OCR 本身耗时，丢到工作线程，不堵热键消息循环。
+                    if clipboard_ocr::clipboard_has_image() {
+                        let app_for_hotkey = app.clone();
+                        std::thread::spawn(move || {
+                            let Some(text) = recognize_clipboard_text(&app_for_hotkey, None) else {
+                                return;
+                            };
+                            apply_ocr_text(&app_for_hotkey, &text, true);
+                        });
+                    } else if selection_enabled {
+                        capture_and_translate(&app);
+                    }
                 }
             }
             win::UnregisterHotKey(0, HOTKEY_ID);
@@ -309,6 +326,73 @@ return;
     // 快照在提交之后取：缓存命中的译文已经写回，不会先推一份「同步中」的旧状态。
     let view = snapshot(state.inner());
     let _ = app.emit("state", view);
+}
+
+/// 剪贴板截图 OCR 的落卡入口：识别出的文本直接复用 `accept_clipboard_with_cache`
+/// 的语种检测与落卡规则（识别到池外语言同样不粘贴），不另写一套判断。
+///
+/// `from_hotkey` 为真时沿用划词路径的「自动展开 + 移交焦点」；
+/// 面板主动打开路径要求仍处于展开态才落卡——OCR 完成前用户若已收起面板，
+/// 结果直接丢弃，不把面板重新弹出来。
+#[cfg(windows)]
+fn apply_ocr_text(app: &tauri::AppHandle, text: &str, from_hotkey: bool) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let state = app.state::<AppState>();
+    let hover_state = state.hover.lock().expect("hover state poisoned").state();
+    if matches!(
+        hover_state,
+        HoverState::Expanded { locked: true, .. } | HoverState::Expanded { editing: true, .. }
+    ) {
+        return;
+    }
+    if !from_hotkey && !matches!(hover_state, HoverState::Expanded { .. }) {
+        return;
+    }
+    if let SensitiveVerdict::Skipped(_reason) = SensitiveFilter::classify(text) {
+        return;
+    }
+    if from_hotkey {
+        state
+            .hover
+            .lock()
+            .expect("hover state poisoned")
+            .transition(HoverEvent::SelectionCaptured);
+        record_focus_return(app, state.inner());
+        focus_main_panel(app);
+    }
+    let engine = engine_fingerprint(
+        &state.provider_config.lock().expect("provider config poisoned"),
+    );
+    let outcome = {
+        let mut coordinator = state.coordinator.lock().expect("coordinator poisoned");
+        coordinator.accept_clipboard_with_cache(text, false, &engine)
+    };
+    match outcome {
+        Some(CommitOutcome::Translate(plan)) => {
+            resolve_translation_with_history(app, state.inner(), plan, engine)
+        }
+        Some(CommitOutcome::Cached { .. }) => {
+            state.translation_epoch.fetch_add(1, Ordering::SeqCst);
+            touch_history_for_current(state.inner(), &engine);
+        }
+        None => {}
+    }
+    let view = snapshot(state.inner());
+    let _ = app.emit("state", view);
+}
+
+/// 面板主动打开时读不到文本：转到剪贴板截图 OCR。独立线程执行，
+/// 展开动画与 UI 不被识别耗时拖住；任何失败都静默结束。
+#[cfg(windows)]
+fn spawn_panel_ocr(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let Some(text) = recognize_clipboard_text(&app, None) else {
+            return;
+        };
+        apply_ocr_text(&app, &text, false);
+    });
 }
 
 /// 选区图标开关当前值：Raw Input 线程松手时用它复核，避免关闭后还有在途事件弹图标。
@@ -852,6 +936,8 @@ struct AppState {
     /// 落盘的翻译历史（MRU、最多 10 条）；启动早期为空，setup 拿到配置目录后加载。
     history: Mutex<history::TranslationHistory>,
     speech: SpeechService,
+    /// 内置 PP-OCRv4：资产放应用数据目录，仅用户选择「内置」且已安装时懒加载。
+    ocr: ocr::Manager,
     update_latest: Mutex<Option<String>>,
     /// 翻译任务代次：只有最新一代可以推送 state，防止慢请求回来覆盖新内容。
     translation_epoch: AtomicU64,
@@ -927,6 +1013,18 @@ struct SettingsView {
     tts_volume: u8,
     /// 该语言没有本地音色时，是否允许把文本发往在线朗读服务。默认开启。
     tts_online_fallback: bool,
+    /// OCR 引擎选择：`system` / `bundled`（用户选择，未安装时仍保留）。
+    ocr_engine: String,
+    /// 实际生效的引擎：选择 bundled 但未安装 / 加载失败时为 `system`。
+    ocr_effective_engine: String,
+    /// 当前平台是否支持内置引擎（只有 Windows 实现了剪贴板取图）。
+    ocr_bundled_supported: bool,
+    ocr_installed: bool,
+    ocr_version: String,
+    ocr_total_size: u64,
+    ocr_busy: bool,
+    /// 安装/加载失败原因：只在设置页内联显示，不弹提示。
+    ocr_error: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1015,9 +1113,75 @@ fn snapshot(state: &AppState) -> StateView {
             tts_rate: settings.tts_rate,
             tts_volume: settings.tts_volume,
             tts_online_fallback: settings.tts_online_fallback,
+            ocr_engine: settings.ocr_engine.clone(),
+            ocr_effective_engine: effective_ocr_engine(state, &settings),
+            ocr_bundled_supported: cfg!(windows),
+            ocr_installed: state.ocr.installed(),
+            ocr_version: state.ocr.version(),
+            ocr_total_size: state.ocr.total_size(),
+            ocr_busy: state.ocr.busy(),
+            ocr_error: state.ocr.last_error(),
         },
         update_latest: state.update_latest.lock().expect("update poisoned").clone(),
     }
+}
+
+/// 实际生效的 OCR 引擎：只有「选了内置 + 已安装 + 平台支持」才真正用内置，
+/// 其余情况都会落到系统 OCR，设置页展示的是这个值而不是用户选择。
+fn effective_ocr_engine(state: &AppState, settings: &settings::AppSettings) -> String {
+    if settings.ocr_engine == ocr::ENGINE_BUNDLED && cfg!(windows) && state.ocr.installed() {
+        ocr::ENGINE_BUNDLED.into()
+    } else {
+        ocr::ENGINE_SYSTEM.into()
+    }
+}
+
+/// 下载进度事件载荷：只用于设置页内联进度条，不产生任何提示文案。
+#[derive(Serialize, Clone)]
+struct OcrProgressView {
+    phase: String,
+    file: String,
+    index: usize,
+    count: usize,
+    received: u64,
+    overall: u64,
+    total: u64,
+}
+
+impl From<ocr::download::Progress> for OcrProgressView {
+    fn from(progress: ocr::download::Progress) -> Self {
+        Self {
+            phase: progress.phase.as_str().to_string(),
+            file: progress.file,
+            index: progress.index,
+            count: progress.count,
+            received: progress.received,
+            overall: progress.overall,
+            total: progress.total,
+        }
+    }
+}
+
+/// OCR 统一入口：先试内置引擎，未安装 / 加载失败 / 识别失败都静默回退系统 OCR。
+#[cfg(windows)]
+fn recognize_clipboard_text(app: &tauri::AppHandle, language_tag: Option<&str>) -> Option<String> {
+    let bitmap = clipboard_ocr::clipboard_bitmap()?;
+    let state = app.state::<AppState>();
+    let use_bundled = state
+        .settings
+        .lock()
+        .expect("settings poisoned")
+        .ocr_engine
+        == ocr::ENGINE_BUNDLED;
+    if use_bundled {
+        if let Some(image) = ocr::Image::from_bgra(&bitmap.bgra, bitmap.width, bitmap.height) {
+            let language = language_tag.and_then(|tag| tag.split('-').next());
+            if let Some(text) = state.ocr.recognize(&image, language) {
+                return Some(text);
+            }
+        }
+    }
+    clipboard_ocr::recognize_bitmap_system(&bitmap, language_tag)
 }
 
 /// 面板打开且既没有新识别结果、也没有在途请求时，用最近一条历史填充面板。
@@ -2143,38 +2307,46 @@ fn consume(actions: Vec<HoverAction>, app: &tauri::AppHandle, state: &AppState, 
             HoverAction::ReadClipboardOnce => {
                 // 关闭自动读取后：除手动粘贴/输入外无任何读取（重读按钮也拦下，规范从严）。
                 if !state.settings.lock().expect("settings poisoned").auto_read_clipboard {
-continue;
+                    continue;
                 }
-                match app.clipboard().read_text() {
-                    Ok(text) => match SensitiveFilter::classify(&text) {
-                        // 敏感内容连 provider 链都不进：过滤发生在读取之后、提交之前，静默跳过。
-                        SensitiveVerdict::Skipped(_) => {}
-                        SensitiveVerdict::Allowed => {
-                            let engine = engine_fingerprint(
-                                &state.provider_config.lock().expect("provider config poisoned"),
-                            );
-                            let outcome = state
-                                .coordinator
-                                .lock()
-                                .expect("coordinator poisoned")
-                                .accept_clipboard_with_cache(&text, force_refresh, &engine);
-                            match outcome {
-                                Some(CommitOutcome::Translate(plan)) => {
-                                    // 翻译链含 10s 超时 + 重试，绝不能让展开/刷新命令等它跑完。
-                                    resolve_translation_with_history(app, state, plan, engine);
-                                }
-                                Some(CommitOutcome::Cached { .. }) => {
-                                    // 命中缓存：译文已同步写回，没有任何网络请求；
-                                    // 仍推进 epoch，让可能还在途的旧批次在写回/推送前作废。
-                                    state.translation_epoch.fetch_add(1, Ordering::SeqCst);
-                                    touch_history_for_current(state, &engine);
-                                }
-                                None => {}
+                let text = app
+                    .clipboard()
+                    .read_text()
+                    .ok()
+                    .filter(|text| !text.trim().is_empty());
+                let Some(text) = text else {
+                    // 剪贴板没有文本时不静默结束：用户可能刚用截图工具把图放进了剪贴板，
+                    // 转到系统 OCR 再试一次（只读剪贴板，不截图）。
+                    #[cfg(windows)]
+                    spawn_panel_ocr(app.clone());
+                    continue;
+                };
+                match SensitiveFilter::classify(&text) {
+                    // 敏感内容连 provider 链都不进：过滤发生在读取之后、提交之前，静默跳过。
+                    SensitiveVerdict::Skipped(_) => {}
+                    SensitiveVerdict::Allowed => {
+                        let engine = engine_fingerprint(
+                            &state.provider_config.lock().expect("provider config poisoned"),
+                        );
+                        let outcome = state
+                            .coordinator
+                            .lock()
+                            .expect("coordinator poisoned")
+                            .accept_clipboard_with_cache(&text, force_refresh, &engine);
+                        match outcome {
+                            Some(CommitOutcome::Translate(plan)) => {
+                                // 翻译链含 10s 超时 + 重试，绝不能让展开/刷新命令等它跑完。
+                                resolve_translation_with_history(app, state, plan, engine);
                             }
+                            Some(CommitOutcome::Cached { .. }) => {
+                                // 命中缓存：译文已同步写回，没有任何网络请求；
+                                // 仍推进 epoch，让可能还在途的旧批次在写回/推送前作废。
+                                state.translation_epoch.fetch_add(1, Ordering::SeqCst);
+                                touch_history_for_current(state, &engine);
+                            }
+                            None => {}
                         }
-                    },
-                    // 读不到文本（空剪贴板/非文本）是常态，静默返回。
-                    Err(_) => {}
+                    }
                 }
             }
             HoverAction::ClearDocument => {
@@ -2486,6 +2658,62 @@ fn commit_edit(
         }
         Err(_error) => {}
     }
+    snapshot(state.inner())
+}
+
+/// 卡片内粘贴图片的 OCR：只按卡片语言建引擎（中文 → zh-Hans，英文 → en-US），
+/// 不遍历可用语言、不碰文档；文本回前端后由前端走 `commit_edit` 落成该卡权威源。
+/// 独立线程执行，避免 OCR 耗时堵住 IPC 线程。
+#[tauri::command(rename_all = "snake_case")]
+async fn ocr_clipboard_image_for_lang(app: tauri::AppHandle, lang: String) -> Option<String> {
+    let language_tag = match lang.as_str() {
+        "zh" => "zh-Hans",
+        "en" => "en-US",
+        _ => return None,
+    };
+    tauri::async_runtime::spawn_blocking(move || recognize_clipboard_text(&app, Some(language_tag)))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// 切换 OCR 引擎。只接受 `system` / `bundled`；未安装时保留用户选择，
+/// 实际识别静默回退系统 OCR，`ocr_effective_engine` 如实反映这一点。
+#[tauri::command]
+fn set_ocr_engine(engine: String, state: tauri::State<'_, AppState>) -> StateView {
+    let engine = if engine == ocr::ENGINE_BUNDLED {
+        ocr::ENGINE_BUNDLED
+    } else {
+        ocr::ENGINE_SYSTEM
+    };
+    state.settings.lock().expect("settings poisoned").ocr_engine = engine.to_string();
+    persist(state.inner());
+    snapshot(state.inner())
+}
+
+/// 安装内置 OCR：后台线程下载 + 逐文件校验，进度通过 `ocr-progress` 事件回传。
+/// 重复点击直接返回当前状态；失败原因只写进设置页内联状态，不弹提示。
+#[tauri::command]
+fn ocr_install(app: tauri::AppHandle) -> StateView {
+    if app.state::<AppState>().ocr.busy() {
+        return snapshot(app.state::<AppState>().inner());
+    }
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let state = handle.state::<AppState>();
+        let emitter = handle.clone();
+        let _ = state.ocr.install_blocking(|progress| {
+            let _ = emitter.emit("ocr-progress", OcrProgressView::from(progress));
+        });
+        let _ = handle.emit("state", snapshot(state.inner()));
+    });
+    snapshot(app.state::<AppState>().inner())
+}
+
+/// 删除内置 OCR 资产：卸载引擎句柄、清空错误，回退系统 OCR。
+#[tauri::command]
+fn ocr_remove(state: tauri::State<'_, AppState>) -> StateView {
+    state.ocr.remove();
     snapshot(state.inner())
 }
 
@@ -3373,6 +3601,7 @@ fn main() {
                 },
                 std::env::temp_dir().join("bead-tts"),
             )),
+            ocr: ocr::Manager::default(),
             update_latest: Mutex::new(None),
             translation_epoch: AtomicU64::new(0),
             pending_selection: Mutex::new(None),
@@ -3403,6 +3632,10 @@ fn main() {
             clear_document,
             copy_card,
             commit_edit,
+            ocr_clipboard_image_for_lang,
+            set_ocr_engine,
+            ocr_install,
+            ocr_remove,
             edit_start,
             edit_end,
             retry_failed,
@@ -3551,6 +3784,17 @@ fn main() {
                 rebuild_chain(&loaded.provider, state.inner());
                 *state.settings.lock().expect("settings poisoned") = loaded;
                 *state.settings_dir.lock().expect("settings dir poisoned") = Some(dir.clone());
+                // OCR 资产放应用数据目录（与 settings.json 同根、不同子目录）。
+                // 清单拉取放后台线程：启动路径不等网络，拿到远端清单后再刷新一次设置页。
+                if let Ok(data_dir) = app.path().app_data_dir() {
+                    state.ocr.configure(&data_dir);
+                }
+                let ocr_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let ocr_state = ocr_handle.state::<AppState>();
+                    ocr_state.ocr.refresh_manifest();
+                    let _ = ocr_handle.emit("state", snapshot(ocr_state.inner()));
+                });
                 // 历史与 settings.json 同级：读不出或不认识格式都退化成空历史，不影响启动。
                 *state.history.lock().expect("history poisoned") =
                     history::TranslationHistory::load(dir, history::DEFAULT_CAPACITY);

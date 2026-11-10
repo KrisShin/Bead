@@ -91,6 +91,9 @@ export function Card({ card, canClose, usedCodes }) {
 
   // 其他卡片已用的语言（不包括自己）
   const otherUsed = usedCodes.filter((c) => c !== card.lang);
+  // 只有中英文卡片接受图片粘贴：缩略图区域固定挂在输入框下方，
+  // 未粘贴时 hidden，不占卡片高度；其他语言连这块 DOM 都不生成。
+  const imagePaste = card.lang === 'zh' || card.lang === 'en';
 
   return `<article class="${classes.join(' ')}" data-lang="${lang}">
   <div class="card__grip" draggable="true" role="button" aria-roledescription="拖拽手柄" aria-label="按住并拖动以调整卡片顺序" title="按住并拖动调整顺序"></div>
@@ -101,6 +104,7 @@ export function Card({ card, canClose, usedCodes }) {
     ${status ? `<span class="card__status">${status}</span>` : ''}
   </header>
   <textarea class="card__text" data-lang="${lang}" spellcheck="false">${escapeHtml(card.text)}</textarea>
+  ${imagePaste ? `<div class="card__media" data-lang="${lang}" hidden><div class="card__media-thumb" role="img" aria-label="粘贴的图片缩略图"></div><span class="card__media-status" hidden></span><button class="card__media-close" type="button" data-action="dismiss-paste" aria-label="关闭缩略图">×</button></div>` : ''}
   <footer class="card__actions">
     ${card.status === 'error' ? CardButton({ action: 'retry', lang: card.lang, iconName: 'retry', title: '重试' }) : ''}
     ${CardButton({ action: 'speak', lang: card.lang, iconName: 'speaker', title: '朗读' })}

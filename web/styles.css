@@ -7,6 +7,15 @@
   --bead-surface-alt: #fbfcfe;
   --bead-border: #e2e8f2;
   --bead-muted: #8a94a6;
+
+  /* 定稿动效「种子生长」：基准 700ms ÷ 0.875 = 实际展开 800ms（实机复看后提速）。
+     所有时长写成 基准ms / --motion-speed；必须与 app.js 的 MOTION_SPEED 一致。 */
+  --motion-speed: 0.875;
+  /* 胶囊在面板窗口内 left 272 / top 0 / 68×26；.board 的 border-box 是
+     inset:1px 后的 611×298，换算成百分比即下面这块起始裁剪区。
+     终态的 14px 圆角与 .board 自身 border-radius 对齐。 */
+  --bead-seed-clip: inset(0 44.4% 91.3% 44.4% round 13px);
+  --bead-full-clip: inset(0 0 0 0 round 14px);
 }
 
 * { box-sizing: border-box; outline: none; }
@@ -75,6 +84,16 @@ html, body {
   pointer-events: none;
   transition: none;
 }
+/* 展开启动的那一帧就藏起胶囊。Rust 的 SetWindowPos 把窗口左移 272px 并放大，
+   而 WebView 可能还合成着上一帧（胶囊按旧坐标 left:0 绘制），于是会在新窗口
+   左端闪出一个错位的胶囊、下一帧才随 shape=panel 消失。CSS 改不了 native
+   窗口的时机，只能保证窗口变化之前胶囊已经不可见。
+   放在 hover_pending 规则之后，同特异性下由本条接管；不带 transition，立即生效。 */
+#root[data-capsule-gone] #capsule {
+  opacity: 0;
+  transition: none;
+  pointer-events: none;
+}
 /* 缩回胶囊的那一帧：胶囊要立刻在原位出现，不能从 0 再淡 220ms */
 #root[data-capsule-instant] #capsule { transition: none; }
 
@@ -83,7 +102,8 @@ html, body {
    **窗口 resize 只发生在画面不可见的那一帧** —— 展开时先全透明再变大，
    收起时先淡到 0 再缩回。可见期间改窗口尺寸，合成器会把上一帧的白底面板
    留在胶囊大小的窗口里，就是那块偶发的白色「Bead」矩形。
-   只补间 opacity / transform；面板不做 box-shadow / filter / backdrop-filter 过渡。
+   可见帧里只补间 clip-path / opacity / transform（见下方「种子生长」）；
+   面板不做 box-shadow / filter / backdrop-filter 过渡。
    窗口本体、html、body、宿主背景全部透明，新尺寸窗口在首帧不会露白。 */
 #board-host {
   position: absolute;
@@ -103,43 +123,87 @@ html, body {
   will-change: opacity, transform;
 }
 
-/* 进入态：与 closing 终态完全一致 —— 弹出就是回收的逆向 */
-#board-host[data-phase='entering'] .board {
+/* ========== 种子生长（定稿，展开 800ms） ==========
+   白板从胶囊那一小块长出来：窗口尺寸仍由 app.js 在全透明帧一次切到 613×300，
+   可见帧里只改 .board 的 clip-path，内容布局全程不变形、不重排。
+   不用 box-shadow / filter / backdrop-filter —— 透明窗口会把半透明边缘合成成亮边。 */
+#board-host[data-phase='entering'] .board,
+#board-host[data-phase='closing'] .board,
+#board-host[data-phase='hidden'] .board {
+  clip-path: var(--bead-seed-clip);
+}
+/* 宿主在 entering 时 visibility:hidden，所以 opacity 0 不会被人看到；
+   shown 那一帧 opacity 瞬间置 1，第一眼就是与胶囊同位置同大小的白块，没有淡入感。 */
+#board-host[data-phase='entering'] .board,
+#board-host[data-phase='hidden'] .board {
   opacity: 0;
-  transform: translateY(-4px) scale(0.99);
 }
-/* 展开：opacity 140ms / transform 160ms，与 closing 参数相同、方向相反 */
+/* 展开：裁剪区用强 ease-out 一次铺开（基准 460ms / 40ms，按 --motion-speed 折算）。 */
 #board-host[data-phase='shown'] .board {
+  clip-path: var(--bead-full-clip);
   opacity: 1;
-  transform: none;
-  transition: opacity 140ms cubic-bezier(0.4, 0, 1, 1),
-              transform 160ms cubic-bezier(0.4, 0, 1, 1);
+  transition: clip-path calc(460ms / var(--motion-speed)) cubic-bezier(0.22, 1, 0.36, 1)
+                          calc(40ms / var(--motion-speed)),
+              opacity 1ms linear;
 }
-/* 收起：opacity 140ms / transform 160ms，cubic-bezier(0.4, 0, 1, 1)；
-   这一段走完（transitionend 或 180ms 兜底）之前绝不碰窗口尺寸 */
+/* 收起：裁剪区先朝胶囊口收回（基准 320/90ms），最后整板淡出（基准 90ms，延迟 470ms）。
+   opacity 的 transitionend 是 finishCollapse 的主时钟，结束时刻必须等于
+   app.js 的 EXIT_TIMEOUT_MS（基准 560ms 按同一速度折算）。 */
 #board-host[data-phase='closing'] .board {
   opacity: 0;
-  transform: translateY(-4px) scale(0.99);
-  transition: opacity 140ms cubic-bezier(0.4, 0, 1, 1),
-              transform 160ms cubic-bezier(0.4, 0, 1, 1);
+  transition: clip-path calc(320ms / var(--motion-speed)) cubic-bezier(0.32, 0, 0.67, 0)
+                          calc(90ms / var(--motion-speed)),
+              opacity calc(90ms / var(--motion-speed)) linear
+                      calc(470ms / var(--motion-speed));
 }
-/* 收起途中回到胶囊：从当前计算值反向补间，200ms 回正，不改窗口尺寸 */
+/* 收起途中回到胶囊：从当前计算值把裁剪区补回满板，不改窗口尺寸。 */
 #board-host[data-phase='reversing'] .board {
+  clip-path: var(--bead-full-clip);
   opacity: 1;
-  transform: none;
-  transition: opacity 200ms cubic-bezier(0.16, 1, 0.3, 1),
-              transform 200ms cubic-bezier(0.16, 1, 0.3, 1);
+  transition: clip-path calc(400ms / var(--motion-speed)) cubic-bezier(0.22, 1, 0.36, 1),
+              opacity 1ms linear;
 }
 
-/* 卡片错峰：第 n 张 delay = min(n*30ms, 120ms)，各自 200ms 淡入 + 下移归位。 */
+/* 内容层：面板头部 / 设置 / 历史等块随白板铺开后浮出；
+   .board__cards 交给卡片自己的 animation，父级不能再压一层 opacity。 */
+#board-host[data-phase='entering'] .board > *:not(.board__cards),
+#board-host[data-phase='closing'] .board > *:not(.board__cards),
+#board-host[data-phase='hidden'] .board > *:not(.board__cards) {
+  opacity: 0;
+  transform: translateY(10px);
+}
+#board-host[data-phase='shown'] .board > *:not(.board__cards),
+#board-host[data-phase='reversing'] .board > *:not(.board__cards) {
+  opacity: 1;
+  transform: none;
+  transition: opacity calc(300ms / var(--motion-speed)) cubic-bezier(0.22, 1, 0.36, 1)
+                        calc(190ms / var(--motion-speed)),
+              transform calc(300ms / var(--motion-speed)) cubic-bezier(0.22, 1, 0.36, 1)
+                        calc(190ms / var(--motion-speed));
+}
+#board-host[data-phase='closing'] .board > *:not(.board__cards) {
+  transition: opacity calc(170ms / var(--motion-speed)) ease
+                        calc(120ms / var(--motion-speed)),
+              transform calc(170ms / var(--motion-speed)) ease
+                        calc(120ms / var(--motion-speed));
+}
+
+/* 卡片错峰：以胶囊（面板水平中点）为中心，中卡先出、两侧同步扩散。
+   --card-delay / --card-fold-delay 由 app.js 的 applyCardStagger 按到中心的距离算。
+   增卡仍走 200ms 的 bead-card-enter，不被展开动效拖慢。 */
 #board-host[data-cards='enter'] .card {
-  /* 展开时的卡片入场：只动 opacity/transform（不动 flex），从下方 6px 归位。
-     不复用 card-pop-in：它带 1.02 的过冲和 -6px 的反向起点，展开时看起来是回弹。 */
-  animation: bead-card-enter 200ms cubic-bezier(0.16, 1, 0.3, 1) var(--card-delay, 0ms) both;
+  animation: bead-card-bloom calc(300ms / var(--motion-speed))
+             cubic-bezier(0.22, 1, 0.36, 1) var(--card-delay, 0ms) both;
 }
 /* 入场结束后停在 settled：不回退到 card-pop-in（否则会再播放一次过冲动画） */
 #board-host[data-cards='settled'] .card {
   animation: none;
+}
+/* 收起反序：外围先走、中卡最后，视觉上朝胶囊聚拢。
+   放在 settled 之后，同特异性下由它接管收起这一段。 */
+#board-host[data-phase='closing'] .card {
+  animation: bead-card-fold calc(170ms / var(--motion-speed))
+             cubic-bezier(0.4, 0, 0.2, 1) var(--card-fold-delay, 0ms) both;
 }
 /* 增卡：只有新出现的那张卡播一次入场。它先被 board 的旧宽裁住，
    随宽度补间露出时正好在播放；其余卡不重播。 */
@@ -176,18 +240,34 @@ html, body {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: none; }
 }
+/* 展开入场：从下方轻浮上来，不带过冲（过冲留给外壳的 ease-out 曲线）。 */
+@keyframes bead-card-bloom {
+  from { opacity: 0; transform: translateY(10px) scale(0.985); }
+  to   { opacity: 1; transform: none; }
+}
+/* 收起退场：朝下方回收，与 bloom 方向相反。 */
+@keyframes bead-card-fold {
+  from { opacity: 1; transform: none; }
+  to   { opacity: 0; transform: translateY(8px) scale(0.985); }
+}
 
 @media (prefers-reduced-motion: reduce) {
+  /* 速度拉到近似瞬时；app.js 的 MOTION_SPEED 同步取 60，收起不会还在等完整动效时长。
+     delay 也必须清掉，否则卡片仍会按 --card-delay 晚 320ms 才出现。 */
+  :root { --motion-speed: 60; }
   #capsule,
   #board-host .board,
+  #board-host .board > *,
   #board-host .card,
   #board-host .card.is-entering,
   #board-host .card.is-removing,
   .icon-btn--lock,
   .icon-btn--history,
   .history__item {
-    transition-duration: 0.01ms;
-    animation-duration: 0.01ms;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
   }
 }
 
@@ -506,6 +586,24 @@ html, body {
   cursor: pointer;
 }
 
+/* OCR 引擎区块：整行标签 + 细进度条，与设置面板其余项保持同一套边框和字号。 */
+.board__label { flex-basis: 100%; font-size: 11px; color: var(--bead-muted); }
+.board__actions { display: inline-flex; gap: 6px; }
+.board__hint--error { color: #b4453a; }
+.board__settings .board__progress {
+  flex-basis: 100%;
+  width: 100%;
+  height: 5px;
+  border: none;
+  border-radius: 3px;
+  overflow: hidden;
+  appearance: none;
+  background: var(--bead-border);
+}
+.board__settings .board__progress[hidden] { display: none; }
+.board__settings .board__progress::-webkit-progress-bar { background: var(--bead-border); border-radius: 3px; }
+.board__settings .board__progress::-webkit-progress-value { background: var(--bead-primary-soft); border-radius: 3px; }
+
 /* ========== 翻译历史 ==========
    与设置面板同层的内联面板：占满剩余高度、内部滚动，不浮在卡片编辑区上方。 */
 .board__history {
@@ -710,6 +808,62 @@ html, body {
   word-break: break-word;
 }
 .card__text:focus { outline: none; }
+
+/* 卡片内粘贴图片：缩略图只占输入框下方一条固定高度（56px），
+   textarea 仍是 flex:1，面板窗口高度保持不变；文本可视区按需缩小，内容不会被裁。 */
+.card__media {
+  position: relative;
+  flex: none;
+  height: 56px;
+  border: 1px solid #dbe3ee;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #eef2f8;
+}
+.card__media[hidden] { display: none; }
+.card__media-thumb {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background-position: center;
+  background-size: cover;
+  background-repeat: no-repeat;
+}
+/* OCR 失败/无文字的内联状态：贴在缩略图底部，不弹出任何全局提示。 */
+.card__media-status {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 2px 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #4b5a6d;
+  background: rgba(255, 255, 255, 0.88);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.card__media-status[hidden] { display: none; }
+/* × 只压在缩略图右上角，不进入上方文本区，不遮挡识别结果。 */
+.card__media-close {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  z-index: 1;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.92);
+  color: #4b5a6d;
+  font-size: 13px;
+  line-height: 18px;
+  text-align: center;
+  cursor: pointer;
+}
+.card__media-close:hover { color: #1f2a37; background: #fff; }
 
 .card__actions { display: flex; flex-shrink: 0; justify-content: flex-end; gap: 4px; }
 

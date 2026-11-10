@@ -1,7 +1,7 @@
 # Maintainer: KrisShin <KrisShin@users.noreply.github.com>
 # Bead — 悬停即译、多语言并排联动的桌面翻译工具（Tauri v2）
 pkgname=bead
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="悬停即译、五语同步的轻量桌面多向翻译工具 (Tauri v2 + Rust)"
 arch=('x86_64')

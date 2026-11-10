@@ -64,7 +64,15 @@ foreach ($voice in $synth.GetInstalledVoices()) {
 $synth.Dispose()
 if ($items.Count -eq 0) { Write-Output '[]' } else { $items | ConvertTo-Json -Compress -Depth 3 }
 "#;
-    let output = Command::new("powershell")
+    let mut command = Command::new("powershell");
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        // `-WindowStyle Hidden` 是窗口创建后再隐藏，仍会闪一帧控制台；
+        // 只有 CREATE_NO_WINDOW 让进程根本不创建控制台窗口。
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command
         .args([
             "-NoProfile",
             "-NonInteractive",
