@@ -941,13 +941,16 @@ struct AppState {
     update_latest: Mutex<Option<String>>,
     /// 翻译任务代次：只有最新一代可以推送 state，防止慢请求回来覆盖新内容。
     translation_epoch: AtomicU64,
+    /// 本次展开是否已经用历史做过空态回填：每个展开会话只回填一次。
+    /// 用户点「清空」后文档为空，后续快照不得再用历史把刚清掉的文字填回来。
+    history_previewed: AtomicBool,
     /// 选区图标待确认的文本：点击图标才消费；超时/关开关/热键取词即丢弃。
     pending_selection: Mutex<Option<String>>,
     /// 图标显示代次：定时隐藏据此放弃旧定时器，避免把新图标提前收掉。
     anchor_epoch: AtomicU64,
     /// 图标窗口是否创建成功；失败时设置项如实标为不可用（不静默 no-op）。
     anchor_ready: AtomicBool,
-    /// 键盘选区兜底开关（默认关闭）：监听线程据此注册/反注册键盘设备与事件钩子。
+    /// 键盘选区兜底（固定开启，随划词开关启停）：监听线程据此注册键盘设备与事件钩子。
     keyboard_fallback: Arc<AtomicBool>,
     /// 划词热键线程句柄；改键与退出时先反注册旧键再结束线程。
     #[cfg(windows)]
@@ -1057,7 +1060,11 @@ fn snapshot(state: &AppState) -> StateView {
         HoverState::Collapsing { .. } => ("collapsing", false),
     };
     // 面板展开但还没有新识别结果时，用最近一条历史填充；有在途翻译或已有新结果时不动。
-    if view == "expanded" {
+    // 每个展开会话只回填一次：用户点「清空」后文档为空，同一会话里的后续快照
+    // （聚焦卡片、改设置、退出编辑）不能再拿历史把刚清掉的文字填回来。
+    let was_previewed =
+        state.history_previewed.swap(history_preview_flag(view), Ordering::SeqCst);
+    if should_preview_history(view, was_previewed) {
         preview_latest_history(&mut coordinator, state);
     }
     let authoritative = coordinator.document().authoritative();
@@ -1182,6 +1189,17 @@ fn recognize_clipboard_text(app: &tauri::AppHandle, language_tag: Option<&str>) 
         }
     }
     clipboard_ocr::recognize_bitmap_system(&bitmap, language_tag)
+}
+
+/// 展开会话的历史回填门闩：展开态置真，离开面板（收起 / 胶囊 / 待展开）即复位。
+fn history_preview_flag(view: &str) -> bool {
+    view == "expanded"
+}
+
+/// 本次快照是否允许用历史做空态回填：每个展开会话的第一次快照才允许。
+/// 清空是显式动作，「清空后的空文档」不能被历史回填，否则看起来只清掉了缩略图。
+fn should_preview_history(view: &str, was_previewed: bool) -> bool {
+    view == "expanded" && !was_previewed
 }
 
 /// 面板打开且既没有新识别结果、也没有在途请求时，用最近一条历史填充面板。
@@ -3907,6 +3925,7 @@ fn main() {
             ocr: ocr::Manager::default(),
             update_latest: Mutex::new(None),
             translation_epoch: AtomicU64::new(0),
+            history_previewed: AtomicBool::new(false),
             pending_selection: Mutex::new(None),
             anchor_epoch: AtomicU64::new(0),
             anchor_ready: AtomicBool::new(false),
@@ -4605,5 +4624,28 @@ mod focus_return_tests {
         assert_eq!(focus_return_target(0x11, 0x22), Some(0x11));
         assert_eq!(focus_return_target(0, 0x22), None);
         assert_eq!(focus_return_target(0x22, 0x22), None);
+    }
+}
+
+#[cfg(test)]
+mod history_preview_tests {
+    use super::*;
+
+    #[test]
+    fn an_explicitly_cleared_board_is_not_refilled_by_history_within_the_same_panel_session() {
+        // 展开后的第一次快照允许用历史做空态回填……
+        assert!(should_preview_history("expanded", false));
+        // ……但用户点「清空」后，同一展开会话里的后续快照不得再把刚清掉的文字填回来。
+        assert!(!should_preview_history("expanded", true));
+    }
+
+    #[test]
+    fn reopening_the_panel_starts_a_new_session_that_previews_history_once() {
+        // 离开面板（收起 / 胶囊 / 待展开）即复位门闩，下次展开仍按原设计回填一次。
+        assert!(!history_preview_flag("collapsing"));
+        assert!(!history_preview_flag("capsule"));
+        assert!(!history_preview_flag("hover_pending"));
+        assert!(!should_preview_history("capsule", true));
+        assert!(should_preview_history("expanded", false));
     }
 }
