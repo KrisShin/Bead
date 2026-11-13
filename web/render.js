@@ -111,16 +111,12 @@ export function renderBoard(view) {
       ? `<div class="board__settings">
     <label><input type="checkbox" data-setting="auto_read_clipboard"${view.settings.auto_read_clipboard ? ' checked' : ''} />自动读剪贴板</label>
     <label>悬停 <input type="number" data-setting="hover_delay_ms" value="${view.settings.hover_delay_ms}" min="50" max="2000" step="50" /> ms 后展开</label>
-    <label><input type="checkbox" data-setting="selection_enabled"${view.settings.selection_enabled ? ' checked' : ''} />划词（快捷键触发取词）</label>
+    <label><input type="checkbox" data-setting="selection_enabled"${view.settings.selection_enabled ? ' checked' : ''} />划词（快捷键触发取词，开启后划词即显示翻译图标）</label>
     <label>快捷键 <input type="text" data-setting="selection_hotkey" value="${escapeHtml(view.settings.selection_hotkey ?? '')}" spellcheck="false" autocomplete="off" /></label>
     ${view.settings.selection_hotkey_error ? `<span class="board__hint">${escapeHtml(view.settings.selection_hotkey_error)}</span>` : ''}
-    <label><input type="checkbox" data-setting="selection_anchor_enabled"${view.settings.selection_anchor_enabled ? ' checked' : ''}${view.settings.selection_anchor_supported === false ? ' disabled' : ''} />划词后显示翻译图标</label>
-    <label><input type="checkbox" data-setting="selection_keyboard_fallback"${view.settings.selection_keyboard_fallback ? ' checked' : ''}${view.settings.selection_anchor_supported === false ? ' disabled' : ''} />键盘选区兜底（监听键盘活动与文本选区变化，不记录按键内容）</label>
+    ${view.settings.selection_watch_error ? `<span class="board__hint board__hint--error">${escapeHtml(view.settings.selection_watch_error)}</span>` : ''}
+    ${view.settings.selection_anchor_supported === false ? '<span class="board__hint">当前平台不支持划词图标，快捷键取词仍可用。</span>' : ''}
     <label><input type="checkbox" data-setting="autostart" ${view.settings.autostart_enabled ? 'checked' : ''} />开机自启</label>
-    <label><input type="checkbox" data-setting="auto_check_updates" ${view.settings.auto_check_updates ? 'checked' : ''} />启动时检查更新</label>
-    <label>朗读语速 <input type="number" data-setting="tts_rate" value="${Number(view.settings.tts_rate ?? 1)}" min="0.5" max="2" step="0.1" /> ×</label>
-    <label>朗读音量 <input type="number" data-setting="tts_volume" value="${Number(view.settings.tts_volume ?? 80)}" min="0" max="100" step="5" /></label>
-    <label><input type="checkbox" data-setting="tts_online_fallback"${view.settings.tts_online_fallback !== false ? ' checked' : ''} />缺音色时使用在线朗读</label>
     <span class="board__hint">有本地音色时不联网；仅在该语言缺少音色时才把卡片文本发送给在线朗读服务。</span>
     ${renderOcrSettings(view.settings)}
     <button type="button" data-action="clear-history">清空历史</button>
@@ -182,7 +178,15 @@ export function renderBoard(view) {
         className: 'icon-btn--history',
       })}
       ${view.update_latest ? `<button type="button" class="icon-btn" data-action="open-release" title="下载新版 ${escapeHtml(view.update_latest)}">${escapeHtml(view.update_latest)}</button>` : ''}
-      ${HeadButton({ action: 'languages', iconName: 'settings', title: '设置', label: '设置' })}
+      ${HeadButton({
+        action: 'languages',
+        iconName: 'settings',
+        title: '设置',
+        label: view.languagesOpen ? '关闭设置' : '设置',
+        ariaLabel: '设置',
+        pressed: Boolean(view.languagesOpen),
+        className: 'icon-btn--settings',
+      })}
       ${HeadButton({
         action: 'pin',
         iconName: view.locked ? 'lock' : 'unlock',

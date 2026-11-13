@@ -919,11 +919,7 @@ function playSpeechFile(result) {
   if (!currentAudio) currentAudio = new Audio();
   currentAudio.pause();
   currentAudio.src = url; // 换 src 后自然从头播；复用同一个元素，避免每点一次就泄漏一个 Audio
-  const settings = lastView?.settings ?? {};
-  const volume = Number(settings.tts_volume ?? 80);
-  const rate = Number(settings.tts_rate ?? 1);
-  currentAudio.volume = Math.min(1, Math.max(0, volume / 100));
-  currentAudio.playbackRate = Math.min(2, Math.max(0.5, rate));
+  // 语速固定 1 倍速、音量交给系统默认：设置页已移除这两个调整项，不再读旧配置。
   currentAudio.onended = () => {
     currentAudio.onended = null;
     currentAudio.onerror = null;
@@ -1101,23 +1097,15 @@ async function saveProvider() {
 }
 
 async function saveSettings() {
-  const checked = (name, fallback = false) =>
-    boardHost.querySelector(`[data-setting="${name}"]`)?.checked ?? fallback;
-  const value = (name) =>
-    Number(boardHost.querySelector(`[data-setting="${name}"]`)?.value);
+  const checked = (name) =>
+    boardHost.querySelector(`[data-setting="${name}"]`)?.checked ?? false;
   const view = await send('set_settings', {
     auto_read_clipboard: checked('auto_read_clipboard'),
     hover_delay_ms:
       Number(boardHost.querySelector('[data-setting="hover_delay_ms"]')?.value) || 200,
     selection_enabled: checked('selection_enabled'),
-    selection_anchor_enabled: checked('selection_anchor_enabled'),
-    selection_keyboard_fallback: checked('selection_keyboard_fallback'),
     selection_hotkey:
       boardHost.querySelector('[data-setting="selection_hotkey"]')?.value ?? '',
-    auto_check_updates: checked('auto_check_updates'),
-    tts_rate: value('tts_rate') || 1,
-    tts_volume: Number.isFinite(value('tts_volume')) ? value('tts_volume') : 80,
-    tts_online_fallback: checked('tts_online_fallback', true),
   });
   await refreshSpeechCapabilities();
   return view;

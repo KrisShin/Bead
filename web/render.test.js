@@ -236,21 +236,36 @@ describe('board rendering', () => {
     expect(html).toContain('开机自启');
   });
 
-  it('shows the selection anchor switch and greys it out when unsupported', () => {
-    const on = renderBoard({
+  it('merges the anchor icon into the selection switch and explains unsupported platforms', () => {
+    // 方案 C：图标显示不再有独立开关，只保留一个划词开关。
+    const html = renderBoard({
       ...expanded,
       languagesOpen: true,
-      settings: { selection_anchor_enabled: true, selection_anchor_supported: true },
+      settings: { selection_enabled: true, selection_anchor_supported: true },
     });
-    expect(on).toContain('data-setting="selection_anchor_enabled" checked');
-    expect(on).not.toContain('data-setting="selection_anchor_enabled" checked disabled');
+    expect(html).not.toContain('data-setting="selection_anchor_enabled"');
+    expect(html).toContain('开启后划词即显示翻译图标');
+    expect(html).not.toContain('当前平台不支持划词图标');
 
     const unsupported = renderBoard({
       ...expanded,
       languagesOpen: true,
-      settings: { selection_anchor_enabled: false, selection_anchor_supported: false },
+      settings: { selection_enabled: true, selection_anchor_supported: false },
     });
-    expect(unsupported).toContain('data-setting="selection_anchor_enabled" disabled');
+    expect(unsupported).toContain('当前平台不支持划词图标');
+  });
+
+  it('surfaces a failed selection watcher instead of silently doing nothing', () => {
+    const html = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      settings: {
+        selection_enabled: true,
+        selection_watch_error: '选区监听启动失败，本次运行不会自动取词；可用快捷键触发取词。',
+      },
+    });
+    expect(html).toContain('board__hint board__hint--error');
+    expect(html).toContain('选区监听启动失败');
   });
 
   it('renders a hotkey input and surfaces registration failures instead of hiding them', () => {
@@ -275,29 +290,30 @@ describe('board rendering', () => {
     expect(failed).toContain('请改键或改用划词图标');
   });
 
-  it('shows the keyboard fallback switch as off by default and disabled when unsupported', () => {
-    const off = renderBoard({
+  it('removes the switches that are now fixed defaults', () => {
+    // 启动检查更新 / 朗读语速 / 朗读音量 / 在线朗读兜底 / 键盘选区兜底：
+    // 界面不再提供开关，行为固定为开启或默认值。
+    const html = renderBoard({
       ...expanded,
       languagesOpen: true,
-      settings: { selection_keyboard_fallback: false, selection_anchor_supported: true },
+      settings: {
+        auto_read_clipboard: true,
+        hover_delay_ms: 200,
+        selection_enabled: true,
+        selection_hotkey: 'Ctrl+Alt+B',
+        selection_anchor_supported: true,
+        autostart_enabled: false,
+      },
     });
-    expect(off).toContain('data-setting="selection_keyboard_fallback"');
-    expect(off).not.toContain('data-setting="selection_keyboard_fallback" checked');
-    expect(off).toContain('不记录按键内容');
-
-    const on = renderBoard({
-      ...expanded,
-      languagesOpen: true,
-      settings: { selection_keyboard_fallback: true, selection_anchor_supported: true },
-    });
-    expect(on).toContain('data-setting="selection_keyboard_fallback" checked');
-
-    const unsupported = renderBoard({
-      ...expanded,
-      languagesOpen: true,
-      settings: { selection_keyboard_fallback: false, selection_anchor_supported: false },
-    });
-    expect(unsupported).toContain('data-setting="selection_keyboard_fallback" disabled');
+    expect(html).not.toContain('data-setting="auto_check_updates"');
+    expect(html).not.toContain('data-setting="tts_rate"');
+    expect(html).not.toContain('data-setting="tts_volume"');
+    expect(html).not.toContain('data-setting="tts_online_fallback"');
+    expect(html).not.toContain('data-setting="selection_keyboard_fallback"');
+    expect(html).not.toContain('启动时检查更新');
+    expect(html).not.toContain('朗读语速');
+    // 在线兜底的隐私披露仍要保留：开关没了，但行为仍会把文本发出去。
+    expect(html).toContain('缺少音色时才把卡片文本发送给在线朗读服务');
   });
 
   // --- 新增功能测试 ---

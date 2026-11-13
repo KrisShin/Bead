@@ -395,13 +395,26 @@ fn spawn_panel_ocr(app: tauri::AppHandle) {
     });
 }
 
-/// 选区图标开关当前值：Raw Input 线程松手时用它复核，避免关闭后还有在途事件弹图标。
+/// 图标 / 选区监听是否生效（方案 C 的唯一真值来源）：划词开关 × 平台能力位。
+///
+/// 关闭划词即一并关闭图标与键盘兜底，不保留独立状态；能力不可用时不得出现
+/// 「已开启」的假状态。
+fn anchor_gate(selection_enabled: bool, anchor_ready: bool) -> bool {
+    cfg!(windows) && selection_enabled && anchor_ready
+}
+
+/// 划词开关当前值：Raw Input 线程松手时用它复核，避免关闭后还有在途事件弹图标。
+///
+/// 图标显示已与划词开关合并（方案 C）：这里只看 `selection_enabled` 与能力位，
+/// 不再读旧字段 `selection_anchor_enabled`。
 fn anchor_enabled(app: &tauri::AppHandle) -> bool {
-    app.state::<AppState>()
+    let state = app.state::<AppState>();
+    let selection_enabled = state
         .settings
         .lock()
         .expect("settings poisoned")
-        .selection_anchor_enabled
+        .selection_enabled;
+    anchor_gate(selection_enabled, state.anchor_ready.load(Ordering::SeqCst))
 }
 
 /// 自动划词连续失败时写一条降级提示，展示在设置页热键输入框下方。
@@ -527,14 +540,18 @@ fn show_selection_anchor(
     });
 }
 
-/// 按开关启停 Raw Input 监听。关闭时停线程并反注册设备，此后不注册任何全局监听。
+/// 划词开关的运行时副作用：启停选区监听线程（图标与键盘兜底共用这一条线程）。
 ///
-/// 监听线程启动失败或图标窗口建不出来时，把内存里的开关与能力位一起落回不可用，
-/// 让设置页如实置灰（规范：能力探测失败不得静默 no-op）。
+/// 图标显示已与划词开关合并：打开划词即启动监听、即显示图标；关闭即停线程并反注册设备，
+/// 此后不注册任何全局监听。能力不可用（非 Windows / 图标窗口建不出来 / 线程启动失败）时
+/// 如实落回不可用并写一条设置页提示，不保留「已开启」的假状态（规范：不得静默 no-op）。
 fn apply_anchor_watcher(app: &tauri::AppHandle, enabled: bool) {
     #[cfg(windows)]
     {
         let state = app.state::<AppState>();
+        let ready = state.anchor_ready.load(Ordering::SeqCst);
+        // 键盘选区兜底固定开启：只在划词开着且图标链路可用时注册键盘输入（不记录键值）。
+        state.keyboard_fallback.store(anchor_gate(enabled, ready), Ordering::SeqCst);
         let mut watcher = state
             .selection_watch
             .lock()
@@ -544,24 +561,25 @@ fn apply_anchor_watcher(app: &tauri::AppHandle, enabled: bool) {
                 handle.stop();
             }
             clear_selection_unsupported_hint(app);
-        } else if !state.anchor_ready.load(Ordering::SeqCst) {
-            // 图标窗口不可用：开关不能在界面上保持「已开启」。
-            state
-                .settings
-                .lock()
-                .expect("settings poisoned")
-                .selection_anchor_enabled = false;
+            clear_selection_watch_error(app);
+        } else if !ready {
+            set_selection_watch_error(
+                app,
+                "划词图标窗口不可用，本次运行不会显示翻译图标；快捷键取词仍然可用。",
+            );
         } else if watcher.is_none() {
             match selection_watch::start(app.clone()) {
-                Some(handle) => *watcher = Some(handle),
+                Some(handle) => {
+                    *watcher = Some(handle);
+                    clear_selection_watch_error(app);
+                }
                 None => {
                     state.anchor_ready.store(false, Ordering::SeqCst);
                     state.selection_diag.note("watcher", "start_failed", "unknown", 0);
-                    state
-                        .settings
-                        .lock()
-                        .expect("settings poisoned")
-                        .selection_anchor_enabled = false;
+                    set_selection_watch_error(
+                        app,
+                        "选区监听启动失败，本次运行不会自动取词；可用快捷键触发取词。",
+                    );
                 }
             }
         }
@@ -569,6 +587,55 @@ fn apply_anchor_watcher(app: &tauri::AppHandle, enabled: bool) {
     // 关闭、或刚才因能力不可用被落回关闭：都要把图标与待确认文本一起清掉。
     if !enabled || !anchor_enabled(app) {
         dismiss_anchor(app);
+    }
+}
+
+/// 选区链路（图标 / 键盘兜底）的能力失败提示：写进设置页，不静默吞掉。
+#[cfg(windows)]
+fn set_selection_watch_error(app: &tauri::AppHandle, message: &str) {
+    let state = app.state::<AppState>();
+    let slot = state.selection_watch_error.lock();
+    if let Ok(mut slot) = slot {
+        *slot = Some(message.into());
+    }
+}
+
+#[cfg(windows)]
+fn clear_selection_watch_error(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let _ = state.selection_watch_error.lock().map(|mut slot| slot.take());
+}
+
+fn selection_watch_error(state: &AppState) -> Option<String> {
+    #[cfg(windows)]
+    {
+        return state
+            .selection_watch_error
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        None
+    }
+}
+
+#[cfg(test)]
+mod selection_policy_tests {
+    use super::*;
+
+    /// 方案 C 真值表：图标与键盘兜底都和划词开关一一对应，不保留独立状态。
+    #[test]
+    fn the_icon_and_keyboard_fallback_follow_the_selection_switch() {
+        // 划词关闭：无论能力位如何都不生效。
+        assert!(!anchor_gate(false, false));
+        assert!(!anchor_gate(false, true));
+        // 划词开启但能力不可用（非 Windows / 图标窗口建不出来）：不得假开启。
+        assert!(!anchor_gate(true, false));
+        // 划词开启且能力可用：Windows 上唯一生效的组合。
+        assert_eq!(anchor_gate(true, true), cfg!(windows));
     }
 }
 
@@ -626,9 +693,6 @@ struct SpeechCapabilityView {
 
 #[derive(Serialize, Clone)]
 struct SpeechCapabilitiesView {
-    online_fallback: bool,
-    rate: f64,
-    volume: u8,
     languages: Vec<SpeechCapabilityView>,
     /// 枚举系统语音失败时如实回传；此时「本地/在线」判断只能标成未知或在线。
     voice_error: Option<String>,
@@ -967,6 +1031,9 @@ struct AppState {
     /// 自动划词连续失败时给设置页的降级提示（热键兜底）；自动识别成功后清除。
     #[cfg(windows)]
     selection_unsupported_hint: Mutex<Option<String>>,
+    /// 选区链路能力失败（图标窗口 / 监听线程 / 键盘输入注册）的提示；设置页内联展示。
+    #[cfg(windows)]
+    selection_watch_error: Mutex<Option<String>>,
     /// 点开划词面板前的原前台窗口句柄：面板收起时若焦点仍在本应用，还给这个窗口。
     /// 用户如果已经点了别的应用，前台不再是本窗口，收起时不会抢回焦点（见 restore_focus）。
     #[cfg(windows)]
@@ -1001,21 +1068,14 @@ struct SettingsView {
     leave_grace_ms: u64,
     selection_enabled: bool,
     selection_hotkey: String,
-    /// 选区锚点图标开关：Windows 才可用，不可用时前端把开关置灰。
-    selection_anchor_enabled: bool,
+    /// 划词图标是否随划词开关生效（Windows 且图标窗口可用）。
+    /// 图标显示不再是独立开关：前端只拿它决定是否给出能力提示。
     selection_anchor_supported: bool,
-    /// 键盘选区兜底开关（注册键盘设备与文本选区事件，不记录键值）。默认关闭。
-    selection_keyboard_fallback: bool,
     /// 热键注册失败或文本无效的明确原因；为空表示当前热键可用。
     selection_hotkey_error: Option<String>,
+    /// 选区链路能力失败（图标窗口 / 监听线程）的提示；为空表示无异常。
+    selection_watch_error: Option<String>,
     autostart_enabled: bool,
-    auto_check_updates: bool,
-    /// 朗读语速倍率（0.5–2.0）。本地引擎直接生效，在线音频由前端倍速播放。
-    tts_rate: f64,
-    /// 朗读音量（0–100）。
-    tts_volume: u8,
-    /// 该语言没有本地音色时，是否允许把文本发往在线朗读服务。默认开启。
-    tts_online_fallback: bool,
     /// OCR 引擎选择：`system` / `bundled`（用户选择，未安装时仍保留）。
     ocr_engine: String,
     /// 实际生效的引擎：选择 bundled 但未安装 / 加载失败时为 `system`。
@@ -1105,21 +1165,16 @@ fn snapshot(state: &AppState) -> StateView {
             leave_grace_ms: settings.leave_grace_ms,
             selection_enabled: settings.selection_enabled,
             selection_hotkey: settings.selection_hotkey.clone(),
-            selection_anchor_enabled: settings.selection_anchor_enabled,
             selection_anchor_supported: cfg!(windows)
                 && state.anchor_ready.load(Ordering::SeqCst),
-            selection_keyboard_fallback: settings.selection_keyboard_fallback,
             selection_hotkey_error: state
                 .hotkey_error
                 .lock()
                 .expect("hotkey error poisoned")
                 .clone()
                 .or_else(|| selection_unsupported_hint(state)),
+            selection_watch_error: selection_watch_error(state),
             autostart_enabled: settings.autostart_enabled,
-            auto_check_updates: settings.auto_check_updates,
-            tts_rate: settings.tts_rate,
-            tts_volume: settings.tts_volume,
-            tts_online_fallback: settings.tts_online_fallback,
             ocr_engine: settings.ocr_engine.clone(),
             ocr_effective_engine: effective_ocr_engine(state, &settings),
             ocr_bundled_supported: cfg!(windows),
@@ -1238,12 +1293,9 @@ fn preview_latest_history(coordinator: &mut SyncCoordinator<SystemClock>, state:
 }
 
 /// 启动时异步检查（不阻塞启动）；手动检查同步返回结果。失败一律静默。
-fn run_update_check(state: &AppState) {
-    let settings = state.settings.lock().expect("settings poisoned");
-    if !settings.auto_check_updates {
-        return;
-    }
-    drop(settings);
+///
+/// 启动检查固定开启（设置页已移除该开关），但只比较版本与提示，绝不下载安装。
+fn run_update_check() {
     let status = check_for_update(&GitHubReleaseFetcher::default(), env!("CARGO_PKG_VERSION"));
     if let UpdateStatus::UpdateAvailable(_latest) = status {
 }
@@ -1287,18 +1339,15 @@ async fn speak_text(text: String, lang: String, app: tauri::AppHandle) -> SpeakR
     run_speech(text, lang, app).await
 }
 
+/// 朗读语速固定 1 倍速（SAPI 0 级）：设置页已移除调整项，不再读配置。
+const SPEECH_RATE: f64 = 1.0;
+/// 朗读音量固定 100%，音量大头交给系统音量；设置页已移除调整项。
+const SPEECH_VOLUME: u8 = 100;
+
 /// 朗读的实际执行路径。空文本在 `begin` 之前返回，避免无意义地抢占正在播放的卡片。
 async fn run_speech(text: String, lang: String, app: tauri::AppHandle) -> SpeakResult {
     let language = Lang::new(&lang);
-    let (rate, volume, online_fallback) = {
-        let state = app.state::<AppState>();
-        let settings = state.settings.lock().expect("settings poisoned");
-        (
-            settings.tts_rate,
-            settings.tts_volume,
-            settings.tts_online_fallback,
-        )
-    };
+    let (rate, volume) = (SPEECH_RATE, SPEECH_VOLUME);
     if text.trim().is_empty() {
         return speak_error_result(
             0,
@@ -1323,28 +1372,8 @@ async fn run_speech(text: String, lang: String, app: tauri::AppHandle) -> SpeakR
     .await;
     let voices = match voices_result {
         Ok(Ok(voices)) => voices,
-        other => {
-            if !online_fallback {
-                let message = match other {
-                    Ok(Err(error)) => format!("无法读取系统语音：{error}"),
-                    Err(error) => format!("系统语音查询任务失败：{error}"),
-                    _ => "无法读取系统语音".into(),
-                };
-                let state = app.state::<AppState>();
-                state
-                    .speech
-                    .fail(&app, ticket, &lang, "none", message.clone());
-                return speak_error_result(
-                    ticket,
-                    &lang,
-                    "none",
-                    "error",
-                    message,
-                    Some("voice_query_failed"),
-                );
-            }
-            Vec::new()
-        }
+        // 枚举失败时按「没有本地音色」继续，缺音色固定走在线兜底。
+        _ => Vec::new(),
     };
 
     match choose_voice(&language, &voices) {
@@ -1405,24 +1434,6 @@ async fn run_speech(text: String, lang: String, app: tauri::AppHandle) -> SpeakR
             }
         }
         None => {
-            if !online_fallback {
-                let state = app.state::<AppState>();
-                let message = format!(
-                    "未安装 {lang} 语音，且在线兜底已关闭；可在 Windows 设置 → 时间和语言 → 语音 添加"
-                );
-                state
-                    .speech
-                    .fail(&app, ticket, &lang, "none", message.clone());
-                return speak_error_result(
-                    ticket,
-                    &lang,
-                    "none",
-                    "unavailable",
-                    message,
-                    Some("no_voice"),
-                );
-            }
-
             {
                 let state = app.state::<AppState>();
                 state.speech.resolving(&app, ticket, &lang);
@@ -1549,23 +1560,15 @@ fn spawn_local_monitor(app: tauri::AppHandle, ticket: u64, lang: String) {
 /// 各语言朗读能力（只读）。前端在挂载与设置变化后调用，据此 disable 按钮、标「在线」。
 #[tauri::command]
 async fn speech_capabilities(app: tauri::AppHandle) -> SpeechCapabilitiesView {
-    let (langs, rate, volume, online_fallback) = {
+    let langs = {
         let state = app.state::<AppState>();
         let coordinator = state.coordinator.lock().expect("coordinator poisoned");
-        let langs = coordinator
+        coordinator
             .pool()
             .languages()
             .iter()
             .map(|language| language.code().to_string())
-            .collect::<Vec<_>>();
-        drop(coordinator);
-        let settings = state.settings.lock().expect("settings poisoned");
-        (
-            langs,
-            settings.tts_rate,
-            settings.tts_volume,
-            settings.tts_online_fallback,
-        )
+            .collect::<Vec<_>>()
     };
 
     let handle = app.clone();
@@ -1595,30 +1598,19 @@ async fn speech_capabilities(app: tauri::AppHandle) -> SpeechCapabilitiesView {
                     backend: "local".into(),
                     reason: Some(format!("本机音色：{}", voice.id)),
                 }
-            } else if online_fallback {
+            } else {
+                // 缺音色时固定在线兜底（设置页已移除该开关）。
                 SpeechCapabilityView {
                     lang,
                     enabled: true,
                     backend: "online".into(),
                     reason: Some("未安装该语言语音，将使用在线朗读（文本会发送到在线服务）".into()),
                 }
-            } else {
-                SpeechCapabilityView {
-                    lang,
-                    enabled: false,
-                    backend: "none".into(),
-                    reason: Some(
-                        "未安装该语言语音；可在 Windows 设置 → 时间和语言 → 语音 添加".into(),
-                    ),
-                }
             }
         })
         .collect();
 
     SpeechCapabilitiesView {
-        online_fallback,
-        rate,
-        volume,
         languages,
         voice_error,
     }
@@ -3064,7 +3056,8 @@ fn check_updates(state: tauri::State<'_, AppState>) -> StateView {
     snapshot(state.inner())
 }
 
-/// 保存面板设置（自动读剪贴板、悬停延迟、划词、选区图标、更新开关）并即时生效。
+/// 保存面板设置（自动读剪贴板、悬停延迟、划词开关、划词热键）并即时生效。
+/// 划词开关同时决定图标与选区监听的生命周期；朗读参数与更新检查已固定，不再入参。
 /// 延迟生效通过重建状态机完成，展开态会复位——该动作本身就来自展开的面板，代价可接受。
 #[tauri::command(rename_all = "snake_case")]
 fn set_settings(
@@ -3072,19 +3065,12 @@ fn set_settings(
     auto_read_clipboard: bool,
     hover_delay_ms: u64,
     selection_enabled: bool,
-    selection_anchor_enabled: bool,
-    selection_keyboard_fallback: bool,
-    auto_check_updates: bool,
-    tts_rate: Option<f64>,
-    tts_volume: Option<u8>,
-    tts_online_fallback: Option<bool>,
     selection_hotkey: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> StateView {
     let delay = hover_delay_ms.clamp(50, 2000);
-    // 非 Windows 不落地「已开启」的假状态：没有实现就没有开关。
-    let anchor_on = cfg!(windows) && selection_anchor_enabled;
-    let keyboard_on = cfg!(windows) && selection_keyboard_fallback;
+    // 图标显示与划词开关合并：非 Windows 不落地「已开启」的假状态。
+    let anchor_on = cfg!(windows) && selection_enabled;
     let hotkey_text = selection_hotkey
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
@@ -3093,18 +3079,6 @@ fn set_settings(
         settings.auto_read_clipboard = auto_read_clipboard;
         settings.hover_delay_ms = delay;
         settings.selection_enabled = selection_enabled;
-        settings.selection_anchor_enabled = anchor_on;
-        settings.selection_keyboard_fallback = keyboard_on;
-        settings.auto_check_updates = auto_check_updates;
-        if let Some(rate) = tts_rate {
-            settings.tts_rate = rate.clamp(0.5, 2.0);
-        }
-        if let Some(volume) = tts_volume {
-            settings.tts_volume = volume.min(100);
-        }
-        if let Some(online) = tts_online_fallback {
-            settings.tts_online_fallback = online;
-        }
         let grace = settings.leave_grace_ms;
         *state.hover.lock().expect("hover state poisoned") =
             HoverStateMachine::new(delay, grace);
@@ -3126,25 +3100,7 @@ fn set_settings(
     }
     persist(state.inner());
     apply_anchor_watcher(&app, anchor_on);
-    apply_keyboard_fallback(&app, keyboard_on);
     snapshot(state.inner())
-}
-
-/// 键盘兜底开关：写能力位并通知监听线程注册/反注册键盘设备与事件钩子。
-fn apply_keyboard_fallback(app: &tauri::AppHandle, enabled: bool) {
-    #[cfg(windows)]
-    {
-        let state = app.state::<AppState>();
-        state.keyboard_fallback.store(enabled, Ordering::SeqCst);
-        let watcher = state
-            .selection_watch
-            .lock()
-            .expect("selection watcher poisoned");
-        if let Some(handle) = watcher.as_ref() {
-            handle.refresh_inputs();
-        }
-    }
-    let _ = (app, enabled);
 }
 
 /// 开机自启开关（tauri-plugin-autostart：Win 注册表 Run / macOS LaunchAgent / XDG autostart）。
@@ -3464,18 +3420,20 @@ fn apply_language_pool(languages: &[String], app: &tauri::AppHandle, state: &App
     }
 }
 /// 面板头划词翻译开关：toggle_selection。单独一个命令因为它只改一个布尔字段。
+///
+/// 图标显示已与它合并（方案 C）：翻转后立即启停选区监听，不保留独立的图标状态。
 #[tauri::command]
 fn toggle_selection(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> StateView {
-    let _enabled = {
+    let enabled = {
         let mut settings = state.settings.lock().expect("settings poisoned");
         settings.selection_enabled = !settings.selection_enabled;
         settings.selection_enabled
     };
-persist(state.inner());
-    let _ = app;
+    persist(state.inner());
+    apply_anchor_watcher(&app, cfg!(windows) && enabled);
     snapshot(state.inner())
 }
 
@@ -3719,9 +3677,10 @@ fn selection_debug_state(
 ) -> SelectionDebugView {
     let (anchor_enabled, keyboard_fallback) = {
         let settings = state.settings.lock().expect("settings poisoned");
+        // 图标生效值 = 划词开关；键盘兜底固定开启，读运行时能力位。
         (
-            settings.selection_anchor_enabled,
-            settings.selection_keyboard_fallback,
+            settings.selection_enabled,
+            state.keyboard_fallback.load(Ordering::SeqCst),
         )
     };
     let hover_state = hover_code(state.hover.lock().expect("hover state poisoned").state());
@@ -3939,6 +3898,8 @@ fn main() {
             selection_diag: Arc::new(selection_watch::SelectionDiagnostics::default()),
             #[cfg(windows)]
             selection_unsupported_hint: Mutex::new(None),
+            #[cfg(windows)]
+            selection_watch_error: Mutex::new(None),
             #[cfg(windows)]
             focus_return: Mutex::new(None),
         })
@@ -4164,46 +4125,27 @@ fn main() {
                 state.settings.lock().expect("settings poisoned").capsule_anchor = Some(anchor);
             }
             // 划词热键：按用户配置（默认 Ctrl+Alt+Shift+B）注册；失败原因进设置页提示。
-            let (keyboard_fallback_on, hotkey_spec) = {
+            let hotkey_spec = {
                 let settings = state.settings.lock().expect("settings poisoned");
-                (
-                    settings.selection_keyboard_fallback,
-                    settings.selection_hotkey.clone(),
-                )
+                settings.selection_hotkey.clone()
             };
-            state
-                .keyboard_fallback
-                .store(cfg!(windows) && keyboard_fallback_on, Ordering::SeqCst);
             #[cfg(windows)]
             apply_hotkey(app.handle(), &hotkey_spec);
-            // 选区锚点图标：先建隐藏窗口（建不出来就让设置项如实置灰），
-            // 再按已保存的开关启动 Raw Input 监听；关闭时不注册任何全局监听。
+            // 选区图标与键盘兜底随划词开关启停：先建隐藏窗口，再按开关启动监听。
             #[cfg(windows)]
             {
                 let ready = selection_anchor::create(app.handle()).is_some();
                 state.anchor_ready.store(ready, Ordering::SeqCst);
-                if !ready {
-                    // 图标窗口建不出来（WebView2 或窗口系统异常）就不能留下「已开启」的假状态。
-                    state
-                        .settings
-                        .lock()
-                        .expect("settings poisoned")
-                        .selection_anchor_enabled = false;
-                }
             }
-            let anchor_on = state
+            let selection_on = state
                 .settings
                 .lock()
                 .expect("settings poisoned")
-                .selection_anchor_enabled;
-            apply_anchor_watcher(app.handle(), anchor_on);
-            // 启动时异步检查更新（auto_check_updates 开关控制），绝不阻塞启动。
+                .selection_enabled;
+            apply_anchor_watcher(app.handle(), cfg!(windows) && selection_on);
+            // 启动时异步检查更新（固定开启，只比较与提示），绝不阻塞启动。
             {
-                let handle = app.handle().clone();
-                std::thread::spawn(move || {
-                    let state = handle.state::<AppState>();
-                    run_update_check(state.inner());
-                });
+                std::thread::spawn(run_update_check);
             }
             // 托盘：显隐胶囊 / 退出（工单 08）。
             build_tray(app.handle())?;

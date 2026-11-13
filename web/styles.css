@@ -418,6 +418,34 @@ html, body {
   outline-offset: 2px;
 }
 
+/* 设置入口：与锁定 / 划词 / 历史同一套状态语言——设置面板打开时实底强调 + 白色滑杆。 */
+.icon-btn--settings {
+  border: 1px solid transparent;
+  background: transparent;
+  color: #5a6778;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease,
+              transform 0.15s ease;
+}
+.icon-btn--settings:hover {
+  background: #eef1f6;
+  border-color: #dbe3ef;
+  color: var(--bead-primary);
+}
+.icon-btn--settings[aria-pressed='true'] {
+  background: var(--bead-primary);
+  border-color: var(--bead-primary);
+  color: #ffffff;
+}
+.icon-btn--settings[aria-pressed='true']:hover {
+  background: var(--bead-primary-soft);
+  border-color: var(--bead-primary-soft);
+  color: #ffffff;
+}
+.icon-btn--settings:focus-visible {
+  outline: 2px solid var(--bead-primary-soft);
+  outline-offset: 2px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .icon-btn--selection {
     transition-duration: 0.01ms;
@@ -562,10 +590,14 @@ html, body {
 .board__provider input[data-provider='model'] { width: 150px; }
 .board__provider input[data-provider='base_url'] { width: 200px; }
 
-/* ========== 设置 ========== */
+/* ========== 设置 ==========
+   窗口高度固定（BOARD_WINDOW_HEIGHT = 300），设置项比可视区高；
+   所以设置块占满头部与 provider 之外的剩余高度并在内部滚动，
+   与 .board__history 同一套「内联面板内部滚动」的做法，不撑破窗口。 */
 .board__settings {
   display: flex;
   flex-wrap: wrap;
+  align-content: flex-start;
   gap: 4px 14px;
   padding: 5px 8px;
   background: #f4f7fc;
@@ -573,6 +605,9 @@ html, body {
   border-radius: 7px;
   font-size: 12px;
   color: #334155;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 .board__settings label { display: inline-flex; align-items: center; gap: 4px; }
 .board__settings input[type='number'] { width: 60px; font-size: 12px; padding: 2px 4px; border: 1px solid #d7dfeb; border-radius: 6px; }
@@ -589,7 +624,9 @@ html, body {
 /* OCR 引擎区块：整行标签 + 细进度条，与设置面板其余项保持同一套边框和字号。 */
 .board__label { flex-basis: 100%; font-size: 11px; color: var(--bead-muted); }
 .board__actions { display: inline-flex; gap: 6px; }
-.board__hint--error { color: #b4453a; }
+/* 与 .board__hint 同权重时会被后面的声明覆盖，这里提高选择器权重保证错误提示可辨。 */
+.board__hint.board__hint--error { color: #b4453a; }
+
 .board__settings .board__progress {
   flex-basis: 100%;
   width: 100%;
