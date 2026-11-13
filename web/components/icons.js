@@ -10,6 +10,21 @@ export const ICONS = {
     <circle cx="5" cy="11.5" r="1.5" fill="currentColor"/>
   </svg>`,
 
+  // OCR 系统方案（显示器 + 文本行）：强调「系统自带接口」。
+  ocr_system: `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect x="2" y="3" width="12" height="7.6" rx="1.2" stroke="currentColor" stroke-width="1.2"/>
+    <path d="M4.8 5.7h6.4M4.8 8h4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
+    <path d="M8 10.6v2.8M6 13.4h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+  </svg>`,
+
+  // OCR 内置方案（芯片）：强调「自带插件 / 本地模型」。
+  ocr_builtin: `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect x="4.6" y="4.6" width="6.8" height="6.8" rx="1.2" stroke="currentColor" stroke-width="1.2"/>
+    <rect x="6.9" y="6.9" width="2.2" height="2.2" rx="0.5" fill="currentColor"/>
+    <path d="M6.2 2.6v1.6M9.8 2.6v1.6M6.2 11.8v1.6M9.8 11.8v1.6M2.6 6.2h1.6M2.6 9.8h1.6M11.8 6.2h1.6M11.8 9.8h1.6"
+      stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
+  </svg>`,
+
   // 图钉/锁定（pushpin；旧的十字星形容易被看成太阳）
   pin: `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M5.6 2h4.8l-.5 3.6 1.6 1.6v.9H4.5v-.9l1.6-1.6L5.6 2Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>

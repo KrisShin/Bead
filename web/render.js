@@ -67,9 +67,27 @@ function renderOcrSettings(settings) {
       settings.ocr_effective_engine === 'bundled' ? '内置 PP-OCRv4' : '系统 OCR';
     status = `已安装 v${escapeHtml(settings.ocr_version ?? '')}（${size}），当前使用${effective}。`;
   }
+  // 推荐项在前：内置模型实测识别更稳；系统 OCR 标红并写明「体验不佳」，
+  // 颜色之外还有「推荐」徽标与「✓ 已选」文字，色弱用户同样可辨。
   return `<span class="board__label">OCR 引擎</span>
-    <label><input type="radio" name="ocr-engine" data-ocr-engine="system"${selected === 'system' ? ' checked' : ''} />系统 OCR</label>
-    <label><input type="radio" name="ocr-engine" data-ocr-engine="bundled"${selected === 'bundled' ? ' checked' : ''}${supported && installed ? '' : ' disabled'} />内置 PP-OCRv4</label>
+    <label class="ocr-option ocr-option--recommended">
+      <input type="radio" name="ocr-engine" data-ocr-engine="bundled"${selected === 'bundled' ? ' checked' : ''}${supported && installed ? '' : ' disabled'} />
+      <span class="ocr-option__icon">${icon('ocr_builtin', { size: 16 })}</span>
+      <span class="ocr-option__body">
+        <span class="ocr-option__title">内置 PP-OCRv4<span class="ocr-option__badge">推荐</span></span>
+        <span class="ocr-option__note">自带插件、离线识别，准确率与稳定性更好${installed ? '' : '；需先下载模型'}</span>
+      </span>
+      <span class="ocr-option__check" aria-hidden="true">✓ 已选</span>
+    </label>
+    <label class="ocr-option ocr-option--warn">
+      <input type="radio" name="ocr-engine" data-ocr-engine="system"${selected === 'system' ? ' checked' : ''} />
+      <span class="ocr-option__icon">${icon('ocr_system', { size: 16 })}</span>
+      <span class="ocr-option__body">
+        <span class="ocr-option__title">系统 OCR<span class="ocr-option__tag">体验不佳</span></span>
+        <span class="ocr-option__note">无需下载，但识别率与稳定性较差，建议改用内置方案</span>
+      </span>
+      <span class="ocr-option__check" aria-hidden="true">✓ 已选</span>
+    </label>
     <span class="board__hint" data-ocr-status>${status}</span>
     ${settings.ocr_error ? `<span class="board__hint board__hint--error">${escapeHtml(settings.ocr_error)}</span>` : ''}
     <progress class="board__progress" data-ocr-progress max="${Math.max(settings.ocr_total_size ?? 0, 1)}" value="0"${busy ? '' : ' hidden'}></progress>

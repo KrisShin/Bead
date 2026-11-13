@@ -198,6 +198,52 @@ describe('board rendering', () => {
     expect(html).not.toMatch(/data-action="ocr-remove"[^>]*disabled/);
   });
 
+  it('marks the system OCR as not recommended and puts the built-in engine first', () => {
+    const html = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      settings: {
+        ocr_engine: 'system',
+        ocr_bundled_supported: true,
+        ocr_installed: true,
+        ocr_total_size: 35477895,
+        ocr_busy: false,
+      },
+    });
+    // 自建方案：绿色「推荐」徽标（文字标识，不依赖颜色）+ 芯片图标。
+    expect(html).toContain('ocr-option--recommended');
+    expect(html).toContain('class="ocr-option__badge">推荐');
+    expect(html).toContain('M6.2 2.6v1.6');
+    // 系统方案：标红 + 「体验不佳」标签 + 明确推荐改用内置方案。
+    expect(html).toContain('ocr-option--warn');
+    expect(html).toContain('class="ocr-option__tag">体验不佳');
+    expect(html).toContain('建议改用内置方案');
+    expect(html).toContain('M4.8 5.7h6.4');
+    // 推荐项排在前面，视线先落到自建方案。
+    expect(html.indexOf('data-ocr-engine="bundled"')).toBeLessThan(
+      html.indexOf('data-ocr-engine="system"'),
+    );
+    // 未选中的项不显示「✓ 已选」，选中项由 CSS 的 :has(input:checked) 显示。
+    expect(html).toContain('class="ocr-option__check" aria-hidden="true">✓ 已选');
+  });
+
+  it('highlights the settings entry only while the panel is open', () => {
+    const open = renderBoard({
+      ...expanded,
+      languagesOpen: true,
+      settings: { selection_enabled: false },
+    });
+    const openButton = open.match(/<button[^>]*data-action="languages"[^>]*>/)[0];
+    expect(openButton).toContain('class="icon-btn icon-btn--settings"');
+    expect(openButton).toContain('aria-pressed="true"');
+    expect(openButton).toContain('data-tooltip="关闭设置"');
+
+    const closed = renderBoard(expanded);
+    const closedButton = closed.match(/<button[^>]*data-action="languages"[^>]*>/)[0];
+    expect(closedButton).toContain('aria-pressed="false"');
+    expect(closedButton).toContain('data-tooltip="设置"');
+  });
+
   it('reflects the auto-read switch and hover delay in the settings section', () => {
     const html = renderBoard({
       ...expanded,
