@@ -18,6 +18,7 @@ import {
   planCardReorder,
 } from './card-drag.js';
 import { createEditDebouncer, planEditingRefresh } from './edit-sync.js';
+import { stalePasteLangs } from './paste-media.js';
 import { Card, LangAutocomplete } from './components/index.js';
 
 const root = document.getElementById('root');
@@ -69,7 +70,9 @@ let speechHintTimer = null;
 // 每张卡最后一次进入 Rust 的文本：失焦/回车对未变更内容不重复发起同步。
 const lastCommitted = new Map();
 // 卡片内粘贴的图片缩略图：只在前端本次运行内保留，不进 StateView、不写 settings。
-// lang -> { url: objectURL, message: 内联状态文案 }
+// lang -> { url: objectURL, message: 内联状态文案, text: 归属文本, pending: 识别中 }
+// `text` 是这张缩略图对应的那段文本：识别完成前是粘贴时的卡片文本，识别完成后是 OCR 结果。
+// 文档内容一旦被替换，`text` 与快照对不上，缩略图就随之回收（见 paste-media.js）。
 const pasteMedia = new Map();
 // 只有中英文卡片接受图片粘贴；其他语言保持浏览器的默认粘贴行为。
 const IMAGE_PASTE_LANGS = new Set(['zh', 'en']);
@@ -283,6 +286,11 @@ function renderContent(view, wasExpanded) {
   applySpeechUi();
 }
 
+/** 剔除不再属于当前文档内容的缩略图，并回收它们的 objectURL。 */
+function prunePasteMedia(cards) {
+  for (const lang of stalePasteLangs(pasteMedia, cards)) revokePasteMedia(lang);
+}
+
 /** 整板重绘会重建卡片 DOM：缩略图与内联状态每次从内存 Map 重新贴回。 */
 function applyPasteThumbs() {
   for (const box of boardHost.querySelectorAll('.card__media')) {
@@ -306,6 +314,18 @@ function applyPasteThumbs() {
       status.hidden = !entry.message;
     }
   }
+}
+
+/** 回收一张卡的缩略图：objectURL 必须显式释放，否则图片会一直留在内存里。 */
+function revokePasteMedia(lang) {
+  const entry = pasteMedia.get(lang);
+  if (entry?.url) URL.revokeObjectURL(entry.url);
+  pasteMedia.delete(lang);
+}
+
+/** 清空文档：文字与缩略图一起清掉，包括还在识别中的那一张。 */
+function clearPasteMedia() {
+  for (const lang of [...pasteMedia.keys()]) revokePasteMedia(lang);
 }
 
 // 编辑期局部刷新：其余卡整卡替换（焦点在编辑卡上，不会丢光标），
@@ -719,6 +739,10 @@ function draw(view) {
     abortCardDrag();
   }
   lastView = view;
+  // 每次应用新快照前先回收不再属于这份文档的缩略图：内容被新截图/新文本替换、
+  // 清空或收起清空文档后，旧图不能再贴到同名卡片上。非展开态也走这里，
+  // 否则收起时被清空的缩略图会残留到下一次展开。
+  prunePasteMedia(view.cards);
   const expanded = view.view === 'expanded';
   const wasExpanded = root.dataset.view === 'expanded';
   root.dataset.view = view.view;
@@ -895,11 +919,7 @@ function playSpeechFile(result) {
   if (!currentAudio) currentAudio = new Audio();
   currentAudio.pause();
   currentAudio.src = url; // 换 src 后自然从头播；复用同一个元素，避免每点一次就泄漏一个 Audio
-  const settings = lastView?.settings ?? {};
-  const volume = Number(settings.tts_volume ?? 80);
-  const rate = Number(settings.tts_rate ?? 1);
-  currentAudio.volume = Math.min(1, Math.max(0, volume / 100));
-  currentAudio.playbackRate = Math.min(2, Math.max(0.5, rate));
+  // 语速固定 1 倍速、音量交给系统默认：设置页已移除这两个调整项，不再读旧配置。
   currentAudio.onended = () => {
     currentAudio.onended = null;
     currentAudio.onerror = null;
@@ -1018,6 +1038,7 @@ async function ocrPasteIntoCard(lang, entry) {
     console.warn('[bead] paste-ocr', error);
     if (pasteMedia.get(lang) === entry) {
       entry.message = '识别失败';
+      entry.pending = false;
       applyPasteThumbs();
     }
     return;
@@ -1025,6 +1046,7 @@ async function ocrPasteIntoCard(lang, entry) {
   if (pasteMedia.get(lang) !== entry) return; // 期间又粘了新图，旧结果作废
   if (typeof text !== 'string' || !text.trim()) {
     entry.message = '未识别到文字';
+    entry.pending = false;
     applyPasteThumbs();
     return;
   }
@@ -1037,7 +1059,12 @@ async function ocrPasteIntoCard(lang, entry) {
   );
   if (textarea) textarea.value = text;
   await send('commit_edit', { lang, text });
-  applyPasteThumbs();
+  // 缩略图从此归属这段 OCR 文本：下一次快照里文本一旦不同（新截图/新文本/清空），
+  // draw() 里的 prunePasteMedia 就会把它回收。若提交期间已被回收则不再复活。
+  if (pasteMedia.get(lang) === entry) {
+    entry.text = text;
+    entry.pending = false;
+  }
 }
 
 // 输入停顿到期：按语言找回「当前」输入框再提交。排程时捕获的节点可能已被
@@ -1070,23 +1097,15 @@ async function saveProvider() {
 }
 
 async function saveSettings() {
-  const checked = (name, fallback = false) =>
-    boardHost.querySelector(`[data-setting="${name}"]`)?.checked ?? fallback;
-  const value = (name) =>
-    Number(boardHost.querySelector(`[data-setting="${name}"]`)?.value);
+  const checked = (name) =>
+    boardHost.querySelector(`[data-setting="${name}"]`)?.checked ?? false;
   const view = await send('set_settings', {
     auto_read_clipboard: checked('auto_read_clipboard'),
     hover_delay_ms:
       Number(boardHost.querySelector('[data-setting="hover_delay_ms"]')?.value) || 200,
     selection_enabled: checked('selection_enabled'),
-    selection_anchor_enabled: checked('selection_anchor_enabled'),
-    selection_keyboard_fallback: checked('selection_keyboard_fallback'),
     selection_hotkey:
       boardHost.querySelector('[data-setting="selection_hotkey"]')?.value ?? '',
-    auto_check_updates: checked('auto_check_updates'),
-    tts_rate: value('tts_rate') || 1,
-    tts_volume: Number.isFinite(value('tts_volume')) ? value('tts_volume') : 80,
-    tts_online_fallback: checked('tts_online_fallback', true),
   });
   await refreshSpeechCapabilities();
   return view;
@@ -1102,11 +1121,7 @@ root.addEventListener('click', (event) => {
     case 'dismiss-paste': {
       // 只关缩略图，不动已识别/已输入的文字，也不发任何请求。
       const mediaLang = button.closest('.card__media')?.dataset.lang;
-      if (mediaLang) {
-        const entry = pasteMedia.get(mediaLang);
-        if (entry?.url) URL.revokeObjectURL(entry.url);
-        pasteMedia.delete(mediaLang);
-      }
+      if (mediaLang) revokePasteMedia(mediaLang);
       applyPasteThumbs();
       break;
     }
@@ -1151,6 +1166,7 @@ root.addEventListener('click', (event) => {
       pauseSpeechAudio();
       speakingLang = null;
       applySpeechUi();
+      clearPasteMedia(); // 文字与缩略图必须一起清掉
       send('clear_document');
       break;
     case 'check-updates':
@@ -1494,7 +1510,9 @@ root.addEventListener('paste', (event) => {
   if (!file) return;
   const previous = pasteMedia.get(lang);
   if (previous?.url) URL.revokeObjectURL(previous.url);
-  const entry = { url: URL.createObjectURL(file), message: '识别中…' };
+  // 归属文本取自当前快照：识别完成前它就是这张缩略图对应的内容，识别失败时也用它判定过期。
+  const baseline = lastView?.cards?.find((card) => card.lang === lang)?.text ?? '';
+  const entry = { url: URL.createObjectURL(file), message: '识别中…', text: baseline, pending: true };
   pasteMedia.set(lang, entry);
   applyPasteThumbs();
   ocrPasteIntoCard(lang, entry).catch(() => {});

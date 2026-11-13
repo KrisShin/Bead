@@ -109,6 +109,33 @@
 - 验证：`web/edit-sync.test.js` 覆盖防抖 pending 判定，Rust 单测覆盖焦点归还目标；用户已完成真机确认。
 
 
+## 十四、0.3.0 收尾（2026-11-13）
+
+**范围**：`77b7bd1`（0.2.0 发版）之后工作区累计的改动，按功能点分批提交，无新工单。决策见 STATE.md D44–D48。
+
+**已落地（与提交一一对应）**：
+
+1. 胶囊位置自愈 + 启动诊断：胶囊吸附线改为显示器可用区上缘；启动 / 托盘「显示」/ 二次启动共用 `place_capsule_visible` 并复核实际矩形；不可见就落主屏右上角。形态判定改宽高双条件。新增 `%LOCALAPPDATA%\Bead\startup.log`、panic 钩子、构建失败弹窗与 `webview_no_frontend` 标记。
+2. 历史回填门闩：`history_previewed` 让每个展开会话只回填一次历史，清空后同一会话不再被填回。
+3. 粘贴缩略图归属：新增 `web/paste-media.js` 纯函数 `stalePasteLangs`；每次 `draw` 回收过期缩略图并 `revokeObjectURL`，清空时文字与缩略图一起清。
+4. 设置页精简与划词图标合并（方案 C）：撤五个开关、删配置字段、键盘兜底随划词开关启停、能力失败改为设置页内联提示；设置入口图标改滑杆并补按下态。
+5. OCR 方案提示：内置 PP-OCRv4 置顶标「推荐」、系统 OCR 标「体验不佳」，选中态不依赖颜色。
+6. 版本号：Cargo.toml×3 / Cargo.lock / package.json / package-lock.json / tauri.conf.json / PKGBUILD 统一到 0.3.0。
+
+**测试基线（本轮真跑，2026-11-13）**：
+
+- `cargo test --offline --workspace` → `bead` 90 passed / 2 ignored、`bead-core` 106 passed、`bead-providers` 36 passed；合计 232 passed / 0 failed
+- `npm test` → `Test Files 6 passed (6)`、`Tests 73 passed (73)`
+
+**未验证 / 风险**：
+
+- 本轮未重新 `tauri build`，也未做真机冒烟：胶囊自愈（顶部任务栏、拔副屏、混合 DPI）、`startup.log` 实际落盘、OCR 方案卡片视觉、缩略图回收、清空门闩都只有单测与静态阅读保证。
+- 多显示器与 DPI 缩放的自愈只有 `geometry_tests`，按各屏 scale_factor 折算，未见真机。
+- `release-windows.yml` 的 0.3.0 首跑要等 tag 后的 Release 事件；流水线在 0.2.0 已收敛为 Windows-only，本轮未改流水线与签名分支。
+- macOS / Linux / Arch 运行时仍只有 CI 保证可构建。
+- `.screenshots/` 已在 `.gitignore`，本地视觉验证产物未入库。
+
+
 ## 零、T04–T10 自动执行总计划（恢复锚点）
 
 - **T04** Provider 链与真实翻译：bead-core 增 `ProviderChain`（回退/超时/重试上限/熔断，纯逻辑 fake 测试）；新 crate `bead-providers`（HTTP provider 实现，bead-core 保持零依赖）：ZeroKey(MyMemory)、OpenAICompatible(智谱/硅基流动/自定义)、DeepL、腾讯、火山、阿里、百度、有道——请求构造/响应解析用 Transport trait 注入 fake 测试；设置面板加引擎选择与 key/model/base_url + 测试连接。规则 10 解释：单次 translate() 对上层返回全部译文，REST 按语言对的 API 在 provider 内部逐对调用属实现细节（模块文档声明）。

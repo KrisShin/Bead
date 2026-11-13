@@ -4,6 +4,11 @@
 //! 新版本加字段不炸旧配置，旧配置缺新字段不炸新版本。文件损坏时回落默认并继续启动，
 //! 绝不让坏配置挡住主程序。key/secret 随 provider 配置一起落盘（用户本机配置目录，
 //! 权限即用户自身），不写日志。
+//!
+//! 已从界面撤掉的设置（启动检查更新、朗读语速/音量、在线朗读兜底、键盘选区兜底）
+//! 直接删字段：行为改为常量，旧配置里的同名键靠「未知字段忽略」静默丢弃。
+//! `selection_anchor_enabled` 例外——它仍保留字段以便读取老配置，但不再参与任何判断
+//! （图标显示已与划词开关合并）。
 
 use std::path::{Path, PathBuf};
 
@@ -27,27 +32,14 @@ pub struct AppSettings {
     pub selection_enabled: bool,
     #[serde(default = "default_hotkey")]
     pub selection_hotkey: String,
-    /// 选区锚点图标：鼠标划词松手后弹出小图标。默认关闭，关闭时不注册任何全局监听。
+    /// 选区锚点图标的旧字段：**仅保留可反序列化，不生效**。
+    /// 图标显示已与「划词」开关合并（开启划词即可显示图标），该字段不再作为
+    /// 用户可设置的独立偏好参与任何判断；保留是为了老配置静默通过解析。
     #[serde(default)]
     pub selection_anchor_enabled: bool,
-    /// 键盘选区兜底：注册键盘 Raw Input 与文本选区事件钩子（不记录键值）。默认关闭。
-    #[serde(default)]
-    pub selection_keyboard_fallback: bool,
     /// 开机自启（用户显式开启；便携包移动后启动时自动重写路径并提示）。
     #[serde(default)]
     pub autostart_enabled: bool,
-    /// 启动时自动检查更新（只比较与提示，绝不下载安装——产品红线）。
-    #[serde(default = "default_true")]
-    pub auto_check_updates: bool,
-    /// 朗读语速倍率（0.5–2.0）。本地引擎直接生效；在线音频由前端倍速播放。
-    #[serde(default = "default_tts_rate")]
-    pub tts_rate: f64,
-    /// 朗读音量（0–100）。
-    #[serde(default = "default_tts_volume")]
-    pub tts_volume: u8,
-    /// 该语言没有本地音色时是否允许在线兜底。默认开启；仅在缺音色时触发。
-    #[serde(default = "default_true")]
-    pub tts_online_fallback: bool,
     /// OCR 引擎：`system`（系统 WinRT，默认）或 `bundled`（内置 PP-OCRv4）。
     /// `bundled` 未安装或加载失败时运行时静默回退系统 OCR，不改写用户选择。
     #[serde(default = "default_ocr_engine")]
@@ -77,14 +69,6 @@ fn default_leave_grace() -> u64 {
     800
 }
 
-fn default_tts_rate() -> f64 {
-    1.0
-}
-
-fn default_tts_volume() -> u8 {
-    80
-}
-
 fn default_ocr_engine() -> String {
     crate::ocr::ENGINE_SYSTEM.into()
 }
@@ -104,14 +88,9 @@ impl Default for AppSettings {
             selection_enabled: false,
             selection_hotkey: default_hotkey(),
             selection_anchor_enabled: false,
-            selection_keyboard_fallback: false,
             autostart_enabled: false,
             window_position: None,
             capsule_anchor: None,
-            auto_check_updates: true,
-            tts_rate: default_tts_rate(),
-            tts_volume: default_tts_volume(),
-            tts_online_fallback: true,
             ocr_engine: default_ocr_engine(),
         }
     }
@@ -165,14 +144,9 @@ mod tests {
             selection_enabled: true,
             selection_hotkey: "Ctrl+Alt+B".into(),
             selection_anchor_enabled: true,
-            selection_keyboard_fallback: true,
             autostart_enabled: false,
             window_position: Some((100, 100)),
             capsule_anchor: Some((100, 100)),
-            auto_check_updates: true,
-            tts_rate: 1.2,
-            tts_volume: 55,
-            tts_online_fallback: false,
             ocr_engine: "bundled".into(),
             provider: ProviderConfig {
                 engine: bead_providers::Engine::Zhipu,
@@ -188,13 +162,35 @@ mod tests {
         assert_eq!(loaded.auto_read_clipboard, false);
         assert_eq!(loaded.hover_delay_ms, 350);
         assert_eq!(loaded.provider.engine, bead_providers::Engine::Zhipu);
-        assert!(loaded.selection_keyboard_fallback);
         assert_eq!(loaded.provider.api_key, "key-1");
         assert_eq!(loaded.languages, vec!["zh".to_string(), "de".to_string()]);
         assert_eq!(loaded.capsule_anchor, Some((100, 100)));
-        assert_eq!(loaded.tts_rate, 1.2);
-        assert_eq!(loaded.tts_volume, 55);
-        assert!(!loaded.tts_online_fallback);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_config_with_the_removed_tts_and_update_fields_still_loads() {
+        // 五个开关已从界面撤掉并固定为默认值；老配置里的这些键必须静默通过解析，
+        // 且不能影响其它字段，避免升级后整份配置被当成损坏文件回落默认。
+        let dir = temp_dir("removed-fields");
+        let legacy = r#"{
+            "auto_read_clipboard": false,
+            "hover_delay_ms": 350,
+            "auto_check_updates": false,
+            "tts_rate": 1.7,
+            "tts_volume": 35,
+            "tts_online_fallback": false,
+            "selection_keyboard_fallback": false,
+            "selection_anchor_enabled": true,
+            "selection_enabled": true,
+            "provider": {"engine": "deepl", "api_key": "k"}
+        }"#;
+        std::fs::write(settings_path(&dir), legacy).unwrap();
+        let loaded = load(&dir);
+        assert!(!loaded.auto_read_clipboard);
+        assert_eq!(loaded.hover_delay_ms, 350);
+        assert!(loaded.selection_enabled);
+        assert_eq!(loaded.provider.engine, bead_providers::Engine::DeepL);
         std::fs::remove_dir_all(&dir).ok();
     }
 

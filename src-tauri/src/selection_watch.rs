@@ -16,16 +16,17 @@
 //! 「确实存在非空文本选区」由 UIA 终审；拖窗口（HTCAPTION）在预筛就被拒绝，
 //! 拖文件、拉滑块、Explorer 双击等走不到 TextPattern，同样不会出现图标。
 //!
-//! 键盘兜底默认关闭：开启后才注册键盘 Raw Input 与 `EVENT_OBJECT_TEXTSELECTION_CHANGED`
-//! 钩子。键盘 Raw Input 只记录「发生过一次键击」与时间，不读取、不保存任何键值内容；
-//! 关闭时两者都反注册，不留任何键盘监听。鼠标 Raw Input 始终随选区图标开关启停。
+//! 键盘兜底固定开启，随划词开关启停：监听线程运行时注册键盘 Raw Input 与
+//! `EVENT_OBJECT_TEXTSELECTION_CHANGED` 钩子。键盘 Raw Input 只记录「发生过一次键击」
+//! 与时间，不读取、不保存任何键值内容；划词关闭时线程结束，两者一起反注册，
+//! 不留任何键盘监听。鼠标 Raw Input 同样随划词开关启停。
 //!
 //! 隐私：UIA 路径不读剪贴板、不记录文本内容。仅当应用明确不支持 `TextPattern`
 //! （Trae/微信这类 Electron/自绘界面）时，才走 `selection_clipboard` 的兜底：
 //! 先快照、再模拟 Ctrl+C、读文本、恢复快照，**会短暂写剪贴板**；文本只在内存里
 //! 传给图标点击路径，图标超时或关闭开关即丢弃，任何日志都不含文本与按键内容。
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -49,9 +50,9 @@ use windows::Win32::UI::Input::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor,
     GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics,
-    GetWindowThreadProcessId, KillTimer, PostMessageW, RegisterClassW, SendMessageW, SetTimer,
+    GetWindowThreadProcessId, KillTimer, RegisterClassW, SendMessageW, SetTimer,
     TranslateMessage, WindowFromPoint, WNDCLASSW, GA_ROOT, RI_MOUSE_LEFT_BUTTON_DOWN,
-    RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_WHEEL, SM_CXDOUBLECLK, SM_CYDOUBLECLK, WM_APP, WM_INPUT,
+    RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_WHEEL, SM_CXDOUBLECLK, SM_CYDOUBLECLK, WM_INPUT,
     WM_NCHITTEST, WM_QUIT, WM_TIMER, WS_POPUP, WINEVENT_OUTOFCONTEXT,
 };
 
@@ -63,8 +64,6 @@ extern "system" {
 
 /// `EVENT_OBJECT_TEXTSELECTION_CHANGED`：windows 0.62 的元数据没有生成这个常量。
 const EVENT_OBJECT_TEXTSELECTION_CHANGED: u32 = 0x8014;
-/// 让监听线程按最新设置重新注册键盘设备/事件钩子。
-const WM_REFRESH_INPUTS: u32 = WM_APP + 1;
 const TIMER_QUERY: usize = 1;
 /// 剪贴板兜底会注入 Ctrl+C；这段时间内忽略我们自己的按键/选区信号，避免自激。
 const FALLBACK_INPUT_SUPPRESS_MS: u64 = 900;
@@ -75,7 +74,6 @@ thread_local! {
     static RAW_INPUTS: RefCell<VecDeque<RawInputEvent>> = RefCell::new(VecDeque::new());
     /// 文本选区变化事件只记窗口句柄，不带任何文本内容。
     static TEXT_SELECTION_EVENTS: RefCell<VecDeque<HWND>> = RefCell::new(VecDeque::new());
-    static REFRESH_INPUTS: Cell<bool> = Cell::new(false);
 }
 
 /// 划词链路的结构化诊断：计数 + 最近一次失败位置。
@@ -544,6 +542,7 @@ impl WatchState {
             }
             self.hook = hook;
             self.keyboard_on = true;
+            crate::clear_selection_watch_error(&self.app);
         } else {
             if !self.hook.is_invalid() {
                 let _ = unsafe { UnhookWinEvent(self.hook) };
@@ -557,18 +556,18 @@ impl WatchState {
         }
     }
 
-    /// 键盘兜底注册失败：把开关与能力位一起落回关闭并推一次状态，
-    /// 设置页不会停在「已开启」的假状态（规范：能力探测失败不得静默 no-op）。
+    /// 键盘兜底注册失败：停用本次运行的键盘监听并推一次状态。
+    ///
+    /// 开关已固定开启、不再回写设置字段：改为在设置页写一条明确提示，
+    /// 不保留「已开启」的假状态（规范：能力探测失败不得静默 no-op）。
     fn revert_keyboard(&mut self) {
         self.keyboard_on = false;
         self.keyboard_fallback.store(false, Ordering::SeqCst);
+        crate::set_selection_watch_error(
+            &self.app,
+            "键盘选区兜底注册失败，本次运行已停用（不记录按键内容，重启后重试）。",
+        );
         let state = self.app.state::<crate::AppState>();
-        state
-            .settings
-            .lock()
-            .expect("settings poisoned")
-            .selection_keyboard_fallback = false;
-        crate::persist(state.inner());
         let view = crate::snapshot(state.inner());
         let _ = self.app.emit("state", view);
     }
@@ -576,7 +575,6 @@ impl WatchState {
 
 /// 选区监听句柄：关闭开关时用它停线程并反注册 Raw Input。
 pub struct WatcherHandle {
-    hwnd: isize,
     thread_id: u32,
     stopped: Arc<AtomicBool>,
 }
@@ -600,18 +598,6 @@ impl WatcherHandle {
     pub fn is_running(&self) -> bool {
         !self.stopped.load(Ordering::SeqCst)
     }
-
-    /// 键盘兜底开关变化时通知监听线程重新注册；不阻塞 UI。
-    pub fn refresh_inputs(&self) {
-        unsafe {
-            let _ = PostMessageW(
-                Some(HWND(self.hwnd as *mut core::ffi::c_void)),
-                WM_REFRESH_INPUTS,
-                WPARAM(0),
-                LPARAM(0),
-            );
-        }
-    }
 }
 
 impl Drop for WatcherHandle {
@@ -632,9 +618,8 @@ pub fn start(app: tauri::AppHandle) -> Option<WatcherHandle> {
             let _ = unsafe { run(app, thread_stopped, ready_tx) };
         })
         .ok()?;
-    let (hwnd, thread_id) = ready_rx.recv_timeout(Duration::from_secs(2)).ok()??;
+    let (_, thread_id) = ready_rx.recv_timeout(Duration::from_secs(2)).ok()??;
     Some(WatcherHandle {
-        hwnd,
         thread_id,
         stopped,
     })
@@ -756,9 +741,6 @@ unsafe fn run(
         for changed in selection_events {
             state.handle_text_selection(changed);
         }
-        if REFRESH_INPUTS.with(|flag| flag.replace(false)) {
-            state.apply_keyboard_inputs();
-        }
     }
 
     // 关闭开关：先断开键盘兜底与鼠标 Raw Input，再销毁窗口，保证不再收到任何全局输入。
@@ -812,7 +794,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                 RAW_INPUTS.with(|queue| queue.borrow_mut().push_back(event));
             }
         }
-        WM_REFRESH_INPUTS => REFRESH_INPUTS.with(|flag| flag.set(true)),
         _ => {}
     }
     DefWindowProcW(hwnd, message, wparam, lparam)

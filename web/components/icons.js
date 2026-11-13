@@ -2,11 +2,27 @@
 // 所有图标都是纯 SVG 字符串，render.js 直接嵌入 HTML。
 
 export const ICONS = {
-  // 设置（齿轮）
+  // 设置（滑杆）：三档横向滑轨 + 实心滑块，16px 下比齿轮更干净、辨识度更高。
   settings: `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <path d="M13.5 8a5.5 5.5 0 0 1-.14 1.17l1.43 1.11-1.33 2.3-1.69-.68a5.5 5.5 0 0 1-2.02 1.17L9.5 13H6.5l-.25-1.93a5.5 5.5 0 0 1-2.02-1.17l-1.69.68-1.33-2.3 1.43-1.11A5.5 5.5 0 0 1 2.5 8c0-.4.05-.78.14-1.17L1.21 5.72 2.54 3.42l1.69.68a5.5 5.5 0 0 1 2.02-1.17L6.5 2h3l.25 1.93a5.5 5.5 0 0 1 2.02 1.17l1.69-.68 1.33 2.3-1.43 1.11c.09.39.14.77.14 1.17Z"
-    stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
-    <circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.2"/>
+    <path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+    <circle cx="6" cy="4.5" r="1.5" fill="currentColor"/>
+    <circle cx="10.5" cy="8" r="1.5" fill="currentColor"/>
+    <circle cx="5" cy="11.5" r="1.5" fill="currentColor"/>
+  </svg>`,
+
+  // OCR 系统方案（显示器 + 文本行）：强调「系统自带接口」。
+  ocr_system: `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect x="2" y="3" width="12" height="7.6" rx="1.2" stroke="currentColor" stroke-width="1.2"/>
+    <path d="M4.8 5.7h6.4M4.8 8h4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
+    <path d="M8 10.6v2.8M6 13.4h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+  </svg>`,
+
+  // OCR 内置方案（芯片）：强调「自带插件 / 本地模型」。
+  ocr_builtin: `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect x="4.6" y="4.6" width="6.8" height="6.8" rx="1.2" stroke="currentColor" stroke-width="1.2"/>
+    <rect x="6.9" y="6.9" width="2.2" height="2.2" rx="0.5" fill="currentColor"/>
+    <path d="M6.2 2.6v1.6M9.8 2.6v1.6M6.2 11.8v1.6M9.8 11.8v1.6M2.6 6.2h1.6M2.6 9.8h1.6M11.8 6.2h1.6M11.8 9.8h1.6"
+      stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
   </svg>`,
 
   // 图钉/锁定（pushpin；旧的十字星形容易被看成太阳）

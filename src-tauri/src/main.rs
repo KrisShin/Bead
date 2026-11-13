@@ -395,13 +395,26 @@ fn spawn_panel_ocr(app: tauri::AppHandle) {
     });
 }
 
-/// 选区图标开关当前值：Raw Input 线程松手时用它复核，避免关闭后还有在途事件弹图标。
+/// 图标 / 选区监听是否生效（方案 C 的唯一真值来源）：划词开关 × 平台能力位。
+///
+/// 关闭划词即一并关闭图标与键盘兜底，不保留独立状态；能力不可用时不得出现
+/// 「已开启」的假状态。
+fn anchor_gate(selection_enabled: bool, anchor_ready: bool) -> bool {
+    cfg!(windows) && selection_enabled && anchor_ready
+}
+
+/// 划词开关当前值：Raw Input 线程松手时用它复核，避免关闭后还有在途事件弹图标。
+///
+/// 图标显示已与划词开关合并（方案 C）：这里只看 `selection_enabled` 与能力位，
+/// 不再读旧字段 `selection_anchor_enabled`。
 fn anchor_enabled(app: &tauri::AppHandle) -> bool {
-    app.state::<AppState>()
+    let state = app.state::<AppState>();
+    let selection_enabled = state
         .settings
         .lock()
         .expect("settings poisoned")
-        .selection_anchor_enabled
+        .selection_enabled;
+    anchor_gate(selection_enabled, state.anchor_ready.load(Ordering::SeqCst))
 }
 
 /// 自动划词连续失败时写一条降级提示，展示在设置页热键输入框下方。
@@ -527,14 +540,18 @@ fn show_selection_anchor(
     });
 }
 
-/// 按开关启停 Raw Input 监听。关闭时停线程并反注册设备，此后不注册任何全局监听。
+/// 划词开关的运行时副作用：启停选区监听线程（图标与键盘兜底共用这一条线程）。
 ///
-/// 监听线程启动失败或图标窗口建不出来时，把内存里的开关与能力位一起落回不可用，
-/// 让设置页如实置灰（规范：能力探测失败不得静默 no-op）。
+/// 图标显示已与划词开关合并：打开划词即启动监听、即显示图标；关闭即停线程并反注册设备，
+/// 此后不注册任何全局监听。能力不可用（非 Windows / 图标窗口建不出来 / 线程启动失败）时
+/// 如实落回不可用并写一条设置页提示，不保留「已开启」的假状态（规范：不得静默 no-op）。
 fn apply_anchor_watcher(app: &tauri::AppHandle, enabled: bool) {
     #[cfg(windows)]
     {
         let state = app.state::<AppState>();
+        let ready = state.anchor_ready.load(Ordering::SeqCst);
+        // 键盘选区兜底固定开启：只在划词开着且图标链路可用时注册键盘输入（不记录键值）。
+        state.keyboard_fallback.store(anchor_gate(enabled, ready), Ordering::SeqCst);
         let mut watcher = state
             .selection_watch
             .lock()
@@ -544,24 +561,25 @@ fn apply_anchor_watcher(app: &tauri::AppHandle, enabled: bool) {
                 handle.stop();
             }
             clear_selection_unsupported_hint(app);
-        } else if !state.anchor_ready.load(Ordering::SeqCst) {
-            // 图标窗口不可用：开关不能在界面上保持「已开启」。
-            state
-                .settings
-                .lock()
-                .expect("settings poisoned")
-                .selection_anchor_enabled = false;
+            clear_selection_watch_error(app);
+        } else if !ready {
+            set_selection_watch_error(
+                app,
+                "划词图标窗口不可用，本次运行不会显示翻译图标；快捷键取词仍然可用。",
+            );
         } else if watcher.is_none() {
             match selection_watch::start(app.clone()) {
-                Some(handle) => *watcher = Some(handle),
+                Some(handle) => {
+                    *watcher = Some(handle);
+                    clear_selection_watch_error(app);
+                }
                 None => {
                     state.anchor_ready.store(false, Ordering::SeqCst);
                     state.selection_diag.note("watcher", "start_failed", "unknown", 0);
-                    state
-                        .settings
-                        .lock()
-                        .expect("settings poisoned")
-                        .selection_anchor_enabled = false;
+                    set_selection_watch_error(
+                        app,
+                        "选区监听启动失败，本次运行不会自动取词；可用快捷键触发取词。",
+                    );
                 }
             }
         }
@@ -569,6 +587,55 @@ fn apply_anchor_watcher(app: &tauri::AppHandle, enabled: bool) {
     // 关闭、或刚才因能力不可用被落回关闭：都要把图标与待确认文本一起清掉。
     if !enabled || !anchor_enabled(app) {
         dismiss_anchor(app);
+    }
+}
+
+/// 选区链路（图标 / 键盘兜底）的能力失败提示：写进设置页，不静默吞掉。
+#[cfg(windows)]
+fn set_selection_watch_error(app: &tauri::AppHandle, message: &str) {
+    let state = app.state::<AppState>();
+    let slot = state.selection_watch_error.lock();
+    if let Ok(mut slot) = slot {
+        *slot = Some(message.into());
+    }
+}
+
+#[cfg(windows)]
+fn clear_selection_watch_error(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let _ = state.selection_watch_error.lock().map(|mut slot| slot.take());
+}
+
+fn selection_watch_error(state: &AppState) -> Option<String> {
+    #[cfg(windows)]
+    {
+        return state
+            .selection_watch_error
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        None
+    }
+}
+
+#[cfg(test)]
+mod selection_policy_tests {
+    use super::*;
+
+    /// 方案 C 真值表：图标与键盘兜底都和划词开关一一对应，不保留独立状态。
+    #[test]
+    fn the_icon_and_keyboard_fallback_follow_the_selection_switch() {
+        // 划词关闭：无论能力位如何都不生效。
+        assert!(!anchor_gate(false, false));
+        assert!(!anchor_gate(false, true));
+        // 划词开启但能力不可用（非 Windows / 图标窗口建不出来）：不得假开启。
+        assert!(!anchor_gate(true, false));
+        // 划词开启且能力可用：Windows 上唯一生效的组合。
+        assert_eq!(anchor_gate(true, true), cfg!(windows));
     }
 }
 
@@ -626,9 +693,6 @@ struct SpeechCapabilityView {
 
 #[derive(Serialize, Clone)]
 struct SpeechCapabilitiesView {
-    online_fallback: bool,
-    rate: f64,
-    volume: u8,
     languages: Vec<SpeechCapabilityView>,
     /// 枚举系统语音失败时如实回传；此时「本地/在线」判断只能标成未知或在线。
     voice_error: Option<String>,
@@ -941,13 +1005,16 @@ struct AppState {
     update_latest: Mutex<Option<String>>,
     /// 翻译任务代次：只有最新一代可以推送 state，防止慢请求回来覆盖新内容。
     translation_epoch: AtomicU64,
+    /// 本次展开是否已经用历史做过空态回填：每个展开会话只回填一次。
+    /// 用户点「清空」后文档为空，后续快照不得再用历史把刚清掉的文字填回来。
+    history_previewed: AtomicBool,
     /// 选区图标待确认的文本：点击图标才消费；超时/关开关/热键取词即丢弃。
     pending_selection: Mutex<Option<String>>,
     /// 图标显示代次：定时隐藏据此放弃旧定时器，避免把新图标提前收掉。
     anchor_epoch: AtomicU64,
     /// 图标窗口是否创建成功；失败时设置项如实标为不可用（不静默 no-op）。
     anchor_ready: AtomicBool,
-    /// 键盘选区兜底开关（默认关闭）：监听线程据此注册/反注册键盘设备与事件钩子。
+    /// 键盘选区兜底（固定开启，随划词开关启停）：监听线程据此注册键盘设备与事件钩子。
     keyboard_fallback: Arc<AtomicBool>,
     /// 划词热键线程句柄；改键与退出时先反注册旧键再结束线程。
     #[cfg(windows)]
@@ -964,6 +1031,9 @@ struct AppState {
     /// 自动划词连续失败时给设置页的降级提示（热键兜底）；自动识别成功后清除。
     #[cfg(windows)]
     selection_unsupported_hint: Mutex<Option<String>>,
+    /// 选区链路能力失败（图标窗口 / 监听线程 / 键盘输入注册）的提示；设置页内联展示。
+    #[cfg(windows)]
+    selection_watch_error: Mutex<Option<String>>,
     /// 点开划词面板前的原前台窗口句柄：面板收起时若焦点仍在本应用，还给这个窗口。
     /// 用户如果已经点了别的应用，前台不再是本窗口，收起时不会抢回焦点（见 restore_focus）。
     #[cfg(windows)]
@@ -998,21 +1068,14 @@ struct SettingsView {
     leave_grace_ms: u64,
     selection_enabled: bool,
     selection_hotkey: String,
-    /// 选区锚点图标开关：Windows 才可用，不可用时前端把开关置灰。
-    selection_anchor_enabled: bool,
+    /// 划词图标是否随划词开关生效（Windows 且图标窗口可用）。
+    /// 图标显示不再是独立开关：前端只拿它决定是否给出能力提示。
     selection_anchor_supported: bool,
-    /// 键盘选区兜底开关（注册键盘设备与文本选区事件，不记录键值）。默认关闭。
-    selection_keyboard_fallback: bool,
     /// 热键注册失败或文本无效的明确原因；为空表示当前热键可用。
     selection_hotkey_error: Option<String>,
+    /// 选区链路能力失败（图标窗口 / 监听线程）的提示；为空表示无异常。
+    selection_watch_error: Option<String>,
     autostart_enabled: bool,
-    auto_check_updates: bool,
-    /// 朗读语速倍率（0.5–2.0）。本地引擎直接生效，在线音频由前端倍速播放。
-    tts_rate: f64,
-    /// 朗读音量（0–100）。
-    tts_volume: u8,
-    /// 该语言没有本地音色时，是否允许把文本发往在线朗读服务。默认开启。
-    tts_online_fallback: bool,
     /// OCR 引擎选择：`system` / `bundled`（用户选择，未安装时仍保留）。
     ocr_engine: String,
     /// 实际生效的引擎：选择 bundled 但未安装 / 加载失败时为 `system`。
@@ -1057,7 +1120,11 @@ fn snapshot(state: &AppState) -> StateView {
         HoverState::Collapsing { .. } => ("collapsing", false),
     };
     // 面板展开但还没有新识别结果时，用最近一条历史填充；有在途翻译或已有新结果时不动。
-    if view == "expanded" {
+    // 每个展开会话只回填一次：用户点「清空」后文档为空，同一会话里的后续快照
+    // （聚焦卡片、改设置、退出编辑）不能再拿历史把刚清掉的文字填回来。
+    let was_previewed =
+        state.history_previewed.swap(history_preview_flag(view), Ordering::SeqCst);
+    if should_preview_history(view, was_previewed) {
         preview_latest_history(&mut coordinator, state);
     }
     let authoritative = coordinator.document().authoritative();
@@ -1098,21 +1165,16 @@ fn snapshot(state: &AppState) -> StateView {
             leave_grace_ms: settings.leave_grace_ms,
             selection_enabled: settings.selection_enabled,
             selection_hotkey: settings.selection_hotkey.clone(),
-            selection_anchor_enabled: settings.selection_anchor_enabled,
             selection_anchor_supported: cfg!(windows)
                 && state.anchor_ready.load(Ordering::SeqCst),
-            selection_keyboard_fallback: settings.selection_keyboard_fallback,
             selection_hotkey_error: state
                 .hotkey_error
                 .lock()
                 .expect("hotkey error poisoned")
                 .clone()
                 .or_else(|| selection_unsupported_hint(state)),
+            selection_watch_error: selection_watch_error(state),
             autostart_enabled: settings.autostart_enabled,
-            auto_check_updates: settings.auto_check_updates,
-            tts_rate: settings.tts_rate,
-            tts_volume: settings.tts_volume,
-            tts_online_fallback: settings.tts_online_fallback,
             ocr_engine: settings.ocr_engine.clone(),
             ocr_effective_engine: effective_ocr_engine(state, &settings),
             ocr_bundled_supported: cfg!(windows),
@@ -1184,6 +1246,17 @@ fn recognize_clipboard_text(app: &tauri::AppHandle, language_tag: Option<&str>) 
     clipboard_ocr::recognize_bitmap_system(&bitmap, language_tag)
 }
 
+/// 展开会话的历史回填门闩：展开态置真，离开面板（收起 / 胶囊 / 待展开）即复位。
+fn history_preview_flag(view: &str) -> bool {
+    view == "expanded"
+}
+
+/// 本次快照是否允许用历史做空态回填：每个展开会话的第一次快照才允许。
+/// 清空是显式动作，「清空后的空文档」不能被历史回填，否则看起来只清掉了缩略图。
+fn should_preview_history(view: &str, was_previewed: bool) -> bool {
+    view == "expanded" && !was_previewed
+}
+
 /// 面板打开且既没有新识别结果、也没有在途请求时，用最近一条历史填充面板。
 ///
 /// 只在 `snapshot` 内同步执行：不读剪贴板、不发网络请求、不碰 hover 计时；
@@ -1220,12 +1293,9 @@ fn preview_latest_history(coordinator: &mut SyncCoordinator<SystemClock>, state:
 }
 
 /// 启动时异步检查（不阻塞启动）；手动检查同步返回结果。失败一律静默。
-fn run_update_check(state: &AppState) {
-    let settings = state.settings.lock().expect("settings poisoned");
-    if !settings.auto_check_updates {
-        return;
-    }
-    drop(settings);
+///
+/// 启动检查固定开启（设置页已移除该开关），但只比较版本与提示，绝不下载安装。
+fn run_update_check() {
     let status = check_for_update(&GitHubReleaseFetcher::default(), env!("CARGO_PKG_VERSION"));
     if let UpdateStatus::UpdateAvailable(_latest) = status {
 }
@@ -1269,18 +1339,15 @@ async fn speak_text(text: String, lang: String, app: tauri::AppHandle) -> SpeakR
     run_speech(text, lang, app).await
 }
 
+/// 朗读语速固定 1 倍速（SAPI 0 级）：设置页已移除调整项，不再读配置。
+const SPEECH_RATE: f64 = 1.0;
+/// 朗读音量固定 100%，音量大头交给系统音量；设置页已移除调整项。
+const SPEECH_VOLUME: u8 = 100;
+
 /// 朗读的实际执行路径。空文本在 `begin` 之前返回，避免无意义地抢占正在播放的卡片。
 async fn run_speech(text: String, lang: String, app: tauri::AppHandle) -> SpeakResult {
     let language = Lang::new(&lang);
-    let (rate, volume, online_fallback) = {
-        let state = app.state::<AppState>();
-        let settings = state.settings.lock().expect("settings poisoned");
-        (
-            settings.tts_rate,
-            settings.tts_volume,
-            settings.tts_online_fallback,
-        )
-    };
+    let (rate, volume) = (SPEECH_RATE, SPEECH_VOLUME);
     if text.trim().is_empty() {
         return speak_error_result(
             0,
@@ -1305,28 +1372,8 @@ async fn run_speech(text: String, lang: String, app: tauri::AppHandle) -> SpeakR
     .await;
     let voices = match voices_result {
         Ok(Ok(voices)) => voices,
-        other => {
-            if !online_fallback {
-                let message = match other {
-                    Ok(Err(error)) => format!("无法读取系统语音：{error}"),
-                    Err(error) => format!("系统语音查询任务失败：{error}"),
-                    _ => "无法读取系统语音".into(),
-                };
-                let state = app.state::<AppState>();
-                state
-                    .speech
-                    .fail(&app, ticket, &lang, "none", message.clone());
-                return speak_error_result(
-                    ticket,
-                    &lang,
-                    "none",
-                    "error",
-                    message,
-                    Some("voice_query_failed"),
-                );
-            }
-            Vec::new()
-        }
+        // 枚举失败时按「没有本地音色」继续，缺音色固定走在线兜底。
+        _ => Vec::new(),
     };
 
     match choose_voice(&language, &voices) {
@@ -1387,24 +1434,6 @@ async fn run_speech(text: String, lang: String, app: tauri::AppHandle) -> SpeakR
             }
         }
         None => {
-            if !online_fallback {
-                let state = app.state::<AppState>();
-                let message = format!(
-                    "未安装 {lang} 语音，且在线兜底已关闭；可在 Windows 设置 → 时间和语言 → 语音 添加"
-                );
-                state
-                    .speech
-                    .fail(&app, ticket, &lang, "none", message.clone());
-                return speak_error_result(
-                    ticket,
-                    &lang,
-                    "none",
-                    "unavailable",
-                    message,
-                    Some("no_voice"),
-                );
-            }
-
             {
                 let state = app.state::<AppState>();
                 state.speech.resolving(&app, ticket, &lang);
@@ -1531,23 +1560,15 @@ fn spawn_local_monitor(app: tauri::AppHandle, ticket: u64, lang: String) {
 /// 各语言朗读能力（只读）。前端在挂载与设置变化后调用，据此 disable 按钮、标「在线」。
 #[tauri::command]
 async fn speech_capabilities(app: tauri::AppHandle) -> SpeechCapabilitiesView {
-    let (langs, rate, volume, online_fallback) = {
+    let langs = {
         let state = app.state::<AppState>();
         let coordinator = state.coordinator.lock().expect("coordinator poisoned");
-        let langs = coordinator
+        coordinator
             .pool()
             .languages()
             .iter()
             .map(|language| language.code().to_string())
-            .collect::<Vec<_>>();
-        drop(coordinator);
-        let settings = state.settings.lock().expect("settings poisoned");
-        (
-            langs,
-            settings.tts_rate,
-            settings.tts_volume,
-            settings.tts_online_fallback,
-        )
+            .collect::<Vec<_>>()
     };
 
     let handle = app.clone();
@@ -1577,30 +1598,19 @@ async fn speech_capabilities(app: tauri::AppHandle) -> SpeechCapabilitiesView {
                     backend: "local".into(),
                     reason: Some(format!("本机音色：{}", voice.id)),
                 }
-            } else if online_fallback {
+            } else {
+                // 缺音色时固定在线兜底（设置页已移除该开关）。
                 SpeechCapabilityView {
                     lang,
                     enabled: true,
                     backend: "online".into(),
                     reason: Some("未安装该语言语音，将使用在线朗读（文本会发送到在线服务）".into()),
                 }
-            } else {
-                SpeechCapabilityView {
-                    lang,
-                    enabled: false,
-                    backend: "none".into(),
-                    reason: Some(
-                        "未安装该语言语音；可在 Windows 设置 → 时间和语言 → 语音 添加".into(),
-                    ),
-                }
             }
         })
         .collect();
 
     SpeechCapabilitiesView {
-        online_fallback,
-        rate,
-        volume,
         languages,
         voice_error,
     }
@@ -1761,6 +1771,104 @@ fn capsule_shape_anchor(app: &tauri::AppHandle) -> Option<(i32, i32)> {
     })
 }
 
+/// 把胶囊一次提交到「可显示位置」，返回最终锚点。
+///
+/// 启动、托盘「显示」、二次启动共用：先按保存锚点算，再复核窗口实际矩形；
+/// 仍不可见就落主屏右上角。边界判断全部复用 `fit_capsule_anchor` /
+/// `capsule_slot` / `clamp_capsule_left`，这里不另写一套。
+fn place_capsule_visible(window: &WebviewWindow, saved: Option<(i32, i32)>) -> Option<(i32, i32)> {
+    let areas = screen_areas(window);
+    let fallback_area = primary_area(window).or_else(|| areas.first().copied());
+    let fallback = fallback_area.map(capsule_slot).unwrap_or((0.0, 0.0));
+    let (x, y) = fit_capsule_anchor(saved, &areas, fallback);
+    set_window_geometry(window, x, y, CAPSULE_WINDOW_WIDTH, CAPSULE_WINDOW_HEIGHT);
+
+    // 复核：系统可能在提交后按 DPI 或桌面策略把窗口摆到别处。
+    let scale = window_scale(window);
+    let actual = window
+        .outer_position()
+        .ok()
+        .map(|pos| capsule_rect((pos.x as f64 / scale, pos.y as f64 / scale)));
+    let visible = actual.is_some_and(|rect| containing_area(rect, &areas).is_some());
+    if !visible {
+        if let Some((fx, fy)) = fallback_area.map(capsule_slot) {
+            set_window_geometry(window, fx, fy, CAPSULE_WINDOW_WIDTH, CAPSULE_WINDOW_HEIGHT);
+        }
+        startup_log::line("capsule_place_repaired=1");
+    }
+    startup_log::line(&format!(
+        "capsule_place: saved={saved:?} requested=({x:.1},{y:.1}) visible_after={visible}"
+    ));
+    capsule_anchor(window)
+}
+
+/// 找回入口（托盘「显示」/ 二次启动）：只有当前矩形不在任何显示器可用区内才移动。
+/// 面板态不动窗口（收起仍按锚点还原），仅记一条日志。
+fn repair_capsule_visible(app: &tauri::AppHandle) -> bool {
+    let Some(window) = app.get_webview_window("main") else {
+        return false;
+    };
+    if window_is_oversized(&window) {
+        startup_log::line("capsule_repair_skipped=panel");
+        return false;
+    }
+    let areas = screen_areas(&window);
+    if areas.is_empty() {
+        return false;
+    }
+    let scale = window_scale(&window);
+    let current = window
+        .outer_position()
+        .ok()
+        .map(|pos| capsule_rect((pos.x as f64 / scale, pos.y as f64 / scale)));
+    if current.is_some_and(|rect| containing_area(rect, &areas).is_some()) {
+        return false;
+    }
+    let saved = current.map(|rect| (rect.left.round() as i32, rect.top.round() as i32));
+    let Some(anchor) = place_capsule_visible(&window, saved) else {
+        return false;
+    };
+    let state = app.state::<AppState>();
+    {
+        let mut settings = state.settings.lock().expect("settings poisoned");
+        settings.capsule_anchor = Some(anchor);
+    }
+    persist(state.inner());
+    startup_log::line(&format!("capsule_recovered: anchor={anchor:?}"));
+    true
+}
+
+/// 启动记录：显示器几何 + 窗口矩形 + 可见性。只写几何，不写任何用户内容。
+fn log_startup_displays(window: &WebviewWindow, stage: &str) {
+    let areas: Vec<String> = screen_areas(window)
+        .iter()
+        .map(|area| {
+            format!(
+                "[{:.0},{:.0}..{:.0},{:.0}]",
+                area.left, area.top, area.right, area.bottom
+            )
+        })
+        .collect();
+    let scale = window_scale(window);
+    let position = window
+        .outer_position()
+        .ok()
+        .map(|pos| format!("({:.0},{:.0})", pos.x as f64 / scale, pos.y as f64 / scale))
+        .unwrap_or_else(|| "?".into());
+    let size = window
+        .inner_size()
+        .ok()
+        .map(|size| format!("{}x{}", size.width, size.height))
+        .unwrap_or_else(|| "?".into());
+    startup_log::line(&format!(
+        "{stage}: areas={} pos={} size={} visible={:?}",
+        areas.join(","),
+        position,
+        size,
+        window.is_visible().ok()
+    ));
+}
+
 /// 兜底收起：700ms 后若仍不在展开态、窗口还是面板尺寸，就把窗口缩回胶囊。
 /// 正常路径由前端在透明帧之后调用 `resize_window(false)`，这里只防前端页面被重载
 /// 后大窗口长期吞掉桌面点击。触发前重新确认尺寸，避免前端已经缩回还多缩一次。
@@ -1833,13 +1941,17 @@ fn window_scale(window: &WebviewWindow) -> f64 {
         .unwrap_or(1.0)
 }
 
-/// 窗口所在显示器的上边缘（逻辑坐标 y）。胶囊永远吸附在这条线上。
+/// 窗口所在显示器可用区的上边缘（逻辑坐标 y）。胶囊吸附在这条线上。
+///
+/// 用可用区而不是 `monitor.position()`：顶部任务栏 / 顶部 AppBar 会占掉一条 band，
+/// 胶囊钉在 y=0 就会被压在那条 band 底下（topmost 之间按激活先后决定，隐藏窗口永远输），
+/// 表现为「托盘在、胶囊看不见」。底部任务栏或自动隐藏时两者相同。
 fn monitor_top(window: &WebviewWindow) -> f64 {
     window
         .current_monitor()
         .ok()
         .flatten()
-        .map(|monitor| monitor.position().y as f64 / monitor.scale_factor())
+        .map(|monitor| monitor_area(&monitor).top)
         .unwrap_or(0.0)
 }
 
@@ -1947,6 +2059,125 @@ fn place_panel(
         .clamp(area.left, (area.right - panel_width).max(area.left));
     let top = clamp_panel_top(anchor.1, panel_height, area);
     (left, top)
+}
+
+/// 胶囊在屏幕上的矩形（逻辑坐标）。只用于可见性判定，与 `place_panel` 同一套换算。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CapsuleRect {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+fn capsule_rect(anchor: (f64, f64)) -> CapsuleRect {
+    CapsuleRect {
+        left: anchor.0,
+        top: anchor.1,
+        right: anchor.0 + CAPSULE_WINDOW_WIDTH,
+        bottom: anchor.1 + CAPSULE_WINDOW_HEIGHT,
+    }
+}
+
+/// 胶囊矩形是否完整落在某块显示器的可用区内；命中时返回该显示器的下标。
+/// 跨屏缝隙、越出右缘、负坐标、只露出一部分都算不可见。
+fn containing_area(rect: CapsuleRect, areas: &[WorkArea]) -> Option<usize> {
+    areas.iter().position(|area| {
+        rect.left >= area.left
+            && rect.top >= area.top
+            && rect.right <= area.right
+            && rect.bottom <= area.bottom
+    })
+}
+
+/// 横向离锚点最近的显示器：按锚点到「可放置区间 [left, right-68]」的距离比较。
+fn nearest_area(anchor: (f64, f64), areas: &[WorkArea]) -> Option<usize> {
+    areas
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            let distance = |area: &WorkArea| {
+                let max_left = (area.right - CAPSULE_WINDOW_WIDTH).max(area.left);
+                if anchor.0 < area.left {
+                    area.left - anchor.0
+                } else if anchor.0 > max_left {
+                    anchor.0 - max_left
+                } else {
+                    0.0
+                }
+            };
+            distance(a).total_cmp(&distance(b))
+        })
+        .map(|(index, _)| index)
+}
+
+/// 某块显示器的胶囊落点：贴可用区右缘与上缘。可用区比胶囊还窄时贴左缘。
+fn capsule_slot(area: WorkArea) -> (f64, f64) {
+    (
+        (area.right - CAPSULE_WINDOW_WIDTH).max(area.left),
+        area.top,
+    )
+}
+
+/// 把「保存的锚点 / 默认位」归一到可显示位置。
+///
+/// - 没有显示器：用调用方给的兜底点；
+/// - 锚点完整可见：保留 x，y 拉回可用区上缘（胶囊永远贴顶）；
+/// - 不可见：移到横向最近的显示器，x 夹进可用区。
+fn fit_capsule_anchor(
+    saved: Option<(i32, i32)>,
+    areas: &[WorkArea],
+    fallback: (f64, f64),
+) -> (f64, f64) {
+    if areas.is_empty() {
+        return fallback;
+    }
+    let Some((x, y)) = saved else {
+        return fallback;
+    };
+    let anchor = (x as f64, y as f64);
+    if let Some(index) = containing_area(capsule_rect(anchor), areas) {
+        return (anchor.0, areas[index].top);
+    }
+    let Some(index) = nearest_area(anchor, areas) else {
+        return fallback;
+    };
+    let area = areas[index];
+    (
+        clamp_capsule_left(anchor.0, CAPSULE_WINDOW_WIDTH, (area.left, area.right)),
+        area.top,
+    )
+}
+
+/// 形态判定：胶囊 68×28、面板 613×300。宽高双条件，
+/// 保证 `current_monitor()` 取不到、`scale` 回退 1.0 时也不会把胶囊误判成面板态。
+fn is_capsule_shape(width: f64, height: f64, scale: f64) -> bool {
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    width / scale <= CAPSULE_WINDOW_WIDTH + 1.0 && height / scale <= CAPSULE_WINDOW_HEIGHT + 1.0
+}
+
+/// 当前虚拟桌面所有显示器的可用区（逻辑坐标）。
+fn screen_areas(window: &WebviewWindow) -> Vec<WorkArea> {
+    window
+        .available_monitors()
+        .ok()
+        .map(|monitors| monitors.iter().map(monitor_area).collect())
+        .unwrap_or_default()
+}
+
+/// 主显示器可用区；拿不到时退回枚举到的第一块。
+fn primary_area(window: &WebviewWindow) -> Option<WorkArea> {
+    window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| monitor_area(&monitor))
+        .or_else(|| {
+            window
+                .available_monitors()
+                .ok()
+                .and_then(|monitors| monitors.first().map(monitor_area))
+        })
 }
 
 /// 面板窗口的目标矩形（逻辑坐标）。
@@ -2391,8 +2622,14 @@ fn dispatch(
     view
 }
 
+/// 前端是否已经跑过一次 `get_state`：用来区分「窗口位置问题」与「WebView 没执行前端脚本」。
+static FRONTEND_SEEN: AtomicBool = AtomicBool::new(false);
+
 #[tauri::command]
 fn get_state(state: tauri::State<'_, AppState>) -> StateView {
+    if !FRONTEND_SEEN.swap(true, Ordering::Relaxed) {
+        startup_log::line("frontend_first_state");
+    }
     snapshot(state.inner())
 }
 
@@ -2819,7 +3056,8 @@ fn check_updates(state: tauri::State<'_, AppState>) -> StateView {
     snapshot(state.inner())
 }
 
-/// 保存面板设置（自动读剪贴板、悬停延迟、划词、选区图标、更新开关）并即时生效。
+/// 保存面板设置（自动读剪贴板、悬停延迟、划词开关、划词热键）并即时生效。
+/// 划词开关同时决定图标与选区监听的生命周期；朗读参数与更新检查已固定，不再入参。
 /// 延迟生效通过重建状态机完成，展开态会复位——该动作本身就来自展开的面板，代价可接受。
 #[tauri::command(rename_all = "snake_case")]
 fn set_settings(
@@ -2827,19 +3065,12 @@ fn set_settings(
     auto_read_clipboard: bool,
     hover_delay_ms: u64,
     selection_enabled: bool,
-    selection_anchor_enabled: bool,
-    selection_keyboard_fallback: bool,
-    auto_check_updates: bool,
-    tts_rate: Option<f64>,
-    tts_volume: Option<u8>,
-    tts_online_fallback: Option<bool>,
     selection_hotkey: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> StateView {
     let delay = hover_delay_ms.clamp(50, 2000);
-    // 非 Windows 不落地「已开启」的假状态：没有实现就没有开关。
-    let anchor_on = cfg!(windows) && selection_anchor_enabled;
-    let keyboard_on = cfg!(windows) && selection_keyboard_fallback;
+    // 图标显示与划词开关合并：非 Windows 不落地「已开启」的假状态。
+    let anchor_on = cfg!(windows) && selection_enabled;
     let hotkey_text = selection_hotkey
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
@@ -2848,18 +3079,6 @@ fn set_settings(
         settings.auto_read_clipboard = auto_read_clipboard;
         settings.hover_delay_ms = delay;
         settings.selection_enabled = selection_enabled;
-        settings.selection_anchor_enabled = anchor_on;
-        settings.selection_keyboard_fallback = keyboard_on;
-        settings.auto_check_updates = auto_check_updates;
-        if let Some(rate) = tts_rate {
-            settings.tts_rate = rate.clamp(0.5, 2.0);
-        }
-        if let Some(volume) = tts_volume {
-            settings.tts_volume = volume.min(100);
-        }
-        if let Some(online) = tts_online_fallback {
-            settings.tts_online_fallback = online;
-        }
         let grace = settings.leave_grace_ms;
         *state.hover.lock().expect("hover state poisoned") =
             HoverStateMachine::new(delay, grace);
@@ -2881,25 +3100,7 @@ fn set_settings(
     }
     persist(state.inner());
     apply_anchor_watcher(&app, anchor_on);
-    apply_keyboard_fallback(&app, keyboard_on);
     snapshot(state.inner())
-}
-
-/// 键盘兜底开关：写能力位并通知监听线程注册/反注册键盘设备与事件钩子。
-fn apply_keyboard_fallback(app: &tauri::AppHandle, enabled: bool) {
-    #[cfg(windows)]
-    {
-        let state = app.state::<AppState>();
-        state.keyboard_fallback.store(enabled, Ordering::SeqCst);
-        let watcher = state
-            .selection_watch
-            .lock()
-            .expect("selection watcher poisoned");
-        if let Some(handle) = watcher.as_ref() {
-            handle.refresh_inputs();
-        }
-    }
-    let _ = (app, enabled);
 }
 
 /// 开机自启开关（tauri-plugin-autostart：Win 注册表 Run / macOS LaunchAgent / XDG autostart）。
@@ -3219,18 +3420,20 @@ fn apply_language_pool(languages: &[String], app: &tauri::AppHandle, state: &App
     }
 }
 /// 面板头划词翻译开关：toggle_selection。单独一个命令因为它只改一个布尔字段。
+///
+/// 图标显示已与它合并（方案 C）：翻转后立即启停选区监听，不保留独立的图标状态。
 #[tauri::command]
 fn toggle_selection(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> StateView {
-    let _enabled = {
+    let enabled = {
         let mut settings = state.settings.lock().expect("settings poisoned");
         settings.selection_enabled = !settings.selection_enabled;
         settings.selection_enabled
     };
-persist(state.inner());
-    let _ = app;
+    persist(state.inner());
+    apply_anchor_watcher(&app, cfg!(windows) && enabled);
     snapshot(state.inner())
 }
 
@@ -3474,9 +3677,10 @@ fn selection_debug_state(
 ) -> SelectionDebugView {
     let (anchor_enabled, keyboard_fallback) = {
         let settings = state.settings.lock().expect("settings poisoned");
+        // 图标生效值 = 划词开关；键盘兜底固定开启，读运行时能力位。
         (
-            settings.selection_anchor_enabled,
-            settings.selection_keyboard_fallback,
+            settings.selection_enabled,
+            state.keyboard_fallback.load(Ordering::SeqCst),
         )
     };
     let hover_state = hover_code(state.hover.lock().expect("hover state poisoned").state());
@@ -3535,6 +3739,78 @@ fn selection_debug_state(
     view
 }
 
+/// 启动诊断日志：每次启动覆盖写 `%LOCALAPPDATA%\Bead\startup.log`。
+///
+/// 只记版本、显示器几何、窗口矩形与失败阶段，不记选中文本、剪贴板内容与密钥。
+/// release 构建是 `windows_subsystem = "windows"`，没有控制台，panic 与启动失败原本
+/// 完全不可见——这份日志是「托盘在但拿不到窗口」这类问题唯一的外部证据。
+mod startup_log {
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    pub fn path() -> PathBuf {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Bead")
+            .join("startup.log")
+    }
+
+    /// 覆盖写并写入版本行：每次进程启动只调用一次。
+    pub fn reset(version: &str) {
+        let path = path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, format!("Bead {version} startup log\n"));
+    }
+
+    pub fn line(message: &str) {
+        let path = path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(file, "{message}");
+        }
+    }
+}
+
+/// panic 落盘但保留原有输出（debug 构建仍能在终端看到）。
+fn install_panic_log_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        startup_log::line(&format!("panic: {info}"));
+        default_hook(info);
+    }));
+}
+
+/// 致命启动失败时弹一个系统对话框。release 没有控制台，否则用户只会看到「什么都没发生」。
+#[cfg(windows)]
+fn fatal_message_box(text: &str) {
+    extern "system" {
+        fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
+    }
+    const MB_ICONERROR: u32 = 0x10;
+    let body: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = "Bead 启动失败"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        MessageBoxW(0, body.as_ptr(), title.as_ptr(), MB_ICONERROR);
+    }
+}
+
+#[cfg(not(windows))]
+fn fatal_message_box(text: &str) {
+    startup_log::line(&format!("fatal: {text}"));
+}
+
 /// 窗口两种形态的尺寸。
 ///
 /// 面板宽度随卡片数增长：卡片宽度固定 189px、间距 10px，加上左右 padding 与 1px inset，
@@ -3552,6 +3828,8 @@ const BOARD_WINDOW_WIDTH: f64 = 613.0;
 const CAPSULE_LEFT_IN_PANEL: f64 = 272.0;
 
 fn main() {
+    startup_log::reset(env!("CARGO_PKG_VERSION"));
+    install_panic_log_hook();
     // 默认三语池演示「改一处、其余全部联动」；工单 03 起可在设置面板改为 2–5 种。
     let pool = LanguagePool::new(vec![
         Lang::new("zh"),
@@ -3566,14 +3844,16 @@ fn main() {
         Ok(translator) => chain.push(translator),
         Err(message) => panic!("默认引擎装配失败：{message}"),
     }
-    tauri::Builder::default()
+    let built = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // 第二次启动：唤起已有实例（显示窗口），不起新进程。
+            // 第二次启动：先把跑丢的胶囊拉回可见区，再唤起已有实例，不起新进程。
+            let repaired = repair_capsule_visible(app);
+            startup_log::line(&format!("second_instance: repaired={repaired}"));
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
@@ -3604,6 +3884,7 @@ fn main() {
             ocr: ocr::Manager::default(),
             update_latest: Mutex::new(None),
             translation_epoch: AtomicU64::new(0),
+            history_previewed: AtomicBool::new(false),
             pending_selection: Mutex::new(None),
             anchor_epoch: AtomicU64::new(0),
             anchor_ready: AtomicBool::new(false),
@@ -3617,6 +3898,8 @@ fn main() {
             selection_diag: Arc::new(selection_watch::SelectionDiagnostics::default()),
             #[cfg(windows)]
             selection_unsupported_hint: Mutex::new(None),
+            #[cfg(windows)]
+            selection_watch_error: Mutex::new(None),
             #[cfg(windows)]
             focus_return: Mutex::new(None),
         })
@@ -3674,21 +3957,23 @@ fn main() {
             // 避免大窗口与系统边框在默认位置闪一下。
             let window = app.get_webview_window("main").expect("main window exists");
             strip_nc_frame(&window);
-            window
-                .set_size(LogicalSize::new(CAPSULE_WINDOW_WIDTH, CAPSULE_WINDOW_HEIGHT))
-                .expect("resize main window");
-            let default_x = window
-                .current_monitor()
-                .ok()
-                .flatten()
-                .map(|monitor| {
-                    monitor.size().width as f64 / monitor.scale_factor() - CAPSULE_WINDOW_WIDTH
-                })
-                .unwrap_or(0.0);
-            window
-                .set_position(LogicalPosition::new(default_x, 0.0))
-                .expect("position main window");
-            window.show().expect("show main window");
+            if let Err(error) =
+                window.set_size(LogicalSize::new(CAPSULE_WINDOW_WIDTH, CAPSULE_WINDOW_HEIGHT))
+            {
+                startup_log::line(&format!("set_size_failed: {error}"));
+            }
+            // 默认位 = 主屏可用区右上角。用可用区而不是 `size/scale`，同时修掉两个坑：
+            // 忽略显示器原点会让窗口落进多屏之间的缝隙；贴 y=0 会被顶部任务栏压住。
+            let default_slot = primary_area(&window).map(capsule_slot).unwrap_or((0.0, 0.0));
+            if let Err(error) =
+                window.set_position(LogicalPosition::new(default_slot.0, default_slot.1))
+            {
+                startup_log::line(&format!("set_position_failed: {error}"));
+            }
+            if let Err(error) = window.show() {
+                startup_log::line(&format!("show_failed: {error}"));
+            }
+            log_startup_displays(&window, "startup");
             // 预热系统语音列表：首次点朗读不必等 PowerShell 枚举；后续按 TTL 刷新。
             let warm = app.handle().clone();
             std::thread::spawn(move || {
@@ -3722,11 +4007,16 @@ fn main() {
                 let top = monitor_top(&window_for_snap);
                 let x = pos.x as f64 / scale;
                 let y = pos.y as f64 / scale;
-                let width = window_for_snap
+                // 形态判定用宽高双条件：`current_monitor()` 取不到时 scale 会回退 1.0，
+                // 只看宽度会把 68×28 的胶囊误判成面板态，夹取与锚点回写就整段失效。
+                let (raw_width, raw_height) = window_for_snap
                     .inner_size()
-                    .map(|size| size.width as f64 / scale)
-                    .unwrap_or(CAPSULE_WINDOW_WIDTH);
-                if width > CAPSULE_WINDOW_WIDTH + 1.0 {
+                    .map(|size| (size.width as f64, size.height as f64))
+                    .unwrap_or((
+                        CAPSULE_WINDOW_WIDTH * scale,
+                        CAPSULE_WINDOW_HEIGHT * scale,
+                    ));
+                if !is_capsule_shape(raw_width, raw_height, scale) {
                     // 面板态：只保证纵向落在当前显示器可用区。横向不能按「左缘 + 272」
                     // 反推锚点——贴边 clamp 后面板 left 不再等于锚点 - 272，反推会带偏胶囊。
                     let Some(area) = monitor_work_area(&window_for_snap) else {
@@ -3739,11 +4029,11 @@ fn main() {
                     return;
                 }
                 // 胶囊态：夹回可用区（跨屏用并集，允许拖到副屏）并贴显示器上缘；
-                // 锚点跟随真实位置。
-                let Some(span) = virtual_work_span(&window_for_snap) else {
-                    return;
+                // 锚点跟随真实位置。取不到并集时不提前 return，退化为只贴顶不夹 x。
+                let target_left = match virtual_work_span(&window_for_snap) {
+                    Some(span) => clamp_capsule_left(x, CAPSULE_WINDOW_WIDTH, span),
+                    None => x,
                 };
-                let target_left = clamp_capsule_left(x, CAPSULE_WINDOW_WIDTH, span);
                 if (target_left - x).abs() > 0.5 || (y - top).abs() > 0.5 {
                     let _ = window_for_snap.set_position(LogicalPosition::new(target_left, top));
                 }
@@ -3798,31 +4088,10 @@ fn main() {
                 // 历史与 settings.json 同级：读不出或不认识格式都退化成空历史，不影响启动。
                 *state.history.lock().expect("history poisoned") =
                     history::TranslationHistory::load(dir, history::DEFAULT_CAPACITY);
-                // 位置记忆：恢复拖拽后的横向锚点；纵坐标一律吸附显示器上边缘。
-                if let Some((x, _y)) = saved_anchor {
-                    let top = monitor_top(&window);
-                    let _ = window.set_position(LogicalPosition::new(x as f64, top));
-                    let on_screen = window.outer_position().ok().is_some_and(|outer| {
-                        window
-                            .available_monitors()
-                            .unwrap_or_default()
-                            .iter()
-                            .any(|monitor| {
-                                let origin = monitor.position();
-                                let size = monitor.size();
-                                outer.x >= origin.x
-                                    && outer.y >= origin.y
-                                    && outer.x + CAPSULE_WINDOW_WIDTH as i32
-                                        <= origin.x + size.width as i32
-                                    && outer.y + CAPSULE_WINDOW_HEIGHT as i32
-                                        <= origin.y + size.height as i32
-                            })
-                    });
-                    if !on_screen {
-                        let _ = window
-                            .set_position(LogicalPosition::new(default_x, monitor_top(&window)));
-                    }
-                }
+                // 位置记忆：恢复拖拽后的锚点；不可见（换机 / 拔屏 / 改缩放 / 顶部任务栏）
+                // 就落主屏可用区右上角，绝不把窗口留在屏外。
+                place_capsule_visible(&window, saved_anchor);
+                log_startup_displays(&window, "after_restore");
                 // 自启动：已启用则重写当前路径（便携包移动后自愈）。
                 if state.settings.lock().expect("settings poisoned").autostart_enabled {
                     let autostart = app.autolaunch();
@@ -3832,52 +4101,51 @@ fn main() {
                     }
                 }
             }
+            // 启动后复核一次：show 之后系统仍可能按 DPI / 桌面策略重摆窗口。
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    let repaired = repair_capsule_visible(&handle);
+                    startup_log::line(&format!("startup_recheck: repaired={repaired}"));
+                });
+            }
+            // 前端 3s 内没跑过 get_state：WebView 没执行脚本（资源/渲染问题），不是位置问题。
+            {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(3000));
+                    if !FRONTEND_SEEN.load(Ordering::Relaxed) {
+                        startup_log::line("webview_no_frontend");
+                    }
+                });
+            }
             // 记下胶囊左缘作为窗口伸缩的固定锚点：展开/收起只改尺寸，位置全部由锚点算出，
             // 不再从当前几何反推（异步 resize 的中间态几何会把锚点算歪）。
             if let Some(anchor) = capsule_anchor(&window) {
                 state.settings.lock().expect("settings poisoned").capsule_anchor = Some(anchor);
             }
             // 划词热键：按用户配置（默认 Ctrl+Alt+Shift+B）注册；失败原因进设置页提示。
-            let (keyboard_fallback_on, hotkey_spec) = {
+            let hotkey_spec = {
                 let settings = state.settings.lock().expect("settings poisoned");
-                (
-                    settings.selection_keyboard_fallback,
-                    settings.selection_hotkey.clone(),
-                )
+                settings.selection_hotkey.clone()
             };
-            state
-                .keyboard_fallback
-                .store(cfg!(windows) && keyboard_fallback_on, Ordering::SeqCst);
             #[cfg(windows)]
             apply_hotkey(app.handle(), &hotkey_spec);
-            // 选区锚点图标：先建隐藏窗口（建不出来就让设置项如实置灰），
-            // 再按已保存的开关启动 Raw Input 监听；关闭时不注册任何全局监听。
+            // 选区图标与键盘兜底随划词开关启停：先建隐藏窗口，再按开关启动监听。
             #[cfg(windows)]
             {
                 let ready = selection_anchor::create(app.handle()).is_some();
                 state.anchor_ready.store(ready, Ordering::SeqCst);
-                if !ready {
-                    // 图标窗口建不出来（WebView2 或窗口系统异常）就不能留下「已开启」的假状态。
-                    state
-                        .settings
-                        .lock()
-                        .expect("settings poisoned")
-                        .selection_anchor_enabled = false;
-                }
             }
-            let anchor_on = state
+            let selection_on = state
                 .settings
                 .lock()
                 .expect("settings poisoned")
-                .selection_anchor_enabled;
-            apply_anchor_watcher(app.handle(), anchor_on);
-            // 启动时异步检查更新（auto_check_updates 开关控制），绝不阻塞启动。
+                .selection_enabled;
+            apply_anchor_watcher(app.handle(), cfg!(windows) && selection_on);
+            // 启动时异步检查更新（固定开启，只比较与提示），绝不阻塞启动。
             {
-                let handle = app.handle().clone();
-                std::thread::spawn(move || {
-                    let state = handle.state::<AppState>();
-                    run_update_check(state.inner());
-                });
+                std::thread::spawn(run_update_check);
             }
             // 托盘：显隐胶囊 / 退出（工单 08）。
             build_tray(app.handle())?;
@@ -3889,9 +4157,19 @@ fn main() {
             }
             Ok(())
         })
-        .build(tauri::generate_context!())
-        .expect("failed to build Bead")
-        .run(|app_handle, event| {
+        .build(tauri::generate_context!());
+    let app = match built {
+        Ok(app) => app,
+        Err(error) => {
+            // release 没有控制台：静默退出会让用户以为「装完什么也没发生」。
+            startup_log::line(&format!("build_failed: {error}"));
+            fatal_message_box(&format!(
+                "无法创建应用窗口：{error}\n\n请确认系统已安装 Microsoft Edge WebView2 运行时后重试。"
+            ));
+            return;
+        }
+    };
+    app.run(|app_handle, event| {
             // 位置记忆：锚点由 Moved 监听维护，退出只需要落盘。
             // 胶囊态再从窗口几何补一次兜底；展开态禁止反推——贴边 clamp 后
             // 面板 left ≠ 锚点 - 272，反推会把记忆位置写歪。
@@ -3936,6 +4214,9 @@ fn build_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> 
                     if window.is_visible().unwrap_or(false) {
                         let _ = window.hide();
                     } else {
+                        // 显示前先把跑丢的胶囊拉回可见区：这就是用户找回胶囊的入口。
+                        let repaired = repair_capsule_visible(app);
+                        startup_log::line(&format!("tray_show: repaired={repaired}"));
                         let _ = window.show();
                         let _ = window.set_focus();
                     }
@@ -4137,6 +4418,127 @@ mod geometry_tests {
         let clamped = clamp_capsule_left(5000.0, CAPSULE_WINDOW_WIDTH, span);
         assert!((clamped - (1706.6667 - CAPSULE_WINDOW_WIDTH)).abs() < 0.01);
     }
+
+    fn secondary_right() -> WorkArea {
+        WorkArea {
+            left: 1920.0,
+            top: 0.0,
+            right: 3840.0,
+            bottom: 1040.0,
+        }
+    }
+
+    #[test]
+    fn a_capsule_saved_beyond_the_right_edge_is_recovered_into_the_visible_slot() {
+        let areas = [primary_1080p()];
+        let fallback = capsule_slot(areas[0]);
+        assert_eq!(
+            fit_capsule_anchor(Some((5000, 0)), &areas, fallback),
+            (1920.0 - CAPSULE_WINDOW_WIDTH, 0.0)
+        );
+    }
+
+    #[test]
+    fn a_negative_anchor_falls_back_to_the_visible_left_edge() {
+        let areas = [primary_1080p()];
+        let fallback = capsule_slot(areas[0]);
+        assert_eq!(fit_capsule_anchor(Some((-500, 0)), &areas, fallback), (0.0, 0.0));
+        // 纵坐标越界同样拉回可用区上缘。
+        assert_eq!(fit_capsule_anchor(Some((800, -400)), &areas, fallback), (800.0, 0.0));
+    }
+
+    #[test]
+    fn a_capsule_saved_on_a_removed_secondary_monitor_returns_to_the_primary() {
+        // 副屏（1920..3840）已被拔掉，只剩主屏：3760 必须夹回主屏右缘而不是留在屏外。
+        let areas = [primary_1080p()];
+        let fallback = capsule_slot(areas[0]);
+        assert_eq!(fit_capsule_anchor(Some((3760, 0)), &areas, fallback), (1852.0, 0.0));
+    }
+
+    #[test]
+    /// 副屏（1920, 0）锚点 (3760, 0)：必须留在副屏且贴其可用区上缘（顶部任务栏）。
+    fn a_capsule_saved_on_a_kept_secondary_monitor_stays_there() {
+        let areas = [primary_1080p(), secondary_right()];
+        let fallback = capsule_slot(areas[0]);
+        assert_eq!(fit_capsule_anchor(Some((3760, 0)), &areas, fallback), (3760.0, 0.0));
+    }
+
+    #[test]
+    fn a_capsule_under_a_top_taskbar_sits_below_the_reserved_band() {
+        let with_taskbar = WorkArea {
+            top: 48.0,
+            ..primary_1080p()
+        };
+        let areas = [with_taskbar];
+        assert_eq!(capsule_slot(with_taskbar), (1852.0, 48.0));
+        assert_eq!(
+            fit_capsule_anchor(Some((1000, 0)), &areas, capsule_slot(with_taskbar)),
+            (1000.0, 48.0)
+        );
+    }
+
+    #[test]
+    fn a_saved_anchor_that_is_already_visible_is_not_moved_horizontally() {
+        let areas = [primary_1080p()];
+        let fallback = capsule_slot(areas[0]);
+        assert_eq!(fit_capsule_anchor(Some((817, 0)), &areas, fallback), (817.0, 0.0));
+    }
+
+    #[test]
+    fn an_empty_monitor_list_falls_back_to_the_given_slot() {
+        assert_eq!(
+            fit_capsule_anchor(Some((9999, 0)), &[], (10.0, 20.0)),
+            (10.0, 20.0)
+        );
+    }
+
+    #[test]
+    fn a_gap_between_staggered_monitors_is_not_treated_as_visible() {
+        // 副屏从 (1920, 1080) 起：锚点 (2500, 0) 落在两块屏之间的空档，必须判不可见。
+        let lower = WorkArea {
+            left: 1920.0,
+            top: 1080.0,
+            right: 3840.0,
+            bottom: 2120.0,
+        };
+        let areas = [primary_1080p(), lower];
+        assert_eq!(containing_area(capsule_rect((2500.0, 0.0)), &areas), None);
+        assert_eq!(containing_area(capsule_rect((1900.0, 0.0)), &areas), None);
+        assert_eq!(containing_area(capsule_rect((1000.0, 0.0)), &areas), Some(0));
+    }
+
+    #[test]
+    fn a_scaled_saved_anchor_is_fitted_in_logical_pixels() {
+        let area = WorkArea::from_physical(
+            PhysicalArea {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1380,
+            },
+            1.5,
+        );
+        let areas = [area];
+        let (x, y) = fit_capsule_anchor(Some((5000, 0)), &areas, capsule_slot(area));
+        assert!((x - (1706.6667 - CAPSULE_WINDOW_WIDTH)).abs() < 0.01);
+        assert_eq!(y, 0.0);
+    }
+
+    #[test]
+    fn capsule_and_panel_shapes_are_told_apart_even_when_scale_falls_back() {
+        assert!(is_capsule_shape(
+            CAPSULE_WINDOW_WIDTH,
+            CAPSULE_WINDOW_HEIGHT,
+            1.0
+        ));
+        assert!(is_capsule_shape(
+            CAPSULE_WINDOW_WIDTH * 1.5,
+            CAPSULE_WINDOW_HEIGHT * 1.5,
+            1.5
+        ));
+        assert!(!is_capsule_shape(414.0, BOARD_WINDOW_HEIGHT, 1.0));
+        assert!(!is_capsule_shape(613.0, BOARD_WINDOW_HEIGHT, 1.0));
+    }
 }
 
 #[cfg(test)]
@@ -4164,5 +4566,28 @@ mod focus_return_tests {
         assert_eq!(focus_return_target(0x11, 0x22), Some(0x11));
         assert_eq!(focus_return_target(0, 0x22), None);
         assert_eq!(focus_return_target(0x22, 0x22), None);
+    }
+}
+
+#[cfg(test)]
+mod history_preview_tests {
+    use super::*;
+
+    #[test]
+    fn an_explicitly_cleared_board_is_not_refilled_by_history_within_the_same_panel_session() {
+        // 展开后的第一次快照允许用历史做空态回填……
+        assert!(should_preview_history("expanded", false));
+        // ……但用户点「清空」后，同一展开会话里的后续快照不得再把刚清掉的文字填回来。
+        assert!(!should_preview_history("expanded", true));
+    }
+
+    #[test]
+    fn reopening_the_panel_starts_a_new_session_that_previews_history_once() {
+        // 离开面板（收起 / 胶囊 / 待展开）即复位门闩，下次展开仍按原设计回填一次。
+        assert!(!history_preview_flag("collapsing"));
+        assert!(!history_preview_flag("capsule"));
+        assert!(!history_preview_flag("hover_pending"));
+        assert!(!should_preview_history("capsule", true));
+        assert!(should_preview_history("expanded", false));
     }
 }

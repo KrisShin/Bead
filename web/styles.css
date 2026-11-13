@@ -418,6 +418,34 @@ html, body {
   outline-offset: 2px;
 }
 
+/* 设置入口：与锁定 / 划词 / 历史同一套状态语言——设置面板打开时实底强调 + 白色滑杆。 */
+.icon-btn--settings {
+  border: 1px solid transparent;
+  background: transparent;
+  color: #5a6778;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease,
+              transform 0.15s ease;
+}
+.icon-btn--settings:hover {
+  background: #eef1f6;
+  border-color: #dbe3ef;
+  color: var(--bead-primary);
+}
+.icon-btn--settings[aria-pressed='true'] {
+  background: var(--bead-primary);
+  border-color: var(--bead-primary);
+  color: #ffffff;
+}
+.icon-btn--settings[aria-pressed='true']:hover {
+  background: var(--bead-primary-soft);
+  border-color: var(--bead-primary-soft);
+  color: #ffffff;
+}
+.icon-btn--settings:focus-visible {
+  outline: 2px solid var(--bead-primary-soft);
+  outline-offset: 2px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .icon-btn--selection {
     transition-duration: 0.01ms;
@@ -562,10 +590,14 @@ html, body {
 .board__provider input[data-provider='model'] { width: 150px; }
 .board__provider input[data-provider='base_url'] { width: 200px; }
 
-/* ========== 设置 ========== */
+/* ========== 设置 ==========
+   窗口高度固定（BOARD_WINDOW_HEIGHT = 300），设置项比可视区高；
+   所以设置块占满头部与 provider 之外的剩余高度并在内部滚动，
+   与 .board__history 同一套「内联面板内部滚动」的做法，不撑破窗口。 */
 .board__settings {
   display: flex;
   flex-wrap: wrap;
+  align-content: flex-start;
   gap: 4px 14px;
   padding: 5px 8px;
   background: #f4f7fc;
@@ -573,6 +605,9 @@ html, body {
   border-radius: 7px;
   font-size: 12px;
   color: #334155;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 .board__settings label { display: inline-flex; align-items: center; gap: 4px; }
 .board__settings input[type='number'] { width: 60px; font-size: 12px; padding: 2px 4px; border: 1px solid #d7dfeb; border-radius: 6px; }
@@ -589,7 +624,92 @@ html, body {
 /* OCR 引擎区块：整行标签 + 细进度条，与设置面板其余项保持同一套边框和字号。 */
 .board__label { flex-basis: 100%; font-size: 11px; color: var(--bead-muted); }
 .board__actions { display: inline-flex; gap: 6px; }
-.board__hint--error { color: #b4453a; }
+/* 与 .board__hint 同权重时会被后面的声明覆盖，这里提高选择器权重保证错误提示可辨。 */
+.board__hint.board__hint--error { color: #b4453a; }
+
+/* OCR 方案选项：整行可点击卡片。推荐项带「推荐」徽标，系统方案带红色「体验不佳」标签；
+   选中态用实边框 + 淡蓝底 + 「✓ 已选」文字，颜色之外还有形状与文字两层区分。 */
+.board__settings .ocr-option {
+  position: relative;
+  flex-basis: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 5px 7px;
+  border: 1px solid #dbe3ef;
+  border-radius: 7px;
+  background: #fbfcfe;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+.board__settings .ocr-option:hover { border-color: #b9c8de; background: #f4f8fd; }
+/* 原生 radio 只做视觉隐藏，保留可聚焦与方向键切换能力。 */
+.board__settings .ocr-option input[type='radio'] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.board__settings .ocr-option__icon { flex: none; margin-top: 1px; color: #5a6778; }
+.board__settings .ocr-option__body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.board__settings .ocr-option__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #334155;
+}
+.board__settings .ocr-option__note { font-size: 11px; line-height: 1.35; color: var(--bead-muted); }
+.board__settings .ocr-option__badge {
+  padding: 0 5px;
+  border: 1px solid #bfe0cc;
+  border-radius: 999px;
+  background: #e4f3ea;
+  color: #1c6b47;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 15px;
+}
+.board__settings .ocr-option__tag {
+  padding: 0 5px;
+  border: 1px solid #f0c2bb;
+  border-radius: 999px;
+  background: #fdecea;
+  color: #b4453a;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 15px;
+}
+.board__settings .ocr-option__check {
+  display: none;
+  flex: none;
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--bead-primary);
+}
+/* 系统方案：文案整体标红，图标同步，明确「体验不佳」。 */
+.board__settings .ocr-option--warn .ocr-option__title { color: #b4453a; }
+.board__settings .ocr-option--warn .ocr-option__note { color: #a2635c; }
+.board__settings .ocr-option--warn .ocr-option__icon { color: #b4453a; }
+
+.board__settings .ocr-option:has(input:checked) {
+  border-color: var(--bead-primary);
+  background: #e8eefc;
+  box-shadow: inset 0 0 0 1px var(--bead-primary);
+}
+.board__settings .ocr-option:has(input:checked) .ocr-option__icon { color: var(--bead-primary); }
+.board__settings .ocr-option:has(input:checked) .ocr-option__check { display: inline; }
+/* 系统方案被选中时仍保持红色文案，避免高亮把「体验不佳」的警告冲淡。 */
+.board__settings .ocr-option--warn:has(input:checked) .ocr-option__title { color: #b4453a; }
+.board__settings .ocr-option:has(input:disabled) { opacity: 0.55; cursor: not-allowed; }
+.board__settings .ocr-option:has(input:focus-visible) {
+  outline: 2px solid var(--bead-primary-soft);
+  outline-offset: 2px;
+}
 .board__settings .board__progress {
   flex-basis: 100%;
   width: 100%;

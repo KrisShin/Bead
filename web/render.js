@@ -67,9 +67,27 @@ function renderOcrSettings(settings) {
       settings.ocr_effective_engine === 'bundled' ? '内置 PP-OCRv4' : '系统 OCR';
     status = `已安装 v${escapeHtml(settings.ocr_version ?? '')}（${size}），当前使用${effective}。`;
   }
+  // 推荐项在前：内置模型实测识别更稳；系统 OCR 标红并写明「体验不佳」，
+  // 颜色之外还有「推荐」徽标与「✓ 已选」文字，色弱用户同样可辨。
   return `<span class="board__label">OCR 引擎</span>
-    <label><input type="radio" name="ocr-engine" data-ocr-engine="system"${selected === 'system' ? ' checked' : ''} />系统 OCR</label>
-    <label><input type="radio" name="ocr-engine" data-ocr-engine="bundled"${selected === 'bundled' ? ' checked' : ''}${supported && installed ? '' : ' disabled'} />内置 PP-OCRv4</label>
+    <label class="ocr-option ocr-option--recommended">
+      <input type="radio" name="ocr-engine" data-ocr-engine="bundled"${selected === 'bundled' ? ' checked' : ''}${supported && installed ? '' : ' disabled'} />
+      <span class="ocr-option__icon">${icon('ocr_builtin', { size: 16 })}</span>
+      <span class="ocr-option__body">
+        <span class="ocr-option__title">内置 PP-OCRv4<span class="ocr-option__badge">推荐</span></span>
+        <span class="ocr-option__note">自带插件、离线识别，准确率与稳定性更好${installed ? '' : '；需先下载模型'}</span>
+      </span>
+      <span class="ocr-option__check" aria-hidden="true">✓ 已选</span>
+    </label>
+    <label class="ocr-option ocr-option--warn">
+      <input type="radio" name="ocr-engine" data-ocr-engine="system"${selected === 'system' ? ' checked' : ''} />
+      <span class="ocr-option__icon">${icon('ocr_system', { size: 16 })}</span>
+      <span class="ocr-option__body">
+        <span class="ocr-option__title">系统 OCR<span class="ocr-option__tag">体验不佳</span></span>
+        <span class="ocr-option__note">无需下载，但识别率与稳定性较差，建议改用内置方案</span>
+      </span>
+      <span class="ocr-option__check" aria-hidden="true">✓ 已选</span>
+    </label>
     <span class="board__hint" data-ocr-status>${status}</span>
     ${settings.ocr_error ? `<span class="board__hint board__hint--error">${escapeHtml(settings.ocr_error)}</span>` : ''}
     <progress class="board__progress" data-ocr-progress max="${Math.max(settings.ocr_total_size ?? 0, 1)}" value="0"${busy ? '' : ' hidden'}></progress>
@@ -111,16 +129,12 @@ export function renderBoard(view) {
       ? `<div class="board__settings">
     <label><input type="checkbox" data-setting="auto_read_clipboard"${view.settings.auto_read_clipboard ? ' checked' : ''} />自动读剪贴板</label>
     <label>悬停 <input type="number" data-setting="hover_delay_ms" value="${view.settings.hover_delay_ms}" min="50" max="2000" step="50" /> ms 后展开</label>
-    <label><input type="checkbox" data-setting="selection_enabled"${view.settings.selection_enabled ? ' checked' : ''} />划词（快捷键触发取词）</label>
+    <label><input type="checkbox" data-setting="selection_enabled"${view.settings.selection_enabled ? ' checked' : ''} />划词（快捷键触发取词，开启后划词即显示翻译图标）</label>
     <label>快捷键 <input type="text" data-setting="selection_hotkey" value="${escapeHtml(view.settings.selection_hotkey ?? '')}" spellcheck="false" autocomplete="off" /></label>
     ${view.settings.selection_hotkey_error ? `<span class="board__hint">${escapeHtml(view.settings.selection_hotkey_error)}</span>` : ''}
-    <label><input type="checkbox" data-setting="selection_anchor_enabled"${view.settings.selection_anchor_enabled ? ' checked' : ''}${view.settings.selection_anchor_supported === false ? ' disabled' : ''} />划词后显示翻译图标</label>
-    <label><input type="checkbox" data-setting="selection_keyboard_fallback"${view.settings.selection_keyboard_fallback ? ' checked' : ''}${view.settings.selection_anchor_supported === false ? ' disabled' : ''} />键盘选区兜底（监听键盘活动与文本选区变化，不记录按键内容）</label>
+    ${view.settings.selection_watch_error ? `<span class="board__hint board__hint--error">${escapeHtml(view.settings.selection_watch_error)}</span>` : ''}
+    ${view.settings.selection_anchor_supported === false ? '<span class="board__hint">当前平台不支持划词图标，快捷键取词仍可用。</span>' : ''}
     <label><input type="checkbox" data-setting="autostart" ${view.settings.autostart_enabled ? 'checked' : ''} />开机自启</label>
-    <label><input type="checkbox" data-setting="auto_check_updates" ${view.settings.auto_check_updates ? 'checked' : ''} />启动时检查更新</label>
-    <label>朗读语速 <input type="number" data-setting="tts_rate" value="${Number(view.settings.tts_rate ?? 1)}" min="0.5" max="2" step="0.1" /> ×</label>
-    <label>朗读音量 <input type="number" data-setting="tts_volume" value="${Number(view.settings.tts_volume ?? 80)}" min="0" max="100" step="5" /></label>
-    <label><input type="checkbox" data-setting="tts_online_fallback"${view.settings.tts_online_fallback !== false ? ' checked' : ''} />缺音色时使用在线朗读</label>
     <span class="board__hint">有本地音色时不联网；仅在该语言缺少音色时才把卡片文本发送给在线朗读服务。</span>
     ${renderOcrSettings(view.settings)}
     <button type="button" data-action="clear-history">清空历史</button>
@@ -182,7 +196,15 @@ export function renderBoard(view) {
         className: 'icon-btn--history',
       })}
       ${view.update_latest ? `<button type="button" class="icon-btn" data-action="open-release" title="下载新版 ${escapeHtml(view.update_latest)}">${escapeHtml(view.update_latest)}</button>` : ''}
-      ${HeadButton({ action: 'languages', iconName: 'settings', title: '设置', label: '设置' })}
+      ${HeadButton({
+        action: 'languages',
+        iconName: 'settings',
+        title: '设置',
+        label: view.languagesOpen ? '关闭设置' : '设置',
+        ariaLabel: '设置',
+        pressed: Boolean(view.languagesOpen),
+        className: 'icon-btn--settings',
+      })}
       ${HeadButton({
         action: 'pin',
         iconName: view.locked ? 'lock' : 'unlock',
