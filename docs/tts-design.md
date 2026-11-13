@@ -336,7 +336,7 @@ SelectionCapture ── { text, lang_hint } ──> SyncCoordinator.accept_text(
 | M6 | `SpeechManager` 切块拼 MP3；缓存键 `SpeechProfile{backend,voice_id,rate}+lang+text`；`GoogleTts::fetch` >200 报错 | `cargo test -p bead-providers`：36 passed（新增超长拒收用例） |
 | M7 | `speech_capabilities` → 按钮 disable / `is-online` 角标；设置页隐私提示 | 命令逻辑编译通过；ja 置灰需真机确认（本机无日语包） |
 | M8 | `speakFailed` → `.speech-hint` 轻提示 + 按钮复位 | 逻辑覆盖；断网真机未验 |
-| M9 | `settings.rs`：`tts_rate`(0.5–2.0, 默认 1.0) / `tts_volume`(0–100, 默认 80) / `tts_online_fallback`(默认 true)；`web/render.js` 控件 | `cargo test` 通过；重启保留需真机确认 |
+| M9 | ~~`settings.rs`：`tts_rate`(0.5–2.0, 默认 1.0) / `tts_volume`(0–100, 默认 80) / `tts_online_fallback`(默认 true)；`web/render.js` 控件~~ **2026-11-13 修订**：三项设置已从界面移除并改为常量（语速固定 1×、音量 100% 交系统音量、缺音色固定在线兜底）；旧配置键由 serde 忽略。 | `cargo test` 通过；重启保留需真机确认 |
 | M10 | `web/app.js` `speakCard`：先 `editDebouncer.cancel` + `commitEdit`，再 `speak_card` | 逻辑覆盖；真机未验 |
 
 `cargo test --all` 实测：`bead`（src-tauri）27 passed / `bead-core` 78 passed / `bead-providers` 36 passed；`npm test` 实测 4 个文件 46 passed。另：工作区还有另一条会话（划词）的未提交改动，本轮未触碰其逻辑。
@@ -421,7 +421,7 @@ impl<O: OnlineTts> SpeechManager<O> {
 ## 9. 业主确认（2026-11-07 全部批准）
 
 1. **D6/D30 修订**：已改为「本地优先、在线仅缺音色兜底」，README 第 17 行已同步；D6/D30 已在 STATE.md 改写。
-2. **M9 设置结构**：已新增 `tts_rate` / `tts_volume` / `tts_online_fallback`；`tts_voice_overrides` 仍留二期。
+2. **M9 设置结构**：已新增 `tts_rate` / `tts_volume` / `tts_online_fallback`；`tts_voice_overrides` 仍留二期。**2026-11-13 修订**：三项朗读设置已撤出界面，行为固定为 1× / 系统默认音量 / 在线兜底常开，旧配置字段不再生效。
 3. **M4 契约变更**：`StateView` 已移除 `speak`，新增独立 `speech` 事件与 `SpeakResult`。
 4. **OneCore 探针**：已在 `demo/tts-probe` 完成并实测（结果见 §1.1.1）；结论是不接入主程序。
 5. **在线兜底**：保留且**默认开启**，仅缺音色时触发，按钮标「在线」。
