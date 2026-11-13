@@ -1761,6 +1761,104 @@ fn capsule_shape_anchor(app: &tauri::AppHandle) -> Option<(i32, i32)> {
     })
 }
 
+/// 把胶囊一次提交到「可显示位置」，返回最终锚点。
+///
+/// 启动、托盘「显示」、二次启动共用：先按保存锚点算，再复核窗口实际矩形；
+/// 仍不可见就落主屏右上角。边界判断全部复用 `fit_capsule_anchor` /
+/// `capsule_slot` / `clamp_capsule_left`，这里不另写一套。
+fn place_capsule_visible(window: &WebviewWindow, saved: Option<(i32, i32)>) -> Option<(i32, i32)> {
+    let areas = screen_areas(window);
+    let fallback_area = primary_area(window).or_else(|| areas.first().copied());
+    let fallback = fallback_area.map(capsule_slot).unwrap_or((0.0, 0.0));
+    let (x, y) = fit_capsule_anchor(saved, &areas, fallback);
+    set_window_geometry(window, x, y, CAPSULE_WINDOW_WIDTH, CAPSULE_WINDOW_HEIGHT);
+
+    // 复核：系统可能在提交后按 DPI 或桌面策略把窗口摆到别处。
+    let scale = window_scale(window);
+    let actual = window
+        .outer_position()
+        .ok()
+        .map(|pos| capsule_rect((pos.x as f64 / scale, pos.y as f64 / scale)));
+    let visible = actual.is_some_and(|rect| containing_area(rect, &areas).is_some());
+    if !visible {
+        if let Some((fx, fy)) = fallback_area.map(capsule_slot) {
+            set_window_geometry(window, fx, fy, CAPSULE_WINDOW_WIDTH, CAPSULE_WINDOW_HEIGHT);
+        }
+        startup_log::line("capsule_place_repaired=1");
+    }
+    startup_log::line(&format!(
+        "capsule_place: saved={saved:?} requested=({x:.1},{y:.1}) visible_after={visible}"
+    ));
+    capsule_anchor(window)
+}
+
+/// 找回入口（托盘「显示」/ 二次启动）：只有当前矩形不在任何显示器可用区内才移动。
+/// 面板态不动窗口（收起仍按锚点还原），仅记一条日志。
+fn repair_capsule_visible(app: &tauri::AppHandle) -> bool {
+    let Some(window) = app.get_webview_window("main") else {
+        return false;
+    };
+    if window_is_oversized(&window) {
+        startup_log::line("capsule_repair_skipped=panel");
+        return false;
+    }
+    let areas = screen_areas(&window);
+    if areas.is_empty() {
+        return false;
+    }
+    let scale = window_scale(&window);
+    let current = window
+        .outer_position()
+        .ok()
+        .map(|pos| capsule_rect((pos.x as f64 / scale, pos.y as f64 / scale)));
+    if current.is_some_and(|rect| containing_area(rect, &areas).is_some()) {
+        return false;
+    }
+    let saved = current.map(|rect| (rect.left.round() as i32, rect.top.round() as i32));
+    let Some(anchor) = place_capsule_visible(&window, saved) else {
+        return false;
+    };
+    let state = app.state::<AppState>();
+    {
+        let mut settings = state.settings.lock().expect("settings poisoned");
+        settings.capsule_anchor = Some(anchor);
+    }
+    persist(state.inner());
+    startup_log::line(&format!("capsule_recovered: anchor={anchor:?}"));
+    true
+}
+
+/// 启动记录：显示器几何 + 窗口矩形 + 可见性。只写几何，不写任何用户内容。
+fn log_startup_displays(window: &WebviewWindow, stage: &str) {
+    let areas: Vec<String> = screen_areas(window)
+        .iter()
+        .map(|area| {
+            format!(
+                "[{:.0},{:.0}..{:.0},{:.0}]",
+                area.left, area.top, area.right, area.bottom
+            )
+        })
+        .collect();
+    let scale = window_scale(window);
+    let position = window
+        .outer_position()
+        .ok()
+        .map(|pos| format!("({:.0},{:.0})", pos.x as f64 / scale, pos.y as f64 / scale))
+        .unwrap_or_else(|| "?".into());
+    let size = window
+        .inner_size()
+        .ok()
+        .map(|size| format!("{}x{}", size.width, size.height))
+        .unwrap_or_else(|| "?".into());
+    startup_log::line(&format!(
+        "{stage}: areas={} pos={} size={} visible={:?}",
+        areas.join(","),
+        position,
+        size,
+        window.is_visible().ok()
+    ));
+}
+
 /// 兜底收起：700ms 后若仍不在展开态、窗口还是面板尺寸，就把窗口缩回胶囊。
 /// 正常路径由前端在透明帧之后调用 `resize_window(false)`，这里只防前端页面被重载
 /// 后大窗口长期吞掉桌面点击。触发前重新确认尺寸，避免前端已经缩回还多缩一次。
@@ -1833,13 +1931,17 @@ fn window_scale(window: &WebviewWindow) -> f64 {
         .unwrap_or(1.0)
 }
 
-/// 窗口所在显示器的上边缘（逻辑坐标 y）。胶囊永远吸附在这条线上。
+/// 窗口所在显示器可用区的上边缘（逻辑坐标 y）。胶囊吸附在这条线上。
+///
+/// 用可用区而不是 `monitor.position()`：顶部任务栏 / 顶部 AppBar 会占掉一条 band，
+/// 胶囊钉在 y=0 就会被压在那条 band 底下（topmost 之间按激活先后决定，隐藏窗口永远输），
+/// 表现为「托盘在、胶囊看不见」。底部任务栏或自动隐藏时两者相同。
 fn monitor_top(window: &WebviewWindow) -> f64 {
     window
         .current_monitor()
         .ok()
         .flatten()
-        .map(|monitor| monitor.position().y as f64 / monitor.scale_factor())
+        .map(|monitor| monitor_area(&monitor).top)
         .unwrap_or(0.0)
 }
 
@@ -1947,6 +2049,125 @@ fn place_panel(
         .clamp(area.left, (area.right - panel_width).max(area.left));
     let top = clamp_panel_top(anchor.1, panel_height, area);
     (left, top)
+}
+
+/// 胶囊在屏幕上的矩形（逻辑坐标）。只用于可见性判定，与 `place_panel` 同一套换算。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CapsuleRect {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+fn capsule_rect(anchor: (f64, f64)) -> CapsuleRect {
+    CapsuleRect {
+        left: anchor.0,
+        top: anchor.1,
+        right: anchor.0 + CAPSULE_WINDOW_WIDTH,
+        bottom: anchor.1 + CAPSULE_WINDOW_HEIGHT,
+    }
+}
+
+/// 胶囊矩形是否完整落在某块显示器的可用区内；命中时返回该显示器的下标。
+/// 跨屏缝隙、越出右缘、负坐标、只露出一部分都算不可见。
+fn containing_area(rect: CapsuleRect, areas: &[WorkArea]) -> Option<usize> {
+    areas.iter().position(|area| {
+        rect.left >= area.left
+            && rect.top >= area.top
+            && rect.right <= area.right
+            && rect.bottom <= area.bottom
+    })
+}
+
+/// 横向离锚点最近的显示器：按锚点到「可放置区间 [left, right-68]」的距离比较。
+fn nearest_area(anchor: (f64, f64), areas: &[WorkArea]) -> Option<usize> {
+    areas
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            let distance = |area: &WorkArea| {
+                let max_left = (area.right - CAPSULE_WINDOW_WIDTH).max(area.left);
+                if anchor.0 < area.left {
+                    area.left - anchor.0
+                } else if anchor.0 > max_left {
+                    anchor.0 - max_left
+                } else {
+                    0.0
+                }
+            };
+            distance(a).total_cmp(&distance(b))
+        })
+        .map(|(index, _)| index)
+}
+
+/// 某块显示器的胶囊落点：贴可用区右缘与上缘。可用区比胶囊还窄时贴左缘。
+fn capsule_slot(area: WorkArea) -> (f64, f64) {
+    (
+        (area.right - CAPSULE_WINDOW_WIDTH).max(area.left),
+        area.top,
+    )
+}
+
+/// 把「保存的锚点 / 默认位」归一到可显示位置。
+///
+/// - 没有显示器：用调用方给的兜底点；
+/// - 锚点完整可见：保留 x，y 拉回可用区上缘（胶囊永远贴顶）；
+/// - 不可见：移到横向最近的显示器，x 夹进可用区。
+fn fit_capsule_anchor(
+    saved: Option<(i32, i32)>,
+    areas: &[WorkArea],
+    fallback: (f64, f64),
+) -> (f64, f64) {
+    if areas.is_empty() {
+        return fallback;
+    }
+    let Some((x, y)) = saved else {
+        return fallback;
+    };
+    let anchor = (x as f64, y as f64);
+    if let Some(index) = containing_area(capsule_rect(anchor), areas) {
+        return (anchor.0, areas[index].top);
+    }
+    let Some(index) = nearest_area(anchor, areas) else {
+        return fallback;
+    };
+    let area = areas[index];
+    (
+        clamp_capsule_left(anchor.0, CAPSULE_WINDOW_WIDTH, (area.left, area.right)),
+        area.top,
+    )
+}
+
+/// 形态判定：胶囊 68×28、面板 613×300。宽高双条件，
+/// 保证 `current_monitor()` 取不到、`scale` 回退 1.0 时也不会把胶囊误判成面板态。
+fn is_capsule_shape(width: f64, height: f64, scale: f64) -> bool {
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    width / scale <= CAPSULE_WINDOW_WIDTH + 1.0 && height / scale <= CAPSULE_WINDOW_HEIGHT + 1.0
+}
+
+/// 当前虚拟桌面所有显示器的可用区（逻辑坐标）。
+fn screen_areas(window: &WebviewWindow) -> Vec<WorkArea> {
+    window
+        .available_monitors()
+        .ok()
+        .map(|monitors| monitors.iter().map(monitor_area).collect())
+        .unwrap_or_default()
+}
+
+/// 主显示器可用区；拿不到时退回枚举到的第一块。
+fn primary_area(window: &WebviewWindow) -> Option<WorkArea> {
+    window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| monitor_area(&monitor))
+        .or_else(|| {
+            window
+                .available_monitors()
+                .ok()
+                .and_then(|monitors| monitors.first().map(monitor_area))
+        })
 }
 
 /// 面板窗口的目标矩形（逻辑坐标）。
@@ -2391,8 +2612,14 @@ fn dispatch(
     view
 }
 
+/// 前端是否已经跑过一次 `get_state`：用来区分「窗口位置问题」与「WebView 没执行前端脚本」。
+static FRONTEND_SEEN: AtomicBool = AtomicBool::new(false);
+
 #[tauri::command]
 fn get_state(state: tauri::State<'_, AppState>) -> StateView {
+    if !FRONTEND_SEEN.swap(true, Ordering::Relaxed) {
+        startup_log::line("frontend_first_state");
+    }
     snapshot(state.inner())
 }
 
@@ -3535,6 +3762,78 @@ fn selection_debug_state(
     view
 }
 
+/// 启动诊断日志：每次启动覆盖写 `%LOCALAPPDATA%\Bead\startup.log`。
+///
+/// 只记版本、显示器几何、窗口矩形与失败阶段，不记选中文本、剪贴板内容与密钥。
+/// release 构建是 `windows_subsystem = "windows"`，没有控制台，panic 与启动失败原本
+/// 完全不可见——这份日志是「托盘在但拿不到窗口」这类问题唯一的外部证据。
+mod startup_log {
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    pub fn path() -> PathBuf {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Bead")
+            .join("startup.log")
+    }
+
+    /// 覆盖写并写入版本行：每次进程启动只调用一次。
+    pub fn reset(version: &str) {
+        let path = path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, format!("Bead {version} startup log\n"));
+    }
+
+    pub fn line(message: &str) {
+        let path = path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(file, "{message}");
+        }
+    }
+}
+
+/// panic 落盘但保留原有输出（debug 构建仍能在终端看到）。
+fn install_panic_log_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        startup_log::line(&format!("panic: {info}"));
+        default_hook(info);
+    }));
+}
+
+/// 致命启动失败时弹一个系统对话框。release 没有控制台，否则用户只会看到「什么都没发生」。
+#[cfg(windows)]
+fn fatal_message_box(text: &str) {
+    extern "system" {
+        fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
+    }
+    const MB_ICONERROR: u32 = 0x10;
+    let body: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = "Bead 启动失败"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        MessageBoxW(0, body.as_ptr(), title.as_ptr(), MB_ICONERROR);
+    }
+}
+
+#[cfg(not(windows))]
+fn fatal_message_box(text: &str) {
+    startup_log::line(&format!("fatal: {text}"));
+}
+
 /// 窗口两种形态的尺寸。
 ///
 /// 面板宽度随卡片数增长：卡片宽度固定 189px、间距 10px，加上左右 padding 与 1px inset，
@@ -3552,6 +3851,8 @@ const BOARD_WINDOW_WIDTH: f64 = 613.0;
 const CAPSULE_LEFT_IN_PANEL: f64 = 272.0;
 
 fn main() {
+    startup_log::reset(env!("CARGO_PKG_VERSION"));
+    install_panic_log_hook();
     // 默认三语池演示「改一处、其余全部联动」；工单 03 起可在设置面板改为 2–5 种。
     let pool = LanguagePool::new(vec![
         Lang::new("zh"),
@@ -3566,14 +3867,16 @@ fn main() {
         Ok(translator) => chain.push(translator),
         Err(message) => panic!("默认引擎装配失败：{message}"),
     }
-    tauri::Builder::default()
+    let built = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // 第二次启动：唤起已有实例（显示窗口），不起新进程。
+            // 第二次启动：先把跑丢的胶囊拉回可见区，再唤起已有实例，不起新进程。
+            let repaired = repair_capsule_visible(app);
+            startup_log::line(&format!("second_instance: repaired={repaired}"));
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
@@ -3674,21 +3977,23 @@ fn main() {
             // 避免大窗口与系统边框在默认位置闪一下。
             let window = app.get_webview_window("main").expect("main window exists");
             strip_nc_frame(&window);
-            window
-                .set_size(LogicalSize::new(CAPSULE_WINDOW_WIDTH, CAPSULE_WINDOW_HEIGHT))
-                .expect("resize main window");
-            let default_x = window
-                .current_monitor()
-                .ok()
-                .flatten()
-                .map(|monitor| {
-                    monitor.size().width as f64 / monitor.scale_factor() - CAPSULE_WINDOW_WIDTH
-                })
-                .unwrap_or(0.0);
-            window
-                .set_position(LogicalPosition::new(default_x, 0.0))
-                .expect("position main window");
-            window.show().expect("show main window");
+            if let Err(error) =
+                window.set_size(LogicalSize::new(CAPSULE_WINDOW_WIDTH, CAPSULE_WINDOW_HEIGHT))
+            {
+                startup_log::line(&format!("set_size_failed: {error}"));
+            }
+            // 默认位 = 主屏可用区右上角。用可用区而不是 `size/scale`，同时修掉两个坑：
+            // 忽略显示器原点会让窗口落进多屏之间的缝隙；贴 y=0 会被顶部任务栏压住。
+            let default_slot = primary_area(&window).map(capsule_slot).unwrap_or((0.0, 0.0));
+            if let Err(error) =
+                window.set_position(LogicalPosition::new(default_slot.0, default_slot.1))
+            {
+                startup_log::line(&format!("set_position_failed: {error}"));
+            }
+            if let Err(error) = window.show() {
+                startup_log::line(&format!("show_failed: {error}"));
+            }
+            log_startup_displays(&window, "startup");
             // 预热系统语音列表：首次点朗读不必等 PowerShell 枚举；后续按 TTL 刷新。
             let warm = app.handle().clone();
             std::thread::spawn(move || {
@@ -3722,11 +4027,16 @@ fn main() {
                 let top = monitor_top(&window_for_snap);
                 let x = pos.x as f64 / scale;
                 let y = pos.y as f64 / scale;
-                let width = window_for_snap
+                // 形态判定用宽高双条件：`current_monitor()` 取不到时 scale 会回退 1.0，
+                // 只看宽度会把 68×28 的胶囊误判成面板态，夹取与锚点回写就整段失效。
+                let (raw_width, raw_height) = window_for_snap
                     .inner_size()
-                    .map(|size| size.width as f64 / scale)
-                    .unwrap_or(CAPSULE_WINDOW_WIDTH);
-                if width > CAPSULE_WINDOW_WIDTH + 1.0 {
+                    .map(|size| (size.width as f64, size.height as f64))
+                    .unwrap_or((
+                        CAPSULE_WINDOW_WIDTH * scale,
+                        CAPSULE_WINDOW_HEIGHT * scale,
+                    ));
+                if !is_capsule_shape(raw_width, raw_height, scale) {
                     // 面板态：只保证纵向落在当前显示器可用区。横向不能按「左缘 + 272」
                     // 反推锚点——贴边 clamp 后面板 left 不再等于锚点 - 272，反推会带偏胶囊。
                     let Some(area) = monitor_work_area(&window_for_snap) else {
@@ -3739,11 +4049,11 @@ fn main() {
                     return;
                 }
                 // 胶囊态：夹回可用区（跨屏用并集，允许拖到副屏）并贴显示器上缘；
-                // 锚点跟随真实位置。
-                let Some(span) = virtual_work_span(&window_for_snap) else {
-                    return;
+                // 锚点跟随真实位置。取不到并集时不提前 return，退化为只贴顶不夹 x。
+                let target_left = match virtual_work_span(&window_for_snap) {
+                    Some(span) => clamp_capsule_left(x, CAPSULE_WINDOW_WIDTH, span),
+                    None => x,
                 };
-                let target_left = clamp_capsule_left(x, CAPSULE_WINDOW_WIDTH, span);
                 if (target_left - x).abs() > 0.5 || (y - top).abs() > 0.5 {
                     let _ = window_for_snap.set_position(LogicalPosition::new(target_left, top));
                 }
@@ -3798,31 +4108,10 @@ fn main() {
                 // 历史与 settings.json 同级：读不出或不认识格式都退化成空历史，不影响启动。
                 *state.history.lock().expect("history poisoned") =
                     history::TranslationHistory::load(dir, history::DEFAULT_CAPACITY);
-                // 位置记忆：恢复拖拽后的横向锚点；纵坐标一律吸附显示器上边缘。
-                if let Some((x, _y)) = saved_anchor {
-                    let top = monitor_top(&window);
-                    let _ = window.set_position(LogicalPosition::new(x as f64, top));
-                    let on_screen = window.outer_position().ok().is_some_and(|outer| {
-                        window
-                            .available_monitors()
-                            .unwrap_or_default()
-                            .iter()
-                            .any(|monitor| {
-                                let origin = monitor.position();
-                                let size = monitor.size();
-                                outer.x >= origin.x
-                                    && outer.y >= origin.y
-                                    && outer.x + CAPSULE_WINDOW_WIDTH as i32
-                                        <= origin.x + size.width as i32
-                                    && outer.y + CAPSULE_WINDOW_HEIGHT as i32
-                                        <= origin.y + size.height as i32
-                            })
-                    });
-                    if !on_screen {
-                        let _ = window
-                            .set_position(LogicalPosition::new(default_x, monitor_top(&window)));
-                    }
-                }
+                // 位置记忆：恢复拖拽后的锚点；不可见（换机 / 拔屏 / 改缩放 / 顶部任务栏）
+                // 就落主屏可用区右上角，绝不把窗口留在屏外。
+                place_capsule_visible(&window, saved_anchor);
+                log_startup_displays(&window, "after_restore");
                 // 自启动：已启用则重写当前路径（便携包移动后自愈）。
                 if state.settings.lock().expect("settings poisoned").autostart_enabled {
                     let autostart = app.autolaunch();
@@ -3831,6 +4120,24 @@ fn main() {
                         Ok(()) | Err(_) => {}
                     }
                 }
+            }
+            // 启动后复核一次：show 之后系统仍可能按 DPI / 桌面策略重摆窗口。
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    let repaired = repair_capsule_visible(&handle);
+                    startup_log::line(&format!("startup_recheck: repaired={repaired}"));
+                });
+            }
+            // 前端 3s 内没跑过 get_state：WebView 没执行脚本（资源/渲染问题），不是位置问题。
+            {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(3000));
+                    if !FRONTEND_SEEN.load(Ordering::Relaxed) {
+                        startup_log::line("webview_no_frontend");
+                    }
+                });
             }
             // 记下胶囊左缘作为窗口伸缩的固定锚点：展开/收起只改尺寸，位置全部由锚点算出，
             // 不再从当前几何反推（异步 resize 的中间态几何会把锚点算歪）。
@@ -3889,9 +4196,19 @@ fn main() {
             }
             Ok(())
         })
-        .build(tauri::generate_context!())
-        .expect("failed to build Bead")
-        .run(|app_handle, event| {
+        .build(tauri::generate_context!());
+    let app = match built {
+        Ok(app) => app,
+        Err(error) => {
+            // release 没有控制台：静默退出会让用户以为「装完什么也没发生」。
+            startup_log::line(&format!("build_failed: {error}"));
+            fatal_message_box(&format!(
+                "无法创建应用窗口：{error}\n\n请确认系统已安装 Microsoft Edge WebView2 运行时后重试。"
+            ));
+            return;
+        }
+    };
+    app.run(|app_handle, event| {
             // 位置记忆：锚点由 Moved 监听维护，退出只需要落盘。
             // 胶囊态再从窗口几何补一次兜底；展开态禁止反推——贴边 clamp 后
             // 面板 left ≠ 锚点 - 272，反推会把记忆位置写歪。
@@ -3936,6 +4253,9 @@ fn build_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> 
                     if window.is_visible().unwrap_or(false) {
                         let _ = window.hide();
                     } else {
+                        // 显示前先把跑丢的胶囊拉回可见区：这就是用户找回胶囊的入口。
+                        let repaired = repair_capsule_visible(app);
+                        startup_log::line(&format!("tray_show: repaired={repaired}"));
                         let _ = window.show();
                         let _ = window.set_focus();
                     }
@@ -4136,6 +4456,127 @@ mod geometry_tests {
         let span = union_span(&[area]).expect("single monitor");
         let clamped = clamp_capsule_left(5000.0, CAPSULE_WINDOW_WIDTH, span);
         assert!((clamped - (1706.6667 - CAPSULE_WINDOW_WIDTH)).abs() < 0.01);
+    }
+
+    fn secondary_right() -> WorkArea {
+        WorkArea {
+            left: 1920.0,
+            top: 0.0,
+            right: 3840.0,
+            bottom: 1040.0,
+        }
+    }
+
+    #[test]
+    fn a_capsule_saved_beyond_the_right_edge_is_recovered_into_the_visible_slot() {
+        let areas = [primary_1080p()];
+        let fallback = capsule_slot(areas[0]);
+        assert_eq!(
+            fit_capsule_anchor(Some((5000, 0)), &areas, fallback),
+            (1920.0 - CAPSULE_WINDOW_WIDTH, 0.0)
+        );
+    }
+
+    #[test]
+    fn a_negative_anchor_falls_back_to_the_visible_left_edge() {
+        let areas = [primary_1080p()];
+        let fallback = capsule_slot(areas[0]);
+        assert_eq!(fit_capsule_anchor(Some((-500, 0)), &areas, fallback), (0.0, 0.0));
+        // 纵坐标越界同样拉回可用区上缘。
+        assert_eq!(fit_capsule_anchor(Some((800, -400)), &areas, fallback), (800.0, 0.0));
+    }
+
+    #[test]
+    fn a_capsule_saved_on_a_removed_secondary_monitor_returns_to_the_primary() {
+        // 副屏（1920..3840）已被拔掉，只剩主屏：3760 必须夹回主屏右缘而不是留在屏外。
+        let areas = [primary_1080p()];
+        let fallback = capsule_slot(areas[0]);
+        assert_eq!(fit_capsule_anchor(Some((3760, 0)), &areas, fallback), (1852.0, 0.0));
+    }
+
+    #[test]
+    /// 副屏（1920, 0）锚点 (3760, 0)：必须留在副屏且贴其可用区上缘（顶部任务栏）。
+    fn a_capsule_saved_on_a_kept_secondary_monitor_stays_there() {
+        let areas = [primary_1080p(), secondary_right()];
+        let fallback = capsule_slot(areas[0]);
+        assert_eq!(fit_capsule_anchor(Some((3760, 0)), &areas, fallback), (3760.0, 0.0));
+    }
+
+    #[test]
+    fn a_capsule_under_a_top_taskbar_sits_below_the_reserved_band() {
+        let with_taskbar = WorkArea {
+            top: 48.0,
+            ..primary_1080p()
+        };
+        let areas = [with_taskbar];
+        assert_eq!(capsule_slot(with_taskbar), (1852.0, 48.0));
+        assert_eq!(
+            fit_capsule_anchor(Some((1000, 0)), &areas, capsule_slot(with_taskbar)),
+            (1000.0, 48.0)
+        );
+    }
+
+    #[test]
+    fn a_saved_anchor_that_is_already_visible_is_not_moved_horizontally() {
+        let areas = [primary_1080p()];
+        let fallback = capsule_slot(areas[0]);
+        assert_eq!(fit_capsule_anchor(Some((817, 0)), &areas, fallback), (817.0, 0.0));
+    }
+
+    #[test]
+    fn an_empty_monitor_list_falls_back_to_the_given_slot() {
+        assert_eq!(
+            fit_capsule_anchor(Some((9999, 0)), &[], (10.0, 20.0)),
+            (10.0, 20.0)
+        );
+    }
+
+    #[test]
+    fn a_gap_between_staggered_monitors_is_not_treated_as_visible() {
+        // 副屏从 (1920, 1080) 起：锚点 (2500, 0) 落在两块屏之间的空档，必须判不可见。
+        let lower = WorkArea {
+            left: 1920.0,
+            top: 1080.0,
+            right: 3840.0,
+            bottom: 2120.0,
+        };
+        let areas = [primary_1080p(), lower];
+        assert_eq!(containing_area(capsule_rect((2500.0, 0.0)), &areas), None);
+        assert_eq!(containing_area(capsule_rect((1900.0, 0.0)), &areas), None);
+        assert_eq!(containing_area(capsule_rect((1000.0, 0.0)), &areas), Some(0));
+    }
+
+    #[test]
+    fn a_scaled_saved_anchor_is_fitted_in_logical_pixels() {
+        let area = WorkArea::from_physical(
+            PhysicalArea {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1380,
+            },
+            1.5,
+        );
+        let areas = [area];
+        let (x, y) = fit_capsule_anchor(Some((5000, 0)), &areas, capsule_slot(area));
+        assert!((x - (1706.6667 - CAPSULE_WINDOW_WIDTH)).abs() < 0.01);
+        assert_eq!(y, 0.0);
+    }
+
+    #[test]
+    fn capsule_and_panel_shapes_are_told_apart_even_when_scale_falls_back() {
+        assert!(is_capsule_shape(
+            CAPSULE_WINDOW_WIDTH,
+            CAPSULE_WINDOW_HEIGHT,
+            1.0
+        ));
+        assert!(is_capsule_shape(
+            CAPSULE_WINDOW_WIDTH * 1.5,
+            CAPSULE_WINDOW_HEIGHT * 1.5,
+            1.5
+        ));
+        assert!(!is_capsule_shape(414.0, BOARD_WINDOW_HEIGHT, 1.0));
+        assert!(!is_capsule_shape(613.0, BOARD_WINDOW_HEIGHT, 1.0));
     }
 }
 
