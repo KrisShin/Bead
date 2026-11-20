@@ -16,8 +16,31 @@ pub mod manifest;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use manifest::Manifest;
+
+/// 进入识别前的最大长边：超过就按面积平均降采样。
+///
+/// 检测模型本来就把长边压到 960，4K 截图先缩到 1600 再转 BGR，可以省掉
+/// 一份 25MB 级的全尺寸 BGR 缓冲与随之翻倍的张量中间产物，对识别结果没有影响。
+const MAX_INPUT_EDGE: usize = 1600;
+
+/// 进入识别前的最小长边：小于它就放大。
+///
+/// 检测模型只降不升（长边 ≤960），200px 宽的小图送进去实际只有 192px，
+/// 7px 小字会因连通域过碎而识别错字。实测 200×40（7px 字号）原尺寸识别
+/// 出「到译」、放大 2 倍后恢复「翻译」；而正常尺寸的截图放大前后结果一致，
+/// 因此只在长边明显偏小时放大，最多 3 倍（小图本身像素量很低，代价可忽略）。
+const MIN_INPUT_EDGE: usize = 640;
+const MAX_UPSCALE: f32 = 3.0;
+
+/// 空闲多久自动卸载引擎（释放 ONNX 会话常驻内存）。
+///
+/// 识别是低频动作；几分钟不用还留着近 90MB 的会话内存不合理。下次识别重新加载，
+/// 代价是几百毫秒（模型文件已在本机缓存）。卸载只丢会话，`onnxruntime.dll` 与
+/// Environment 保留——DLL 加载后无法卸载，Environment 也必须在进程内唯一。
+const IDLE_UNLOAD: Duration = Duration::from_secs(5 * 60);
 
 /// 剪贴板图像的最小公共表示：BGR 三通道，行优先。
 ///
@@ -31,21 +54,113 @@ pub struct Image {
 
 impl Image {
     /// 从剪贴板解码得到的 BGRA 转成 BGR；长度不足时返回 `None`。
+    ///
+    /// 长边超过 [`MAX_INPUT_EDGE`] 时同一次遍历里按面积平均降采样，不额外产生
+    /// 全尺寸中间图；长边小于 [`MIN_INPUT_EDGE`] 时双线性放大（最多 3 倍）以改善
+    /// 小字识别。调用方拿到即可用，识别结束后由调用方立即释放。
     pub fn from_bgra(bgra: &[u8], width: u32, height: u32) -> Option<Self> {
         let pixels = (width as usize).checked_mul(height as usize)?;
         if width == 0 || height == 0 || bgra.len() < pixels.checked_mul(4)? {
             return None;
         }
-        let mut bgr = Vec::with_capacity(pixels * 3);
-        for pixel in bgra.chunks_exact(4).take(pixels) {
-            bgr.extend_from_slice(&[pixel[0], pixel[1], pixel[2]]);
+        let source_width = width as usize;
+        let source_height = height as usize;
+        let longest = source_width.max(source_height);
+        if longest <= MAX_INPUT_EDGE && longest >= MIN_INPUT_EDGE {
+            let mut bgr = Vec::with_capacity(pixels * 3);
+            for pixel in bgra.chunks_exact(4).take(pixels) {
+                bgr.extend_from_slice(&[pixel[0], pixel[1], pixel[2]]);
+            }
+            return Some(Self {
+                bgr,
+                width,
+                height,
+            });
         }
+
+        if longest > MAX_INPUT_EDGE {
+            let scale = MAX_INPUT_EDGE as f64 / longest as f64;
+            let target_width = ((source_width as f64 * scale).round() as usize).max(1);
+            let target_height = ((source_height as f64 * scale).round() as usize).max(1);
+            let mut bgr = vec![0u8; target_width * target_height * 3];
+            for target_y in 0..target_height {
+                let y0 = target_y * source_height / target_height;
+                let y1 =
+                    (((target_y + 1) * source_height / target_height).max(y0 + 1)).min(source_height);
+                for target_x in 0..target_width {
+                    let x0 = target_x * source_width / target_width;
+                    let x1 = (((target_x + 1) * source_width / target_width).max(x0 + 1))
+                        .min(source_width);
+                    let (mut blue, mut green, mut red) = (0u32, 0u32, 0u32);
+                    for y in y0..y1 {
+                        let start = (y * source_width + x0) * 4;
+                        for index in (start..start + (x1 - x0) * 4).step_by(4) {
+                            blue += bgra[index] as u32;
+                            green += bgra[index + 1] as u32;
+                            red += bgra[index + 2] as u32;
+                        }
+                    }
+                    let count = ((x1 - x0) * (y1 - y0)) as u32;
+                    let target = (target_y * target_width + target_x) * 3;
+                    bgr[target] = (blue / count) as u8;
+                    bgr[target + 1] = (green / count) as u8;
+                    bgr[target + 2] = (red / count) as u8;
+                }
+            }
+            return Some(Self {
+                bgr,
+                width: target_width as u32,
+                height: target_height as u32,
+            });
+        }
+
+        let factor = (MIN_INPUT_EDGE as f32 / longest.max(1) as f32).min(MAX_UPSCALE);
+        let target_width = (source_width as f32 * factor).round() as usize;
+        let target_height = (source_height as f32 * factor).round() as usize;
         Some(Self {
-            bgr,
-            width,
-            height,
+            bgr: upscale_bgra(bgra, source_width, source_height, target_width, target_height),
+            width: target_width as u32,
+            height: target_height as u32,
         })
     }
+}
+
+/// 双线性放大 BGRA → BGR；目标尺寸大于源尺寸。
+fn upscale_bgra(
+    bgra: &[u8],
+    source_width: usize,
+    source_height: usize,
+    target_width: usize,
+    target_height: usize,
+) -> Vec<u8> {
+    let mut bgr = vec![0u8; target_width * target_height * 3];
+    let scale_x = source_width as f32 / target_width as f32;
+    let scale_y = source_height as f32 / target_height as f32;
+    for y in 0..target_height {
+        let fy = ((y as f32 + 0.5) * scale_y - 0.5).clamp(0.0, source_height as f32 - 1.0);
+        let y0 = fy.floor() as usize;
+        let y1 = (y0 + 1).min(source_height - 1);
+        let wy = fy - y0 as f32;
+        for x in 0..target_width {
+            let fx = ((x as f32 + 0.5) * scale_x - 0.5).clamp(0.0, source_width as f32 - 1.0);
+            let x0 = fx.floor() as usize;
+            let x1 = (x0 + 1).min(source_width - 1);
+            let wx = fx - x0 as f32;
+            let top = (y0 * source_width + x0) * 4;
+            let bottom = (y1 * source_width + x0) * 4;
+            let target = (y * target_width + x) * 3;
+            for channel in 0..3 {
+                let top_left = bgra[top + channel] as f32;
+                let top_right = bgra[(y0 * source_width + x1) * 4 + channel] as f32;
+                let bottom_left = bgra[bottom + channel] as f32;
+                let bottom_right = bgra[(y1 * source_width + x1) * 4 + channel] as f32;
+                let upper = top_left + (top_right - top_left) * wx;
+                let lower = bottom_left + (bottom_right - bottom_left) * wx;
+                bgr[target + channel] = (upper + (lower - upper) * wy).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    bgr
 }
 
 /// 引擎选择（持久化在 `settings.json` 的 `ocr_engine` 字段）。
@@ -60,6 +175,8 @@ pub struct Manager {
     manifest: Mutex<Manifest>,
     /// 已加载的推理引擎；删除资产后置空，识别自动回退系统 OCR。
     engine: Mutex<Option<Arc<infer::Engine>>>,
+    /// 最近一次识别时间，供空闲卸载线程判断。
+    last_used: Mutex<Instant>,
     installing: AtomicBool,
     /// 最近一次可展示给设置页的失败原因（不弹提示、不写日志中的路径之外的机密）。
     error: Mutex<Option<String>>,
@@ -71,6 +188,7 @@ impl Default for Manager {
             dir: Mutex::new(PathBuf::new()),
             manifest: Mutex::new(Manifest::builtin()),
             engine: Mutex::new(None),
+            last_used: Mutex::new(Instant::now()),
             installing: AtomicBool::new(false),
             error: Mutex::new(None),
         }
@@ -121,6 +239,9 @@ impl Manager {
     /// `language` 是卡片语言族（`zh` / `en` / `None`）。当前只有中英 bundle，
     /// 其他语言直接放弃内置引擎，交给系统 OCR。
     pub fn recognize(&self, image: &Image, language: Option<&str>) -> Option<String> {
+        if let Ok(mut last_used) = self.last_used.lock() {
+            *last_used = Instant::now();
+        }
         if let Some(language) = language {
             let supported = self
                 .manifest
@@ -134,6 +255,23 @@ impl Manager {
         let (dir, _) = self.installed_manifest()?;
         let engine = self.engine_for(&dir)?;
         engine.recognize(image)
+    }
+
+    /// 空闲超时就丢掉会话；返回是否真的卸载了。由后台低频率线程调用。
+    ///
+    /// 正在识别的调用方持有 `Arc<Engine>`，这里 take 掉只会让内存在那次识别结束后回收，
+    /// 不会中断识别。
+    pub fn unload_if_idle(&self) -> bool {
+        let idle = self
+            .last_used
+            .lock()
+            .map(|last_used| last_used.elapsed())
+            .unwrap_or_default();
+        if idle < IDLE_UNLOAD {
+            return false;
+        }
+        let mut slot = self.engine.lock().expect("ocr engine poisoned");
+        slot.take().is_some()
     }
 
     fn engine_for(&self, dir: &Path) -> Option<Arc<infer::Engine>> {
@@ -247,15 +385,45 @@ mod tests {
 
     #[test]
     fn bgra_is_converted_to_bgr_in_row_order() {
-        let bgra = vec![1, 2, 3, 255, 4, 5, 6, 255];
-        let image = Image::from_bgra(&bgra, 2, 1).expect("image");
-        assert_eq!(image.bgr, vec![1, 2, 3, 4, 5, 6]);
+        // 640 宽落在原尺寸区间，不触发放大/缩小，正好验证通道顺序。
+        let mut bgra = vec![0u8; 640 * 4];
+        bgra[..8].copy_from_slice(&[1, 2, 3, 255, 4, 5, 6, 255]);
+        let image = Image::from_bgra(&bgra, 640, 1).expect("image");
+        assert_eq!(&image.bgr[..6], &[1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
     fn short_buffers_are_rejected() {
         assert!(Image::from_bgra(&[0, 0, 0], 1, 1).is_none());
         assert!(Image::from_bgra(&[], 0, 0).is_none());
+    }
+
+    #[test]
+    fn oversized_images_are_downscaled_before_ocr() {
+        let bgra = vec![255u8; 4000 * 200 * 4];
+        let image = Image::from_bgra(&bgra, 4000, 200).expect("image");
+        assert_eq!((image.width, image.height), (1600, 80));
+        assert_eq!(image.bgr.len(), 1600 * 80 * 3);
+    }
+
+    #[test]
+    fn tiny_images_are_upscaled_at_most_three_times() {
+        let bgra = vec![128u8; 100 * 40 * 4];
+        let image = Image::from_bgra(&bgra, 100, 40).expect("image");
+        assert_eq!((image.width, image.height), (300, 120));
+
+        // 320 宽按 640 上限放大 2 倍。
+        let bgra = vec![128u8; 320 * 56 * 4];
+        let image = Image::from_bgra(&bgra, 320, 56).expect("image");
+        assert_eq!((image.width, image.height), (640, 112));
+    }
+
+    #[test]
+    fn normal_images_keep_their_size() {
+        let bgra = vec![128u8; 640 * 480 * 4];
+        let image = Image::from_bgra(&bgra, 640, 480).expect("image");
+        assert_eq!((image.width, image.height), (640, 480));
+        assert_eq!(image.bgr.len(), 640 * 480 * 3);
     }
 
     #[test]

@@ -549,20 +549,38 @@ fn apply_anchor_watcher(app: &tauri::AppHandle, enabled: bool) {
     #[cfg(windows)]
     {
         let state = app.state::<AppState>();
-        let ready = state.anchor_ready.load(Ordering::SeqCst);
+        if !enabled {
+            state.keyboard_fallback.store(false, Ordering::SeqCst);
+            {
+                let mut watcher = state
+                    .selection_watch
+                    .lock()
+                    .expect("selection watcher poisoned");
+                if let Some(handle) = watcher.take() {
+                    handle.stop();
+                }
+            }
+            // 关闭划词即销毁图标窗口：不开划词的用户不再常驻第二个 WebView2 渲染进程。
+            selection_anchor::destroy(app);
+            state.anchor_ready.store(false, Ordering::SeqCst);
+            clear_selection_unsupported_hint(app);
+            clear_selection_watch_error(app);
+            return;
+        }
+        let mut ready = state.anchor_ready.load(Ordering::SeqCst);
+        if !ready {
+            // 懒创建：只有真正打开划词时才建窗口，建好后本次运行不再重复创建。
+            ready = app.get_webview_window(selection_anchor::ANCHOR_LABEL).is_some()
+                || selection_anchor::create(app).is_some();
+            state.anchor_ready.store(ready, Ordering::SeqCst);
+        }
         // 键盘选区兜底固定开启：只在划词开着且图标链路可用时注册键盘输入（不记录键值）。
         state.keyboard_fallback.store(anchor_gate(enabled, ready), Ordering::SeqCst);
         let mut watcher = state
             .selection_watch
             .lock()
             .expect("selection watcher poisoned");
-        if !enabled {
-            if let Some(handle) = watcher.take() {
-                handle.stop();
-            }
-            clear_selection_unsupported_hint(app);
-            clear_selection_watch_error(app);
-        } else if !ready {
+        if !ready {
             set_selection_watch_error(
                 app,
                 "划词图标窗口不可用，本次运行不会显示翻译图标；快捷键取词仍然可用。",
@@ -1236,11 +1254,18 @@ fn recognize_clipboard_text(app: &tauri::AppHandle, language_tag: Option<&str>) 
         .ocr_engine
         == ocr::ENGINE_BUNDLED;
     if use_bundled {
-        if let Some(image) = ocr::Image::from_bgra(&bitmap.bgra, bitmap.width, bitmap.height) {
-            let language = language_tag.and_then(|tag| tag.split('-').next());
-            if let Some(text) = state.ocr.recognize(&image, language) {
-                return Some(text);
-            }
+        let bundled = ocr::Image::from_bgra(&bitmap.bgra, bitmap.width, bitmap.height).and_then(
+            |image| {
+                let language = language_tag.and_then(|tag| tag.split('-').next());
+                let text = state.ocr.recognize(&image, language);
+                // 文字已取出：BGR 缓冲与引擎内部中间产物都随作用域结束立即释放，
+                // 不带到系统 OCR 回退路径，也不留到下次识别。
+                drop(image);
+                text
+            },
+        );
+        if let Some(text) = bundled {
+            return Some(text);
         }
     }
     clipboard_ocr::recognize_bitmap_system(&bitmap, language_tag)
@@ -4085,6 +4110,17 @@ fn main() {
                     ocr_state.ocr.refresh_manifest();
                     let _ = ocr_handle.emit("state", snapshot(ocr_state.inner()));
                 });
+                // OCR 引擎空闲卸载：低频轮询，超过 10 分钟没识别就丢掉 ONNX 会话。
+                // 只丢会话，进程级 Environment 与 DLL 保留（见 ocr::infer）。
+                {
+                    let idle_handle = app.handle().clone();
+                    let _ = std::thread::Builder::new()
+                        .name("bead-ocr-idle".into())
+                        .spawn(move || loop {
+                            std::thread::sleep(std::time::Duration::from_secs(30));
+                            idle_handle.state::<AppState>().ocr.unload_if_idle();
+                        });
+                }
                 // 历史与 settings.json 同级：读不出或不认识格式都退化成空历史，不影响启动。
                 *state.history.lock().expect("history poisoned") =
                     history::TranslationHistory::load(dir, history::DEFAULT_CAPACITY);
@@ -4131,10 +4167,15 @@ fn main() {
             };
             #[cfg(windows)]
             apply_hotkey(app.handle(), &hotkey_spec);
-            // 选区图标与键盘兜底随划词开关启停：先建隐藏窗口，再按开关启动监听。
+            // 选区图标与键盘兜底随划词开关启停：懒创建，不在启动时常驻第二个 WebView。
             #[cfg(windows)]
             {
-                let ready = selection_anchor::create(app.handle()).is_some();
+                let selection_on = state
+                    .settings
+                    .lock()
+                    .expect("settings poisoned")
+                    .selection_enabled;
+                let ready = selection_on && selection_anchor::create(app.handle()).is_some();
                 state.anchor_ready.store(ready, Ordering::SeqCst);
             }
             let selection_on = state

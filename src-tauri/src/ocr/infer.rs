@@ -12,13 +12,27 @@
 //! minAreaRect 流程。截图里的文字基本水平，倾斜框精度损失可以接受，换来零 C 依赖。
 //! 单个汉字的独立连通域会按「垂直重叠 + 水平邻近」合并回同一行。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use ort::ep::CPU;
+use ort::environment::Environment;
 use ort::session::Session;
 use ort::value::Tensor;
 
 use super::Image;
+
+/// 推理环境：`onnxruntime.dll` 每进程只能加载一次，且 Environment 必须比所有会话活得久。
+///
+/// 空闲卸载只丢会话、不丢它——否则重新加载时 `ort` 会拿到失效的全局环境。
+static ENVIRONMENT: Mutex<Option<Environment>> = Mutex::new(None);
+
+/// 单张图最多用几个线程推理。
+///
+/// PP-OCR 的 mobile 模型在单线程下识别一张截图仍是几十毫秒级；默认按逻辑核数开线程
+/// （本机 24 核 × 3 会话 = 72 线程）会常驻大量线程栈与每线程工作区，得不偿失。
+const INTRA_THREADS: usize = 1;
+const INTER_THREADS: usize = 1;
 
 const DET_NAME: &str = "ch_PP-OCRv4_det_infer.onnx";
 const CLS_NAME: &str = "ch_ppocr_mobile_v2.0_cls_infer.onnx";
@@ -40,9 +54,13 @@ const DET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const DET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 /// 三个 ONNX 会话 + 内嵌字符字典。
+///
+/// cls 只为纠正 180° 倒置，截图里极少出现，因此按需加载：前几次识别不占它的会话内存。
 pub struct Engine {
+    dir: PathBuf,
+    environment: Environment,
     det: Mutex<Session>,
-    cls: Mutex<Session>,
+    cls: Mutex<Option<Session>>,
     rec: Mutex<Session>,
     dict: Vec<String>,
 }
@@ -54,13 +72,8 @@ impl Engine {
         if !runtime.is_file() {
             return Err("缺少 onnxruntime.dll".into());
         }
-        let environment = ort::init_from(&runtime)
-            .map_err(|error| format!("加载 onnxruntime 失败：{error}"))?
-            .with_name("bead-ocr")
-            .build()
-            .map_err(|error| format!("初始化推理环境失败：{error}"))?;
+        let environment = environment(&runtime)?;
         let det = session(&environment, &dir.join(DET_NAME))?;
-        let cls = session(&environment, &dir.join(CLS_NAME))?;
         let rec = session(&environment, &dir.join(REC_NAME))?;
         let raw = rec
             .metadata()
@@ -75,8 +88,10 @@ impl Engine {
             return Err("字符字典异常".into());
         }
         Ok(Self {
+            dir: dir.to_path_buf(),
+            environment,
             det: Mutex::new(det),
-            cls: Mutex::new(cls),
+            cls: Mutex::new(None),
             rec: Mutex::new(rec),
             dict,
         })
@@ -117,25 +132,39 @@ impl Engine {
         let mut det = self.det.lock().ok()?;
         let outputs = det.run(ort::inputs!["x" => tensor]).ok()?;
         let (_, values) = outputs[0].try_extract_tensor::<f32>().ok()?;
-        let probability = values.to_vec();
-        drop(outputs);
-        drop(det);
 
         let scale_x = image.width as f32 / width as f32;
         let scale_y = image.height as f32 / height as f32;
-        Some(detect_regions(
-            &probability,
+        // 直接在输出张量上算连通域：不再复制一份 f32 概率图（960² 时省约 3.7MB 峰值）。
+        let regions = detect_regions(
+            values,
             width,
             height,
             scale_x,
             scale_y,
             image.width,
             image.height,
-        ))
+        );
+        drop(outputs);
+        drop(det);
+        Some(regions)
     }
 
     fn classify(&self, crops: &mut [Image]) {
-        let Ok(mut cls) = self.cls.lock() else {
+        if crops.is_empty() {
+            return;
+        }
+        let Ok(mut slot) = self.cls.lock() else {
+            return;
+        };
+        if slot.is_none() {
+            match session(&self.environment, &self.dir.join(CLS_NAME)) {
+                Ok(session) => *slot = Some(session),
+                // 分类模型加载失败时按原方向识别，不影响出文本。
+                Err(_) => return,
+            }
+        }
+        let Some(cls) = slot.as_mut() else {
             return;
         };
         for crop in crops.iter_mut() {
@@ -185,15 +214,41 @@ impl Engine {
     }
 }
 
-fn session(environment: &ort::environment::Environment, path: &Path) -> Result<Session, String> {
+/// 进程级 Environment：只初始化一次；调用方不要在这种情况下单独 drop 它。
+fn environment(runtime: &Path) -> Result<Environment, String> {
+    let mut slot = ENVIRONMENT.lock().map_err(|_| "推理环境锁已损坏".to_string())?;
+    if let Some(environment) = slot.as_ref() {
+        return Ok(environment.clone());
+    }
+    let environment = ort::init_from(runtime)
+        .map_err(|error| format!("加载 onnxruntime 失败：{error}"))?
+        .with_name("bead-ocr")
+        .build()
+        .map_err(|error| format!("初始化推理环境失败：{error}"))?;
+    *slot = Some(environment.clone());
+    Ok(environment)
+}
+
+fn session(environment: &Environment, path: &Path) -> Result<Session, String> {
     if !path.is_file() {
         return Err(format!(
             "缺少模型文件：{}",
             path.file_name().unwrap_or_default().to_string_lossy()
         ));
     }
-    Session::builder(environment)
+    // 关掉 CPU arena 与 memory pattern：识别是低频操作，不需要为速度缓存一大块峰值内存。
+    // 单线程推理足够快，换来的是每个会话不再带一组按核数展开的线程与私有工作区。
+    let mut builder = Session::builder(environment)
         .map_err(|error| format!("创建会话失败：{error}"))?
+        .with_execution_providers([CPU::default().with_arena_allocator(false).build()])
+        .map_err(|error| format!("设置执行器失败：{error}"))?
+        .with_intra_threads(INTRA_THREADS)
+        .map_err(|error| format!("设置 intra 线程失败：{error}"))?
+        .with_inter_threads(INTER_THREADS)
+        .map_err(|error| format!("设置 inter 线程失败：{error}"))?
+        .with_memory_pattern(false)
+        .map_err(|error| format!("设置内存模式失败：{error}"))?;
+    builder
         .commit_from_file(path)
         .map_err(|error| format!("加载模型失败：{error}"))
 }

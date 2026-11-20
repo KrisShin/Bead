@@ -153,6 +153,13 @@ mod imp {
         }
     }
 
+    /// 销毁图标窗口（连带其 WebView2 渲染进程）；窗口不存在时无操作。
+    pub fn destroy(app: &AppHandle) {
+        if let Some(window) = app.get_webview_window(ANCHOR_LABEL) {
+            let _ = window.destroy();
+        }
+    }
+
     pub fn position_for(
         window: &WebviewWindow,
         snapshot: &SelectionSnapshot,
@@ -236,6 +243,8 @@ mod imp {
 
     pub fn hide(_app: &AppHandle) {}
 
+    pub fn destroy(_app: &AppHandle) {}
+
     pub fn show_selection(
         _app: &AppHandle,
         _snapshot: &SelectionSnapshot,
@@ -250,10 +259,10 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{create, hide, show_selection, window_state};
+pub use imp::{create, destroy, hide, show_selection, window_state};
 
 #[cfg(not(windows))]
-pub use imp::{create, hide, show_selection, window_state};
+pub use imp::{create, destroy, hide, show_selection, window_state};
 
 #[cfg(test)]
 mod tests {
