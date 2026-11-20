@@ -98,6 +98,10 @@ mod imp {
             .always_on_top(true)
             .skip_taskbar(true)
             .focused(false)
+            // `focusable(false)` 让窗口在 CreateWindowEx 时就带上 WS_EX_NOACTIVATE：
+            // 之后建出来的 WebView2 全程都在一个不可激活的壳里，窗口创建/懒创建
+            // 这条路径上不存在「先能聚焦、再补样式」的空档。
+            .focusable(false)
             .visible(false)
             .resizable(false)
             .shadow(false)
@@ -106,6 +110,8 @@ mod imp {
         let hwnd = window.hwnd().ok()?;
         let raw = HWND(hwnd.0 as *mut core::ffi::c_void);
         unsafe {
+            // 兜底再确认一次：即使宿主或第三方改动过扩展样式，这里也保证
+            // 图标窗永远不会被点击/显示动作激活。
             let ex = GetWindowLongPtrW(raw, GWL_EXSTYLE);
             SetWindowLongPtrW(raw, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
         }

@@ -13,6 +13,11 @@
 //! 4. 读文本后按序列号复核：中途被外部改写就放弃恢复，以用户内容为准；
 //! 5. 恢复快照（文本类 HGLOBAL 格式可逐字节还原）。
 //!
+//! 与用户自己的复制不打架：注入前若发现用户正按着修饰键（多半正在按 Ctrl+C），
+//! 整次兜底直接放弃——注入的 Ctrl 抬起会把应用里的 Ctrl 状态改掉，之后用户继续
+//! 按 C 就只是普通字符，复制会「越按越不灵」；恢复快照前也要在锁住剪贴板的同时
+//! 复核序列号，绝不用旧快照盖掉用户刚复制的新内容。
+//!
 //! 隐私边界：不写日志、不持久化任何文本；短暂占用系统剪贴板是这条兜底路径
 //! 不可消除的代价（Windows 剪贴板历史也可能记录这次复制）。
 
@@ -67,6 +72,8 @@ pub enum FallbackError {
     ExternalRewrite,
     /// 兜底整体超时（剪贴板所有者挂起等）：不再等，也不代表剪贴板已被改坏。
     Timeout,
+    /// 用户此刻正按着修饰键（多半在自己按 Ctrl+C）：不注入、不碰剪贴板。
+    ModifierHeld,
 }
 
 impl FallbackError {
@@ -82,6 +89,7 @@ impl FallbackError {
             Self::ForegroundChanged => "foreground_changed",
             Self::ExternalRewrite => "external_rewrite",
             Self::Timeout => "timeout",
+            Self::ModifierHeld => "modifier_held",
         }
     }
 }
@@ -169,10 +177,28 @@ mod imp {
         GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
-        VIRTUAL_KEY, VK_C, VK_CONTROL,
+        GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+        KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_C, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
     };
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    /// 修饰键当前是否被物理按住。
+    ///
+    /// 只在兜底注入前用：用户按着 Ctrl 多半正在自己按 Ctrl+C，这时注入 Ctrl+C
+    /// 会先复制一次、再替用户抬起 Ctrl——应用随后收到的是普通字符，用户的复制
+    /// 会连续失败。快照与恢复都可以放弃，唯独键盘状态不能替用户改。
+    fn modifier_held() -> bool {
+        [VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
+            .into_iter()
+            .any(|key| (unsafe { GetAsyncKeyState(key.0 as i32) } as u16 & 0x8000) != 0)
+    }
+
+    /// 剪贴板恢复结果：只有真的尝试并失败才算失败；用户已改写时主动跳过不算。
+    enum RestoreOutcome {
+        Restored,
+        Skipped,
+        Failed,
+    }
 
     /// 剪贴板快照：格式 id + 原始 HGLOBAL 字节，以及拍快照时的序列号。
     struct ClipboardBackup {
@@ -193,20 +219,32 @@ mod imp {
             })
         }
 
-        fn restore(&self) -> bool {
+        /// 把快照写回剪贴板：`expected_seq` 是我们注入的那次复制之后读到的序列号。
+        ///
+        /// 只有「剪贴板仍停在那次复制上」才允许还原：用户在我们读文本之后自己又复制了
+        /// 别的内容时，序列号会变，此时宁可留下用户的新内容，也不能用旧快照盖掉它。
+        /// 序列号在锁住剪贴板之后比对，其他进程在这段时间里无法改写，检查才是准的。
+        fn restore(&self, expected_seq: u32) -> RestoreOutcome {
             // 剪贴板可能被别的程序短暂占用，重试几次；仍失败就如实上报。
             for _ in 0..4 {
-                if unsafe { self.restore_once() } {
-                    return true;
+                match unsafe { self.restore_once(expected_seq) } {
+                    Some(true) => return RestoreOutcome::Restored,
+                    Some(false) => {}
+                    None => return RestoreOutcome::Skipped,
                 }
                 std::thread::sleep(Duration::from_millis(8));
             }
-            false
+            RestoreOutcome::Failed
         }
 
-        unsafe fn restore_once(&self) -> bool {
+        /// `Some(true/false)`：真的尝试过，成功与否；`None`：用户已改写，主动跳过。
+        unsafe fn restore_once(&self, expected_seq: u32) -> Option<bool> {
             if open_clipboard().is_err() {
-                return false;
+                return Some(false);
+            }
+            if unsafe { GetClipboardSequenceNumber() } != expected_seq || modifier_held() {
+                let _ = unsafe { CloseClipboard() };
+                return None;
             }
             let mut ok = unsafe { EmptyClipboard() }.is_ok();
             for (format, bytes) in &self.entries {
@@ -237,7 +275,7 @@ mod imp {
                 }
             }
             let _ = unsafe { CloseClipboard() };
-            ok
+            Some(ok)
         }
     }
 
@@ -390,12 +428,20 @@ mod imp {
 
     /// 一次完整的兜底取词。调用方必须先确认窗口不是终端类。
     fn capture_selection_inner() -> Result<FallbackCapture, FallbackError> {
+        // 连快照都不做：用户按着修饰键时这次兜底整次放弃，绝不替用户改键盘状态。
+        if modifier_held() {
+            return Err(FallbackError::ModifierHeld);
+        }
         let backup = ClipboardBackup::capture()?;
         // 快照与这一刻之间若剪贴板已被别人改写，快照就作废；此时绝不能再按 Ctrl+C，
         // 否则恢复时会把用户新复制的内容覆盖掉。
         let seq_before = unsafe { GetClipboardSequenceNumber() };
         if seq_before != backup.seq {
             return Err(FallbackError::ExternalRewrite);
+        }
+        // 快照期间用户可能已经按下 Ctrl+C：注入前再查一次，紧贴 SendInput 才有效。
+        if modifier_held() {
+            return Err(FallbackError::ModifierHeld);
         }
         let foreground_before = unsafe { GetForegroundWindow() };
         if !unsafe { send_ctrl_c() } {
@@ -421,7 +467,7 @@ mod imp {
         let foreground_changed = foreground_after.0 != foreground_before.0;
 
         let Some((text, text_seq)) = read_text() else {
-            let _ = backup.restore();
+            let _ = backup.restore(seq_after);
             return Err(FallbackError::Empty);
         };
         // 读完之后再确认一次：复制与读取之间被外部改写，以用户内容为准，不恢复。
@@ -430,11 +476,11 @@ mod imp {
             return Err(FallbackError::ExternalRewrite);
         }
         if text.trim().is_empty() {
-            let _ = backup.restore();
+            let _ = backup.restore(seq_after);
             return Err(FallbackError::Empty);
         }
 
-        let restore_failed = !backup.restore();
+        let restore_failed = matches!(backup.restore(seq_after), RestoreOutcome::Failed);
         if foreground_changed {
             return Err(FallbackError::ForegroundChanged);
         }
@@ -532,5 +578,6 @@ mod tests {
         );
         assert_eq!(FallbackError::ExternalRewrite.code(), "external_rewrite");
         assert_eq!(FallbackError::Timeout.code(), "timeout");
+        assert_eq!(FallbackError::ModifierHeld.code(), "modifier_held");
     }
 }
