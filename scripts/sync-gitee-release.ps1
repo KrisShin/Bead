@@ -13,8 +13,11 @@ sync-gitee-release.ps1 — 把 GitHub Release 镜像到 Gitee 同名仓库
     安装的可用性，清理只认 `^v\d+\.\d+\.\d+$`。
   - 幂等：Gitee 已有该 tag 的 release 时默认整条跳过（历史版本、ocr-v* 这类资源发布都不会被改写）；
     只有本次发布（-PublishedTag 或显式 -Tag）才补缺失附件、更新标题与正文。
-  - tag 落到正确提交：tag 在 Gitee 缺失时，用 GitHub 上该 tag 指向的 commit SHA 作 target_commitish，
-    让 Gitee 在同一个提交上建 tag，而不是拿 main 头凑一个错的。
+  - 先 refs 后 release：脚本第一件事是把分支与本次 tag 推到 Gitee（`git push`，私人令牌走 HTTPS），
+    然后才建 release。顺序反过来就是 400「创建标签失败」——Gitee 上没那个提交，tag 无处可指。
+    分支一起推，Gitee 仓库的源码与 README 也跟着追平，不会出现「tag 是新的、main 是旧的」。
+  - tag 落到正确提交：release 的 target_commitish 用 GitHub 上该 tag 解析出的 commit SHA
+    （annotated tag 会剥一层），而不是拿 main 头凑一个错的。
   - 上传后按「文件名 + 字节数」复核，不一致删掉重传一次：Gitee 在跨境链路下偶发半包，
     半包比失败更坏——用户下载到打不开的安装包才发现。
   - 零第三方依赖：内置 cmdlet + 系统自带 curl.exe（GitHub Actions windows runner 与本机都有）。
@@ -41,6 +44,12 @@ param(
     [switch]$PruneOld,
     # 手动指定清理时保留哪个 tag；缺省取 Gitee 上最高的 v* 版本
     [string]$KeepTag = "",
+    # 跳过 refs 同步（默认会先把分支与 tag 推到 Gitee，建 release 才有所指向的提交）
+    [switch]$NoRefSync,
+    # 只推 tag 不推分支
+    [switch]$NoBranchMirror,
+    # Gitee 上有本地没见过的提交、被拒推送时用
+    [switch]$ForceRefs,
     [int]$MaxAttempts = 4
 )
 $ErrorActionPreference = 'Stop'
@@ -78,19 +87,43 @@ function Hide-Secret {
     return $Text
 }
 
-# Gitee 建 release 的前提是 tag 已经存在，而两个平台的代码是手工/延时同步的，不能指望它先到
-# （实测：Gitee main 落后一个版本时 POST /releases 直接 400「创建标签失败」）。
-# 用私人令牌作 HTTPS 密码把 tag 推上去；幂等——远端已有时 git 返回 up-to-date。
-function Push-TagToGitee {
-    param([string]$TagName)
+# Gitee 建 release 的前提是 commit 与 tag 都已经在那边。两个平台的代码是手工/延时同步的，
+# 不能指望它先到——实测 Gitee main 落后一个版本时，POST /releases 直接 400「创建标签失败」。
+# 所以顺序固定为「先同步 refs（分支 + 本次 tag），再建 release」，不存在 tag 指向远端没有的提交。
+# 用私人令牌作 HTTPS 密码；幂等——远端已一致时 git 返回 up-to-date。
+function Sync-GiteeRefs {
+    param(
+        [string[]]$Tags = @(),
+        [switch]$NoBranches,
+        [switch]$Force
+    )
     $pushUrl = "https://$($script:GiteeUser):$($script:GiteeToken)@gitee.com/$GiteeRepo.git"
-    Write-Host "  推送 tag 到 Gitee（建 release 需要 tag 先存在）..." -ForegroundColor DarkGray
-    $out = & git -c credential.helper= push --no-verify $pushUrl "refs/tags/${TagName}:refs/tags/${TagName}" 2>&1
+
+    # CI 的 checkout 只拉一个 ref，这里显式补齐全部分支与 tag，否则没有可推的引用
+    Write-Host "  拉取全部分支与 tag ..." -ForegroundColor DarkGray
+    $fetch = & git -c credential.helper= fetch --prune origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw ('拉取 origin 引用失败：' + [Environment]::NewLine + (Hide-Secret (($fetch | Out-String).Trim())))
+    }
+
+    $refspecs = @()
+    if (-not $NoBranches) { $refspecs += 'refs/remotes/origin/*:refs/heads/*' }
+    foreach ($t in $Tags) { $refspecs += "refs/tags/${t}:refs/tags/${t}" }
+    if ($refspecs.Count -eq 0) { return }
+
+    $label = if ($NoBranches) { "tag $($Tags -join ', ')" } else { "分支与 tag $($Tags -join ', ')" }
+    Write-Host "  同步 $label 到 Gitee ..." -ForegroundColor DarkGray
+    $gitArgs = @('-c', 'credential.helper=', 'push', '--no-verify')
+    if ($Force) { $gitArgs += '--force' }
+    $gitArgs += $pushUrl
+    $gitArgs += $refspecs
+    $out = & git @gitArgs 2>&1
     $code = $LASTEXITCODE
     $text = Hide-Secret (($out | Out-String).Trim())
     if ($code -ne 0) {
-        throw ("推送 tag $TagName 到 Gitee 失败（git exit $code）" + [Environment]::NewLine + $text + [Environment]::NewLine +
-            '排查：令牌需 projects 权限；CI 需 fetch-depth: 0（浅克隆缺历史对象推不动）；Gitee 仓库必须已存在')
+        throw ("同步 $label 到 Gitee 失败（git exit $code）" + [Environment]::NewLine + $text + [Environment]::NewLine +
+            '排查：令牌需 projects 权限；CI 需 fetch-depth: 0（浅克隆缺历史对象）；' +
+            'Gitee 上有本地没见过的提交时会拒绝推送，确认没有就加 -ForceRefs 覆盖')
     }
     if ($text) { Write-Host "    $text" -ForegroundColor DarkGray }
 }
@@ -470,8 +503,6 @@ function Sync-GiteeRelease {
     }
 
     if (-not $rel) {
-        # 先保证 tag 在 Gitee 上，否则 POST /releases 会 400「创建标签失败」
-        Push-TagToGitee -TagName $TagName
         Write-Host "  [创建] Gitee release $TagName ..." -ForegroundColor Green
         $form = @{
             tag_name         = $TagName
@@ -586,6 +617,17 @@ function Sync-OneVersion {
 $summary = @()
 $failures = 0
 try {
+    # 先同步 refs 再同步 release：Gitee 建 release 要求 tag 指向的提交已存在，
+    # 顺序反了就是 400「创建标签失败」。分支一起推，Gitee 仓库的源码也顺带追平。
+    if (-not $NoRefSync) {
+        $refTags = if ($Tag) {
+            @($Tag)
+        } else {
+            @(Get-GitHubReleases | Where-Object { -not $_.draft } | ForEach-Object { [string]$_.tag_name })
+        }
+        Sync-GiteeRefs -Tags $refTags -NoBranches:$NoBranchMirror -Force:$ForceRefs
+    }
+
     if ($Tag) {
         $rel = Get-GitHubRelease -TagName $Tag
         if (-not $rel -and -not $AssetsDir) { throw "GitHub 上没有 release：$Tag" }
