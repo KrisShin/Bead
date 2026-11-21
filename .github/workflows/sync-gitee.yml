@@ -33,6 +33,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 推 tag 到 Gitee 需要完整历史；浅克隆会缺对象
+          fetch-depth: 0
 
       - name: Mirror to Gitee
         shell: pwsh

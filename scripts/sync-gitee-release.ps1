@@ -32,6 +32,8 @@ param(
     [string]$AssetsDir = "",
     [string]$GitHubRepo = "KrisShin/Bead",
     [string]$GiteeRepo = "KrisShin/Bead",
+    # Gitee 账号名（HTTPS 推 tag 用），缺省取 GiteeRepo 的 owner
+    [string]$GiteeUser = "",
     [string]$GitHubToken = "",
     [string]$GiteeToken = "",
     [string]$PublishedTag = "",
@@ -50,6 +52,8 @@ if (-not $GitHubToken) { $GitHubToken = $env:GITHUB_TOKEN }
 if (-not $GiteeToken) { $GiteeToken = $env:GITEE_TOKEN }
 $script:GitHubToken = $GitHubToken
 $script:GiteeToken = $GiteeToken
+if (-not $GiteeUser) { $GiteeUser = ($GiteeRepo -split '/')[0] }
+$script:GiteeUser = $GiteeUser
 if ($MaxAttempts -lt 1) { $MaxAttempts = 4 }
 $script:MaxAttempts = $MaxAttempts
 
@@ -64,11 +68,31 @@ if ($AssetsDir) {
     $AssetsDir = (Resolve-Path -LiteralPath $AssetsDir).Path
 }
 
-# Gitee 的 token 走查询串，报错信息与 CI 日志里必须抹掉，否则一次失败就把令牌打进公开日志
+# Gitee 的 token 走查询串，报错信息与 CI 日志里必须抹掉，否则一次失败就把令牌打进公开日志；
+# git 的 HTTPS 远程串里也有令牌（https://user:token@gitee.com/...），一起抹
 function Hide-Secret {
     param([string]$Text)
     if (-not $Text) { return $Text }
-    return [regex]::Replace($Text, 'access_token=[^&\s"''<>)]+', 'access_token=***')
+    $Text = [regex]::Replace($Text, 'access_token=[^&\s"''<>)]+', 'access_token=***')
+    $Text = [regex]::Replace($Text, '(?<=://)[^/@\s]+:[^/@\s]+@', '***:***@')
+    return $Text
+}
+
+# Gitee 建 release 的前提是 tag 已经存在，而两个平台的代码是手工/延时同步的，不能指望它先到
+# （实测：Gitee main 落后一个版本时 POST /releases 直接 400「创建标签失败」）。
+# 用私人令牌作 HTTPS 密码把 tag 推上去；幂等——远端已有时 git 返回 up-to-date。
+function Push-TagToGitee {
+    param([string]$TagName)
+    $pushUrl = "https://$($script:GiteeUser):$($script:GiteeToken)@gitee.com/$GiteeRepo.git"
+    Write-Host "  推送 tag 到 Gitee（建 release 需要 tag 先存在）..." -ForegroundColor DarkGray
+    $out = & git -c credential.helper= push --no-verify $pushUrl "refs/tags/${TagName}:refs/tags/${TagName}" 2>&1
+    $code = $LASTEXITCODE
+    $text = Hide-Secret (($out | Out-String).Trim())
+    if ($code -ne 0) {
+        throw ("推送 tag $TagName 到 Gitee 失败（git exit $code）" + [Environment]::NewLine + $text + [Environment]::NewLine +
+            '排查：令牌需 projects 权限；CI 需 fetch-depth: 0（浅克隆缺历史对象推不动）；Gitee 仓库必须已存在')
+    }
+    if ($text) { Write-Host "    $text" -ForegroundColor DarkGray }
 }
 
 # ─────────────────────────────────────────────
@@ -446,6 +470,8 @@ function Sync-GiteeRelease {
     }
 
     if (-not $rel) {
+        # 先保证 tag 在 Gitee 上，否则 POST /releases 会 400「创建标签失败」
+        Push-TagToGitee -TagName $TagName
         Write-Host "  [创建] Gitee release $TagName ..." -ForegroundColor Green
         $form = @{
             tag_name         = $TagName

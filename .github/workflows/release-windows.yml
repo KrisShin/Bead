@@ -118,11 +118,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      # 只为了拿 scripts/sync-gitee-release.ps1；release 事件下 checkout 的就是该 tag。
+      # 脚本不是发布产物：checkout 默认分支而不是 tag，脚本修好后可直接重跑，不必为改一行脚本再打版本。
+      # fetch-depth: 0 —— 同步前要把 tag 推到 Gitee，浅克隆缺少历史对象推不动。
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          fetch-depth: 0
 
       - name: Mirror the release to Gitee
         shell: pwsh
