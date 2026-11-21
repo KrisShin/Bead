@@ -28,6 +28,11 @@
 所有产物**不做代码签名**——这是刻意的：信任来自开源可审计 + 每个版本附 SHA256SUMS。
 首次运行请按平台放行：
 
+发布页：[GitHub Releases](https://github.com/KrisShin/Bead/releases) 与
+[Gitee Releases](https://gitee.com/KrisShin/Bead/releases) 同步发布同一批文件（文件名与字节一致，
+SHA256SUMS 两边通用）；国内网络走 Gitee 更快。**Gitee 只保留最新版的安装包**，旧版本页面只留
+更新说明（历史安装包在 GitHub 上，但我们只支持最新版——旧版的 bug 请先升级复现）。
+
 - **Windows**：SmartScreen 可能提示「已保护你的电脑」——点「更多信息」→「仍要运行」。
   zip 目录形态可直接使用，无需安装。换机、拔副屏或改缩放后胶囊若跑丢，托盘菜单「显示」
   会把它拉回可见区；启动失败或窗口异常会写 `%LOCALAPPDATA%\Bead\startup.log`

@@ -79,6 +79,8 @@
 - **D47** 缩略图归属（2026-11-13，0.3.0）：粘贴缩略图只在前端内存里，归属「粘贴当时那张卡的那段文本」；`web/paste-media.js` 的 `stalePasteLangs` 是纯函数守卫——卡片不存在（清空 / 移出语言池）或文本已变即过期，识别中（`pending`）保留，避免被同期翻译刷新误删。每次 `draw()`（含非展开态）先回收再渲染；清空时文字与缩略图一起清；回收必须显式 `revokeObjectURL`。OCR 完成后把归属文本改成识别结果，下一次快照文本不同即自然回收，不额外维护生命周期。
 - **D48** OCR 方案提示（2026-11-13，0.3.0）：设置页不再把两个引擎摆成对等单选项——内置 PP-OCRv4 置顶并标「推荐」（自带插件、离线、更稳），系统 OCR 标红「体验不佳」并建议改用内置方案。状态区分不依赖颜色：推荐/警告用不同徽标文字、选中用实边框 + 底色 + 「✓ 已选」文字，radio 仅视觉隐藏但保留可聚焦与方向键切换。默认选择仍由用户设置决定，**不替用户改选**。
 
+- **D49** GitHub / Gitee 同步发布（2026-11-21）：GitHub Release 是唯一产物真源——`release-windows.yml` 构建并上传后，新增 `sync-gitee` job 调 `scripts/sync-gitee-release.ps1`，把同一批附件（文件名与字节都不动，故 SHA256SUMS 在两个平台同时成立）镜像到 `gitee.com/KrisShin/Bead` 的同名 release。**Gitee 侧不重复构建**：重跑一次构建可能因依赖漂移产出不同字节，校验值立刻对不上。脚本四条硬约束：① **只留最新版**——`-PruneOld`（CI 默认开）同步完成后清掉所有旧 `v*` release 的附件，release 页与更新说明保留作变更记录；动机是把用户摁在最新版上，用户拿旧版报的 bug 属于纯损耗。清理有三道闸：保留版本必须已存在且有附件才动手（否则会出现「旧的全删、新的没传」）、本次有任一同版本失败就跳过清理、`ocr-v*` 这类资源发布永不参与清理（它是已装用户下载模型的备源）。② **幂等**，Gitee 已有该 tag 的 release 时整条跳过，只有本次发布才补缺失附件并更新标题正文。③ 上传后按「文件名 + 字节数」复核，不一致删掉重传，避免用户下到半包。④ tag 在 Gitee 缺失时，用 GitHub 上该 tag 解析出的 commit SHA 作 `target_commitish`，让 Gitee 建在同一个提交上，而不是拿 `main` 头凑一个。保留版本取「Gitee 上最高的 `v*`」而不是「本次发布的 tag」——给老分支发补丁版时，后者会把主线最新版误清。补跑走独立工作流 `sync-gitee.yml`；**不得**在 `release-windows.yml` 上 `workflow_dispatch` 回填——那会重跑 `tauri build` 并 `--clobber` 覆盖旧 tag 的安装包。
+
 ## Facts (Stage 1 实测 / 查证)
 
 - 2026-11-05 本机网络实测：`translate.googleapis.com/translate_a/single` **超时不可达**；`libretranslate.com/translate` 返回 Cloudflare HTML 挑战页不可用；`api.mymemory.translated.net/get` **零密钥可用**（`你好世界` → `Hello world`）；`cn.bing.com/translator` / `ttranslatev3` / `fanyi.youdao.com` / `fanyi.baidu.com` 均 200；`open.bigmodel.cn/api/paas/v4/chat/completions` 返回 401（可达、需 key）；`api-free.deepl.com` 返回 403（需 key）。**结论：国内网络下「零配置且稳定」的翻译源不成立，免 key 源只能作为尽力而为的默认，稳定源必须用户自备免费 key。**
@@ -106,6 +108,8 @@
 ## Next action
 
 本轮 0.3.0（D44–D48）已按功能点分批提交到 `dev`：设置页精简与划词图标合并、胶囊位置自愈与启动日志、历史回填门闩、粘贴缩略图归属、OCR 方案提示、版本号统一。发布流程按仓库现状执行：`dev` 合并 `main` → 打 `v0.3.0` → 建 Release 触发 `release-windows.yml`（**Windows-only**，产出 NSIS 安装器 + SHA256SUMS；工作流由 Release published 事件触发，不是 tag push，且文件必须在默认分支 `main` 上）。真机未验证项见 `.scratch/bead/STATUS.md` 十四。
+
+Gitee 同步（D49）落地状态：① `GITEE_TOKEN` 已加入仓库 Secrets；② 工作流必须在默认分支 `main` 上才对 `release` 事件生效，0.3.3 发布即首次端到端验证；③ 回填 v0.1.0–v0.3.2 走 `sync-gitee.yml`（prune 默认开）或本地 `.\scripts\sync-gitee-release.ps1 -All -PruneOld -GiteeToken <token>`——回填只为保留变更记录，附件随即被清理，Gitee 上始终只有最新版可下载。
 
 ## 文档地图
 
