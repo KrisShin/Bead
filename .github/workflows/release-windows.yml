@@ -13,6 +13,10 @@ name: release-windows
 # 配置里没有 zip bundle，因此不凭空生成便携 zip。
 # 校验和：原 release.yml 的 checksums job 随多平台流水线一起删除，这里就地生成同名 SHA256SUMS。
 # 红线：无签名步骤、无签名 secrets 分支、不做单文件 exe、不用 UPX。
+#
+# 发布链路：windows（构建 + 上传 GitHub Release）→ sync-gitee（把同一批产物镜像到 Gitee release，
+# 并清掉旧版本附件，Gitee 上只留最新版可下载）。
+# Gitee 侧只做镜像，不重复构建：两个平台的安装包必须字节一致，否则 SHA256SUMS 对不上。
 on:
   release:
     types: [published]
@@ -98,3 +102,40 @@ jobs:
           Get-Content -Path "SHA256SUMS" | Write-Host
 
           gh release upload $env:TAG $assets.FullName SHA256SUMS --clobber --repo $env:GITHUB_REPOSITORY
+
+  # 把 GitHub Release 的同一批产物镜像到 Gitee（gitee.com/KrisShin/Bead）。
+  # 独立成 job 的理由：产物以 GitHub Release 为唯一真源，这里只做搬运，不重复构建；
+  # 同步失败不会牵连同一次构建的产物，重跑本 job 即可（脚本按「文件名 + 字节数」幂等）。
+  # 前置条件：仓库 Secrets 里必须有 GITEE_TOKEN（Gitee 私人令牌，勾 projects 权限）；
+  # 缺 token 时本 job 会红，而不是静默跳过——「Gitee 没同步上」必须可见。
+  sync-gitee:
+    name: gitee release mirror
+    needs: windows
+    # 与构建 job 同一道闸：只镜像软件版本（v*）；ocr-v* 是模型资源发布，不在这里搬运。
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'v')
+    runs-on: windows-latest
+    # 镜像只读 GitHub：不需要、也不该拿写权限。
+    permissions:
+      contents: read
+    steps:
+      # 只为了拿 scripts/sync-gitee-release.ps1；release 事件下 checkout 的就是该 tag。
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Mirror the release to Gitee
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          # -PruneOld：同步完清掉旧版本附件，Gitee 上始终只有最新版可下载——
+          # 用户拿着旧版报 bug 的成本比「旧链接失效」更高。清理前的闸门由脚本自己把（见 Invoke-PruneOldReleases）。
+          ./scripts/sync-gitee-release.ps1 `
+            -Tag $env:TAG `
+            -PruneOld `
+            -GiteeToken $env:GITEE_TOKEN `
+            -GitHubToken $env:GH_TOKEN
+

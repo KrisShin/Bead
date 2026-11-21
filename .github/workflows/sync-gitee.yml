@@ -1,0 +1,56 @@
+name: sync-gitee
+
+# Gitee 发布镜像的补跑入口：不构建、不动 GitHub Release 上的任何产物，只把 GitHub Release
+# 的附件同步到 Gitee。自动路径在 release-windows.yml 的 sync-gitee job。
+# 默认 prune = true，跑完只留最新版可下载；回填历史版本时如果只想补齐、暂不清理，把 prune 关掉。
+#
+# 为什么单独一个文件：在 release-windows.yml 上 workflow_dispatch 会重跑 `tauri build` 并
+# `gh release upload --clobber`，回填历史版本时那等于拿今天依赖重建的产物替换掉老用户手里的
+# 安装包。回填必须只搬不建，所以要这条独立入口。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "只同步这一个 tag，例如 v0.3.2（留空并勾 all 则回填全部）"
+        required: false
+      all:
+        description: "回填全部历史 release（已存在于 Gitee 的会被跳过）"
+        type: boolean
+        default: false
+      prune:
+        description: "清理旧版本附件，只留最新版可下载"
+        type: boolean
+        default: true
+
+# 只读 GitHub；写操作全部走 Gitee API 的 access_token。
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: mirror releases to gitee
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Mirror to Gitee
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          ALL: ${{ inputs.all }}
+          PRUNE: ${{ inputs.prune }}
+        run: |
+          if (-not $env:GITEE_TOKEN) { throw '缺少 GITEE_TOKEN：仓库 Settings → Secrets and variables → Actions 添加' }
+          $params = @{ GiteeToken = $env:GITEE_TOKEN; GitHubToken = $env:GH_TOKEN }
+          if ($env:TAG) {
+            $params.Tag = $env:TAG
+          } elseif ($env:ALL -eq 'true') {
+            $params.All = $true
+          } else {
+            throw '要么填 tag，要么勾「回填全部历史 release」，避免误跑全量'
+          }
+          if ($env:PRUNE -eq 'true') { $params.PruneOld = $true }
+          ./scripts/sync-gitee-release.ps1 @params
