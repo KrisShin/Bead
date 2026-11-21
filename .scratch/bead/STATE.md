@@ -109,7 +109,7 @@
 
 本轮 0.3.0（D44–D48）已按功能点分批提交到 `dev`：设置页精简与划词图标合并、胶囊位置自愈与启动日志、历史回填门闩、粘贴缩略图归属、OCR 方案提示、版本号统一。发布流程按仓库现状执行：`dev` 合并 `main` → 打 `v0.3.0` → 建 Release 触发 `release-windows.yml`（**Windows-only**，产出 NSIS 安装器 + SHA256SUMS；工作流由 Release published 事件触发，不是 tag push，且文件必须在默认分支 `main` 上）。真机未验证项见 `.scratch/bead/STATUS.md` 十四。
 
-Gitee 同步（D49）落地状态：① `GITEE_TOKEN` 已加入仓库 Secrets；② 工作流必须在默认分支 `main` 上才对 `release` 事件生效，0.3.3 发布即首次端到端验证；③ 回填 v0.1.0–v0.3.2 走 `sync-gitee.yml`（prune 默认开）或本地 `.\scripts\sync-gitee-release.ps1 -All -PruneOld -GiteeToken <token>`——回填只为保留变更记录，附件随即被清理，Gitee 上始终只有最新版可下载。
+Gitee 同步（D49）落地状态：① `GITEE_TOKEN` 已加入仓库 Secrets；② **端到端已跑通**——0.3.3 首跑在 Gitee 侧 400「创建标签失败」（顺序错），修复后 0.3.4 的 `release` 事件全绿（构建 10m17s + 镜像 40s，run 44873020104），两平台 SHA256SUMS 一致、旧版附件被清、`ocr-v1.0.0` 未动；③ 回填 v0.1.0–v0.3.2 走 `sync-gitee.yml`（prune 默认开）或本地 `.\scripts\sync-gitee-release.ps1 -All -PruneOld -GiteeToken <token>`——回填只为保留变更记录，附件随即被清理，Gitee 上始终只有最新版可下载。
 
 ## 文档地图
 
